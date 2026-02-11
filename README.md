@@ -1,95 +1,49 @@
-# SimpleFontHook
+# ✧ SimpleFontHook ✧
 
-[![C++](https://img.shields.io/badge/Language-C++-00599C.svg?style=flat&logo=c%2B%2B)](https://isocpp.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D4.svg?style=flat&logo=windows)](https://www.microsoft.com/windows)
+[![Sakura Night Aesthetic](https://img.shields.io/badge/Aesthetic-Sakura%20Night-pink)](https://github.com/your-repo)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Build](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](BUILD)
 
-**SimpleFontHook** 是一个为 Windows 平台（特别是 Galgame 和旧式应用程序）设计的高性能字体 Hook 工具。它能够实时拦截并替换应用程序中的字体调用，支持 GDI、GDI+ 和 DirectWrite 渲染引擎，并提供极其精美的 "Sakura Next" 样式配置界面。
+**SimpleFontHook** 是一款专为游戏（尤其是 Galgame）设计的动态字体替换与优化工具。它通过强大的 API Hooking 技术，实现在无需修改游戏原始资源的情况下，实时替换字体、优化渲染效果并修复由于区域设置（Locale）引起的乱码问题。
 
 ---
 
 ## ✨ 核心特性
 
-- **🚀 全面 Hook 支持**
-  - **GDI**: 拦截 `CreateFont`, `TextOut`, `ExtTextOut`, `DrawText` 等 API。
-  - **GDI+**: 拦截 `GdipDrawString`, `GdipCreateFont` 等，支持私有字体集注入。
-  - **DirectWrite**: 拦截接口虚函数，完美解决现代游戏的字体替换问题。
-- **🌸 Sakura Next GUI**
-  - 内置精美的侧边栏导航界面。
-  - 支持毛玻璃效果与动态动画。
-  - **实时预览**: 修改字体、缩放、粗细后立即生效，无需重启游戏。
-  - **模糊搜索**: 快速从系统成百上千的字体中找到所需。
-- **🔧 深度字体控制**
-  - **比例缩放**: 自由调整字体的宽度和高度比例。
-  - **粗细调节**: 实时修改 `FontWeight`。
-  - **编码仿真 (Codepage Spoofing)**: 自动修补字体 `OS/2` 表，解决日文/中文乱码显示问题。
-- **🛡️ 灵活部署**
-  - 支持通过 `winmm.dll` 代理进行零配置注入（DLL Hijacking）。
+- **🚀 多引擎兼容**: 深度支持 GDI, GDI+, 以及现代化的 DirectWrite 渲染引擎。
+- **🌓 字符集伪装 (Codepage Spoofing)**: 针对日区游戏或乱码情况，支持将 Shift-JIS 等字符集实时伪装为 GB2312 渲染，解决乱码困扰。
+- **📁 本地字体自动加载**: 仅需将 `.ttf` / `.otf` / `.ttc` 字体文件放入 DLL 同级目录，工具将自动加载并提供 OS/2 表实时补丁以增强兼容性。
+- **🛠️ 模块化设计**: 采用 Detours 实现高效、稳定的代码注入。
 
 ---
 
-## 🛠️ 技术栈
+## 📸 界面预览
 
-- **语言**: C++17
-- **Hook 库**: Microsoft Detours
-- **UI 框架**: 自研沉浸式 Win32 UI (Sakura 主题)
-- **字体处理**: GDI/GDI+ & 自定义 TrueType 表解析
+> <img width="480" height="720" alt="image" src="https://github.com/user-attachments/assets/b792dc66-a6d0-41ad-a11b-fc7dfc74ab15" />
 
----
-
-## 🚀 快速开始
-
-### 1. 编译
-使用 Visual Studio 2022 打开 `SimpleFontHook.sln`，选择 `Release` 配置进行编译。
-- 生成 `SimpleFontHook.dll`。
-
-### 2. 安装
-将编译生成的 `SimpleFontHook.dll` 重命名为 `winmm.dll` 放置在游戏根目录。
-或者使用配套的 `FontLoader.exe` 进行注入。
-
-### 3. 使用
-- 运行游戏。
-- 默认按下唤起热键（通常为特定组合键或自动弹出）即可打开 **Font Picker** 界面。
-- 选择你喜欢的字体并即时调整参数。
+- **快速搜索**: 点击搜索框快速定位系统或本地字体。
+- **实时应用**: 双击列表项目即可部分引擎（已知softpal引擎）瞬间全局应用字体变更，无需重启游戏，其他引擎需要具体问题具体分析比如设置更新或者SL。
+- **缩放控制**: 实时缩放 UI 界面以适配不同分辨率的游戏窗口。
 
 ---
 
-## 📂 项目结构
+## 🛠️ 如何使用
 
-```text
-├── SimpleFontHook/
-│   ├── dllmain.cpp          # 主要入口与 Hook 逻辑实现
-│   ├── font_picker.cpp      # Sakura Next UI 实现
-│   ├── font_patcher.cpp     # 字体 OS/2 表实时补丁
-│   ├── utils.cpp            # 配置加载与通用工具
-│   └── winmm_proxy.h        # 导出函数转发定义
-├── build_x64.bat           # 自动化编译脚本
-└── detours.h                # Detours 静态链接库
-```
+### 1. 部署
+1. 将编译生成的 `winmm.dll`放入游戏根目录。
+2. 将你喜欢的字体文件（可选）也放入同级目录。
 
----
+### 2. 操作
+- 工具随游戏启动后，选择字体并按 **Enter** 或双击。
 
-## ⚙️ 配置说明
+### 3. 构建
+项目支持 x86 与 x64 架构，直接运行提供的批处理文件即可：
+- `build_x32.bat`: 构建 32 位版本。
+- `build_x64.bat`: 构建 64 位版本。
 
-可以通过修改 `Config.ini` 或直接在 UI 中调整：
 
-| 参数 | 说明 |
-| :--- | :--- |
-| `EnableFontHook` | 是否启用全局字体替换 |
-| `FontHeightScale` | 字体高度缩放比例 (1.0 = 原大) |
-| `FontWidthScale` | 字体宽度缩放比例 |
-| `CodepageSpoof` | 是否启用字符集欺骗 (解决乱码) |
-| `ForcedFontName` | 强制替换的字体名称 |
+## 🤝 贡献与许可
 
----
+基于 **MIT License** 开源。欢迎提交 Issue 或 Pull Request 来完善对更多特殊引擎的支持。
 
-## 🤝 贡献与反馈
-
-欢迎提交 Issue 或 Pull Request 来改进本项目。如果你喜欢这个项目，请给它一个 **Star**！
-
----
-
-## 📄 开源协议
-
-本项目采用 [MIT License](LICENSE) 协议。
-
+> *“在这个充满幻想的世界里，每一行文字都值得被更加优美地呈现。”*
