@@ -31,4 +31,6 @@ namespace Utils {
     void LogW(const wchar_t* format, ...);
     BOOL LoadCustomFont(HMODULE hModule);
     std::string GetFontEnglishName(HFONT hFont);
+    void SaveConfig(HMODULE hModule);
+    bool LoadConfig(HMODULE hModule);
 }

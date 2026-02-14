@@ -415,6 +415,7 @@ static void ApplySpoofConfig() {
     
     // Just force redraw to let TextOut hook pick up changes
     ForceGameRedraw();
+    Utils::SaveConfig(g_hModule);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -677,6 +678,7 @@ static void ApplySelectedFont() {
     }
 
     ForceGameRedraw();
+    Utils::SaveConfig(g_hModule);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1616,11 +1618,63 @@ static void CreatePickerWindow() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Restore picker UI state from loaded Config
+// ═══════════════════════════════════════════════════════════════
+static void RestoreUIStateFromConfig() {
+    // Restore applied font name
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace && Config::ForcedFontNameW[0] != L'\0') {
+        g_appliedFont = Config::ForcedFontNameW;
+        g_recentFonts.insert(g_recentFonts.begin(), g_appliedFont);
+    }
+
+    // Restore charset selector
+    if (Config::EnableCharsetReplace) {
+        for (int i = 0; i < g_charsetCount; i++) {
+            if (g_charsets[i].value == (BYTE)Config::ForcedCharset) {
+                g_selectedCharset = i;
+                break;
+            }
+        }
+    } else {
+        g_selectedCharset = 0;  // "All"
+    }
+
+    // Restore spoof state
+    g_spoofEnabled = Config::EnableCodepageSpoof;
+    for (int i = 0; i < g_charsetCount; i++) {
+        if (g_charsets[i].value == (BYTE)Config::SpoofFromCharset) g_spoofFromIdx = i;
+        if (g_charsets[i].value == (BYTE)Config::SpoofToCharset) g_spoofToIdx = i;
+    }
+
+    // Try to select the applied font in the list
+    UpdateFilter();
+    if (!g_appliedFont.empty()) {
+        for (int i = 0; i < (int)g_filteredIndices.size(); i++) {
+            if (g_allFonts[g_filteredIndices[i]] == g_appliedFont) {
+                g_selectedIndex = i;
+                EnsureVisible();
+                break;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Public API
 // ═══════════════════════════════════════════════════════════════
 void Init(HMODULE hModule) {
     g_hModule = hModule;
+
+    // Load saved config - if found, font hook is already active from Config load
+    bool hasSavedConfig = Utils::LoadConfig(hModule);
+
     EnumerateFonts();
+
+    // Restore UI state from config
+    if (hasSavedConfig) {
+        RestoreUIStateFromConfig();
+    }
+
     CreatePickerWindow();
     ShowWindow(g_hWnd, SW_SHOW);
     SetForegroundWindow(g_hWnd);
