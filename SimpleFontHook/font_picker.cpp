@@ -1,4 +1,4 @@
-﻿#define NOMINMAX
+#define NOMINMAX
 #include "font_picker.h"
 #include "font_patcher.h"
 #include "framework.h"
@@ -11,6 +11,8 @@
 #include <set>
 #include <dwmapi.h>
 #include <shlwapi.h>
+#include <unordered_map>
+#include <unordered_set>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -37,8 +39,11 @@ static HWND g_hWnd = NULL;
 static HWND g_hSearchEdit = NULL;
 static HMODULE g_hModule = NULL;
 static bool g_visible = false;
-static std::vector<std::wstring> g_allFonts;
-static std::vector<std::set<BYTE>> g_fontCharsets;  // charsets each font supports
+struct FontInfo {
+    std::wstring name;
+    std::unordered_set<BYTE> charsets;
+};
+static std::vector<FontInfo> g_allFonts;
 static std::vector<std::wstring> g_recentFonts;
 static std::vector<int> g_filteredIndices;
 static int g_selectedIndex = 0;
@@ -462,19 +467,28 @@ static void DrawSparkle(HDC hdc, int cx, int cy, int sz, COLORREF col) {
 // ═══════════════════════════════════════════════════════════════
 //  Font enumeration
 // ═══════════════════════════════════════════════════════════════
+static std::unordered_map<std::wstring, size_t> g_nameToIndex;
+
 static int CALLBACK EnumFontProc(const LOGFONTW* lf, const TEXTMETRICW*, DWORD fontType, LPARAM lParam) {
     std::wstring name(lf->lfFaceName);
     if (name.empty() || name[0] == L'@') return 1;
-    if (!(fontType & TRUETYPE_FONTTYPE)) return 1;
+    
+    // Some fonts might not be reported as TRUETYPE but are still usable.
+    // However, we want to skip legacy raster/vector fonts for better quality.
+    // We allow TRUETYPE (4) or DEVICE (2) if it's a modern OpenType/TrueType font.
+    if (!(fontType & TRUETYPE_FONTTYPE) && !(fontType & DEVICE_FONTTYPE)) return 1;
+
     BYTE cs = lf->lfCharSet;
-    for (int i = 0; i < (int)g_allFonts.size(); i++) {
-        if (g_allFonts[i] == name) {
-            g_fontCharsets[i].insert(cs);
-            return 1;
-        }
+    auto it = g_nameToIndex.find(name);
+    if (it != g_nameToIndex.end()) {
+        g_allFonts[it->second].charsets.insert(cs);
+    } else {
+        g_nameToIndex[name] = g_allFonts.size();
+        FontInfo fi;
+        fi.name = name;
+        fi.charsets.insert(cs);
+        g_allFonts.push_back(fi);
     }
-    g_allFonts.push_back(name);
-    g_fontCharsets.push_back({ cs });
     return 1;
 }
 
@@ -490,14 +504,14 @@ static void UpdateFilter() {
     // Helper: does font at index i pass the charset filter?
     auto passCharset = [&](int i) -> bool {
         if (filterCs == DEFAULT_CHARSET) return true;  // "All"
-        return g_fontCharsets[i].count(filterCs) > 0;
+        return g_allFonts[i].charsets.count(filterCs) > 0;
     };
 
     // Recents first when no search
     if (search.empty()) {
         for (const auto& recent : g_recentFonts) {
             for (int i = 0; i < (int)g_allFonts.size(); i++) {
-                if (g_allFonts[i] == recent && passCharset(i)) {
+                if (g_allFonts[i].name == recent && passCharset(i)) {
                     g_filteredIndices.push_back(i); break;
                 }
             }
@@ -513,7 +527,7 @@ static void UpdateFilter() {
             g_filteredIndices.push_back(i);
             continue;
         }
-        std::wstring name = g_allFonts[i];
+        std::wstring name = g_allFonts[i].name;
         std::transform(name.begin(), name.end(), name.begin(), ::towlower);
         if (name.find(search) != std::wstring::npos)
             g_filteredIndices.push_back(i);
@@ -594,7 +608,7 @@ static void LoadLocalFonts() {
 
 static void EnumerateFonts() {
     g_allFonts.clear();
-    g_fontCharsets.clear();
+    g_nameToIndex.clear();
 
     // Load font files from game root directory first
     LoadLocalFonts();
@@ -607,26 +621,39 @@ static void EnumerateFonts() {
         RUSSIAN_CHARSET, THAI_CHARSET, EASTEUROPE_CHARSET, OEM_CHARSET,
         JOHAB_CHARSET, SYMBOL_CHARSET, MAC_CHARSET,
     };
+    
+    Utils::Log("[Picker] Starting font enumeration...");
     for (BYTE cs : charsets) {
         LOGFONTW lf = {};
         lf.lfCharSet = cs;
+        int prevCount = (int)g_allFonts.size();
         EnumFontFamiliesExW(hdc, &lf, (FONTENUMPROCW)EnumFontProc, 0, 0);
+        int added = (int)g_allFonts.size() - prevCount;
+        if (added > 0 || cs == DEFAULT_CHARSET) {
+            Utils::Log("[Picker] Charset %u: found %d new fonts (total %d)", cs, added, (int)g_allFonts.size());
+        }
     }
     ReleaseDC(NULL, hdc);
-    std::sort(g_allFonts.begin(), g_allFonts.end());
+
+    // Sorting must preserve the FontInfo integrity
+    std::sort(g_allFonts.begin(), g_allFonts.end(), [](const FontInfo& a, const FontInfo& b) {
+        return a.name < b.name;
+    });
+
+    Utils::Log("[Picker] Enumeration finished. Final count: %d", (int)g_allFonts.size());
     UpdateFilter();
 }
 
 static bool IsRecentFont(int filteredIdx) {
     if (filteredIdx < 0 || filteredIdx >= (int)g_filteredIndices.size()) return false;
-    const auto& name = g_allFonts[g_filteredIndices[filteredIdx]];
+    const auto& name = g_allFonts[g_filteredIndices[filteredIdx]].name;
     for (const auto& r : g_recentFonts) if (r == name) return true;
     return false;
 }
 
 static bool IsAppliedFont(int filteredIdx) {
     if (filteredIdx < 0 || filteredIdx >= (int)g_filteredIndices.size()) return false;
-    return g_allFonts[g_filteredIndices[filteredIdx]] == g_appliedFont;
+    return g_allFonts[g_filteredIndices[filteredIdx]].name == g_appliedFont;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -634,7 +661,7 @@ static bool IsAppliedFont(int filteredIdx) {
 // ═══════════════════════════════════════════════════════════════
 static void ApplySelectedFont() {
     if (g_selectedIndex < 0 || g_selectedIndex >= (int)g_filteredIndices.size()) return;
-    const std::wstring& name = g_allFonts[g_filteredIndices[g_selectedIndex]];
+    const std::wstring& name = g_allFonts[g_filteredIndices[g_selectedIndex]].name;
 
     auto it = std::find(g_recentFonts.begin(), g_recentFonts.end(), name);
     if (it != g_recentFonts.end()) g_recentFonts.erase(it);
@@ -1001,7 +1028,7 @@ static void PaintWindow(HWND hWnd) {
         bool hovered = (idx == g_hoveredIndex);
         bool isRecent = IsRecentFont(idx);
         bool isApplied = IsAppliedFont(idx);
-        const std::wstring& fontName = g_allFonts[g_filteredIndices[idx]];
+        const std::wstring& fontName = g_allFonts[g_filteredIndices[idx]].name;
 
         // Item background
         if (selected) {
@@ -1113,7 +1140,7 @@ static void PaintWindow(HWND hWnd) {
     DrawPetal(mem, 24, rc.bottom - 20, 4, 5, COL_ACCENT3);
 
     if (g_selectedIndex >= 0 && g_selectedIndex < (int)g_filteredIndices.size()) {
-        const std::wstring& fontName = g_allFonts[g_filteredIndices[g_selectedIndex]];
+        const std::wstring& fontName = g_allFonts[g_filteredIndices[g_selectedIndex]].name;
 
         // Full preview text
         HFONT prevFont = CreateFontW(-SF(28), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -1650,7 +1677,7 @@ static void RestoreUIStateFromConfig() {
     UpdateFilter();
     if (!g_appliedFont.empty()) {
         for (int i = 0; i < (int)g_filteredIndices.size(); i++) {
-            if (g_allFonts[g_filteredIndices[i]] == g_appliedFont) {
+            if (g_allFonts[g_filteredIndices[i]].name == g_appliedFont) {
                 g_selectedIndex = i;
                 EnsureVisible();
                 break;

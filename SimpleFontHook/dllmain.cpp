@@ -1,4 +1,4 @@
-﻿#include "framework.h"
+#include "framework.h"
 #include "winmm_proxy.h"
 #include "font_picker.h"
 #include <detours.h>
@@ -44,10 +44,7 @@ typedef int (WINAPI* pDrawTextA)(HDC, LPCSTR, int, LPRECT, UINT);
 typedef int (WINAPI* pDrawTextW)(HDC, LPCWSTR, int, LPRECT, UINT);
 typedef int (WINAPI* pDrawTextExA)(HDC, LPSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS);
 typedef int (WINAPI* pDrawTextExW)(HDC, LPWSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS);
-typedef BOOL(WINAPI* pPolyTextOutA)(HDC, const POLYTEXTA*, int);
-typedef BOOL(WINAPI* pPolyTextOutW)(HDC, const POLYTEXTW*, int);
-typedef LONG(WINAPI* pTabbedTextOutA)(HDC, int, int, LPCSTR, int, int, const int*, int);
-typedef LONG(WINAPI* pTabbedTextOutW)(HDC, int, int, LPCWSTR, int, int, const int*, int);
+
 
 static pTextOutA orgTextOutA = TextOutA;
 static pTextOutW orgTextOutW = TextOutW;
@@ -57,10 +54,7 @@ static pDrawTextA orgDrawTextA = DrawTextA;
 static pDrawTextW orgDrawTextW = DrawTextW;
 static pDrawTextExA orgDrawTextExA = DrawTextExA;
 static pDrawTextExW orgDrawTextExW = DrawTextExW;
-static pPolyTextOutA orgPolyTextOutA = PolyTextOutA;
-static pPolyTextOutW orgPolyTextOutW = PolyTextOutW;
-static pTabbedTextOutA orgTabbedTextOutA = TabbedTextOutA;
-static pTabbedTextOutW orgTabbedTextOutW = TabbedTextOutW;
+
 
 // ===================== Glyph & Metrics Types (critical for engines that cache glyphs) =====================
 typedef DWORD(WINAPI* pGetGlyphOutlineA)(HDC, UINT, UINT, LPGLYPHMETRICS, DWORD, LPVOID, const MAT2*);
@@ -127,27 +121,7 @@ typedef HFONT(WINAPI* pCreateFontIndirectExW)(const ENUMLOGFONTEXDVW*);
 static pCreateFontIndirectExA orgCreateFontIndirectExA = CreateFontIndirectExA;
 static pCreateFontIndirectExW orgCreateFontIndirectExW = CreateFontIndirectExW;
 
-// ===================== Font Resource Types =====================
-typedef int (WINAPI* pAddFontResourceA)(LPCSTR);
-typedef int (WINAPI* pAddFontResourceW)(LPCWSTR);
-typedef int (WINAPI* pAddFontResourceExA)(LPCSTR, DWORD, PVOID);
-typedef int (WINAPI* pAddFontResourceExW)(LPCWSTR, DWORD, PVOID);
-typedef HANDLE(WINAPI* pAddFontMemResourceEx)(PVOID, DWORD, PVOID, DWORD*);
-typedef BOOL(WINAPI* pRemoveFontResourceA)(LPCSTR);
-typedef BOOL(WINAPI* pRemoveFontResourceW)(LPCWSTR);
-typedef BOOL(WINAPI* pRemoveFontResourceExA)(LPCSTR, DWORD, PVOID);
-typedef BOOL(WINAPI* pRemoveFontResourceExW)(LPCWSTR, DWORD, PVOID);
-typedef BOOL(WINAPI* pRemoveFontMemResourceEx)(HANDLE);
-static pAddFontResourceA orgAddFontResourceA = AddFontResourceA;
-static pAddFontResourceW orgAddFontResourceW = AddFontResourceW;
-static pAddFontResourceExA orgAddFontResourceExA = AddFontResourceExA;
-static pAddFontResourceExW orgAddFontResourceExW = AddFontResourceExW;
-static pAddFontMemResourceEx orgAddFontMemResourceEx = AddFontMemResourceEx;
-static pRemoveFontResourceA orgRemoveFontResourceA = RemoveFontResourceA;
-static pRemoveFontResourceW orgRemoveFontResourceW = RemoveFontResourceW;
-static pRemoveFontResourceExA orgRemoveFontResourceExA = RemoveFontResourceExA;
-static pRemoveFontResourceExW orgRemoveFontResourceExW = RemoveFontResourceExW;
-static pRemoveFontMemResourceEx orgRemoveFontMemResourceEx = RemoveFontMemResourceEx;
+
 
 // ===================== Old-Style Font Enumeration Types =====================
 typedef int (WINAPI* pEnumFontsA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
@@ -201,46 +175,22 @@ static pGetFontData orgGetFontData = GetFontData;
 static pGetFontLanguageInfo orgGetFontLanguageInfo = GetFontLanguageInfo;
 static pGetFontUnicodeRanges orgGetFontUnicodeRanges = GetFontUnicodeRanges;
 
-// ===================== User32 Text Supplement Types =====================
-typedef BOOL(WINAPI* pGrayStringA)(HDC, HBRUSH, GRAYSTRINGPROC, LPARAM, int, int, int, int, int);
-typedef BOOL(WINAPI* pGrayStringW)(HDC, HBRUSH, GRAYSTRINGPROC, LPARAM, int, int, int, int, int);
-typedef DWORD(WINAPI* pGetTabbedTextExtentA)(HDC, LPCSTR, int, int, const int*);
-typedef DWORD(WINAPI* pGetTabbedTextExtentW)(HDC, LPCWSTR, int, int, const int*);
-static pGrayStringA orgGrayStringA = GrayStringA;
-static pGrayStringW orgGrayStringW = GrayStringW;
-static pGetTabbedTextExtentA orgGetTabbedTextExtentA = GetTabbedTextExtentA;
-static pGetTabbedTextExtentW orgGetTabbedTextExtentW = GetTabbedTextExtentW;
 
-// ===================== GDI+ Measure Types =====================
-typedef GpStatus(WINAPI* pGdipMeasureString)(GpGraphics*, const WCHAR*, INT, const GpFont*, const RectF*, const GpStringFormat*, RectF*, INT*, INT*);
-typedef GpStatus(WINAPI* pGdipMeasureCharacterRanges)(GpGraphics*, const WCHAR*, INT, const GpFont*, const RectF*, const GpStringFormat*, INT, GpRegion**);
-typedef GpStatus(WINAPI* pGdipMeasureDriverString)(GpGraphics*, const UINT16*, INT, const GpFont*, const PointF*, INT, const Matrix*, RectF*);
-static pGdipMeasureString orgGdipMeasureString = NULL;
-static pGdipMeasureCharacterRanges orgGdipMeasureCharacterRanges = NULL;
-static pGdipMeasureDriverString orgGdipMeasureDriverString = NULL;
+
+
 
 // ===================== GDI+ Types =====================
 typedef GpStatus(WINAPI* pGdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
 typedef GpStatus(WINAPI* pGdipCreateFontFromLogfontW)(HDC, const LOGFONTW*, GpFont**);
 typedef GpStatus(WINAPI* pGdipCreateFontFromLogfontA)(HDC, const LOGFONTA*, GpFont**);
-typedef GpStatus(WINAPI* pGdipCreateFontFromHFONT)(HDC, HFONT, GpFont**);
-typedef GpStatus(WINAPI* pGdipCreateFontFromDC)(HDC, GpFont**);
-typedef GpStatus(WINAPI* pGdipCreateFont)(const GpFontFamily*, REAL, INT, Unit, GpFont**);
 typedef GpStatus(WINAPI* pGdipNewPrivateFontCollection)(GpFontCollection**);
 typedef GpStatus(WINAPI* pGdipPrivateAddFontFile)(GpFontCollection*, const WCHAR*);
-typedef GpStatus(WINAPI* pGdipDrawString)(GpGraphics*, const WCHAR*, INT, const GpFont*, const RectF*, const GpStringFormat*, const GpBrush*);
-typedef GpStatus(WINAPI* pGdipDrawDriverString)(GpGraphics*, const UINT16*, INT, const GpFont*, const GpBrush*, const PointF*, INT, const Matrix*);
 
 static pGdipCreateFontFamilyFromName orgGdipCreateFontFamilyFromName = NULL;
 static pGdipCreateFontFromLogfontW orgGdipCreateFontFromLogfontW = NULL;
 static pGdipCreateFontFromLogfontA orgGdipCreateFontFromLogfontA = NULL;
-static pGdipCreateFontFromHFONT orgGdipCreateFontFromHFONT = NULL;
-static pGdipCreateFontFromDC orgGdipCreateFontFromDC = NULL;
-static pGdipCreateFont orgGdipCreateFont = NULL;
 static pGdipNewPrivateFontCollection ptrGdipNewPrivateFontCollection = NULL;
 static pGdipPrivateAddFontFile ptrGdipPrivateAddFontFile = NULL;
-static pGdipDrawString orgGdipDrawString = NULL;
-static pGdipDrawDriverString orgGdipDrawDriverString = NULL;
 
 // ===================== DirectWrite Types =====================
 typedef HRESULT(WINAPI* pDWriteCreateFactory)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
@@ -480,33 +430,7 @@ int WINAPI newDrawTextExW(HDC hdc, LPWSTR lpchText, int nCount, LPRECT lpRect, U
     return ret;
 }
 
-BOOL WINAPI newPolyTextOutA(HDC hdc, const POLYTEXTA* ppt, int nTexts) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    BOOL ret = orgPolyTextOutA(hdc, ppt, nTexts);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
 
-BOOL WINAPI newPolyTextOutW(HDC hdc, const POLYTEXTW* ppt, int nTexts) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    BOOL ret = orgPolyTextOutW(hdc, ppt, nTexts);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
-
-LONG WINAPI newTabbedTextOutA(HDC hdc, int x, int y, LPCSTR lpString, int nCount, int nTabPositions, const int* lpnTabPositions, int nTabOrigin) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    LONG ret = orgTabbedTextOutA(hdc, x, y, lpString, nCount, nTabPositions, lpnTabPositions, nTabOrigin);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
-
-LONG WINAPI newTabbedTextOutW(HDC hdc, int x, int y, LPCWSTR lpString, int nCount, int nTabPositions, const int* lpnTabPositions, int nTabOrigin) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    LONG ret = orgTabbedTextOutW(hdc, x, y, lpString, nCount, nTabPositions, lpnTabPositions, nTabOrigin);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
 
 // ===================== SelectObject Hook =====================
 // This is the KEY hook for games that cache HFONT handles.
@@ -791,8 +715,8 @@ BOOL WINAPI newGetTextMetricsW(HDC hdc, LPTEXTMETRICW lptm) {
 int WINAPI newEnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpProc, LPARAM lParam, DWORD dwFlags) {
     // Always call original first
     int ret = orgEnumFontFamiliesExA(hdc, lpLogfont, lpProc, lParam, dwFlags);
-    // Then inject our font if hook is active
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    // Then inject our font if hook is active and NOT in picker thread
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTA lf = {};
         strncpy_s(lf.lfFaceName, Config::ForcedFontNameA, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -804,7 +728,7 @@ int WINAPI newEnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA l
 
 int WINAPI newEnumFontFamiliesExW(HDC hdc, LPLOGFONTW lpLogfont, FONTENUMPROCW lpProc, LPARAM lParam, DWORD dwFlags) {
     int ret = orgEnumFontFamiliesExW(hdc, lpLogfont, lpProc, lParam, dwFlags);
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTW lf = {};
         wcsncpy_s(lf.lfFaceName, Config::ForcedFontNameW, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -817,6 +741,7 @@ int WINAPI newEnumFontFamiliesExW(HDC hdc, LPLOGFONTW lpLogfont, FONTENUMPROCW l
 // ===================== CreateFontIndirectEx Hooks =====================
 HFONT WINAPI newCreateFontIndirectExA(const ENUMLOGFONTEXDVA* lpelfe) {
     if (!lpelfe) return orgCreateFontIndirectExA(lpelfe);
+    if (IsPickerThread()) return orgCreateFontIndirectExA(lpelfe);
     EnsureInitialized();
     if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectExA(lpelfe);
     ENUMLOGFONTEXDVA elfe = *lpelfe;
@@ -831,6 +756,7 @@ HFONT WINAPI newCreateFontIndirectExA(const ENUMLOGFONTEXDVA* lpelfe) {
 
 HFONT WINAPI newCreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelfe) {
     if (!lpelfe) return orgCreateFontIndirectExW(lpelfe);
+    if (IsPickerThread()) return orgCreateFontIndirectExW(lpelfe);
     EnsureInitialized();
     if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectExW(lpelfe);
     ENUMLOGFONTEXDVW elfe = *lpelfe;
@@ -843,22 +769,12 @@ HFONT WINAPI newCreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelfe) {
     return orgCreateFontIndirectExW(&elfe);
 }
 
-// ===================== Font Resource Hooks (Passthrough) =====================
-int WINAPI newAddFontResourceA(LPCSTR lpFileName) { return orgAddFontResourceA(lpFileName); }
-int WINAPI newAddFontResourceW(LPCWSTR lpFileName) { return orgAddFontResourceW(lpFileName); }
-int WINAPI newAddFontResourceExA(LPCSTR name, DWORD fl, PVOID res) { return orgAddFontResourceExA(name, fl, res); }
-int WINAPI newAddFontResourceExW(LPCWSTR name, DWORD fl, PVOID res) { return orgAddFontResourceExW(name, fl, res); }
-HANDLE WINAPI newAddFontMemResourceEx(PVOID pFileView, DWORD cjSize, PVOID pvResrved, DWORD* pNumFonts) { return orgAddFontMemResourceEx(pFileView, cjSize, pvResrved, pNumFonts); }
-BOOL WINAPI newRemoveFontResourceA(LPCSTR lpFileName) { return orgRemoveFontResourceA(lpFileName); }
-BOOL WINAPI newRemoveFontResourceW(LPCWSTR lpFileName) { return orgRemoveFontResourceW(lpFileName); }
-BOOL WINAPI newRemoveFontResourceExA(LPCSTR name, DWORD fl, PVOID res) { return orgRemoveFontResourceExA(name, fl, res); }
-BOOL WINAPI newRemoveFontResourceExW(LPCWSTR name, DWORD fl, PVOID res) { return orgRemoveFontResourceExW(name, fl, res); }
-BOOL WINAPI newRemoveFontMemResourceEx(HANDLE fh) { return orgRemoveFontMemResourceEx(fh); }
+
 
 // ===================== Old-Style Font Enumeration Hooks =====================
 int WINAPI newEnumFontsA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc, LPARAM lParam) {
     int ret = orgEnumFontsA(hdc, lpFaceName, lpProc, lParam);
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTA lf = {};
         strncpy_s(lf.lfFaceName, Config::ForcedFontNameA, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -870,7 +786,7 @@ int WINAPI newEnumFontsA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc, LPARA
 
 int WINAPI newEnumFontsW(HDC hdc, LPCWSTR lpFaceName, FONTENUMPROCW lpProc, LPARAM lParam) {
     int ret = orgEnumFontsW(hdc, lpFaceName, lpProc, lParam);
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTW lf = {};
         wcsncpy_s(lf.lfFaceName, Config::ForcedFontNameW, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -882,7 +798,7 @@ int WINAPI newEnumFontsW(HDC hdc, LPCWSTR lpFaceName, FONTENUMPROCW lpProc, LPAR
 
 int WINAPI newEnumFontFamiliesA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc, LPARAM lParam) {
     int ret = orgEnumFontFamiliesA(hdc, lpFaceName, lpProc, lParam);
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTA lf = {};
         strncpy_s(lf.lfFaceName, Config::ForcedFontNameA, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -894,7 +810,7 @@ int WINAPI newEnumFontFamiliesA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc
 
 int WINAPI newEnumFontFamiliesW(HDC hdc, LPCWSTR lpFaceName, FONTENUMPROCW lpProc, LPARAM lParam) {
     int ret = orgEnumFontFamiliesW(hdc, lpFaceName, lpProc, lParam);
-    if (Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
         LOGFONTW lf = {};
         wcsncpy_s(lf.lfFaceName, Config::ForcedFontNameW, LF_FACESIZE - 1);
         lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
@@ -1039,47 +955,7 @@ DWORD WINAPI newGetFontUnicodeRanges(HDC hdc, LPGLYPHSET lpgs) {
     return ret;
 }
 
-// ===================== User32 Text Supplement Hooks =====================
-BOOL WINAPI newGrayStringA(HDC hdc, HBRUSH hBrush, GRAYSTRINGPROC lpOutputFunc, LPARAM lpData, int nCount, int X, int Y, int nWidth, int nHeight) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    BOOL ret = orgGrayStringA(hdc, hBrush, lpOutputFunc, lpData, nCount, X, Y, nWidth, nHeight);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
 
-BOOL WINAPI newGrayStringW(HDC hdc, HBRUSH hBrush, GRAYSTRINGPROC lpOutputFunc, LPARAM lpData, int nCount, int X, int Y, int nWidth, int nHeight) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    BOOL ret = orgGrayStringW(hdc, hBrush, lpOutputFunc, lpData, nCount, X, Y, nWidth, nHeight);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
-
-DWORD WINAPI newGetTabbedTextExtentA(HDC hdc, LPCSTR lpString, int chCount, int nTabPositions, const int* lpnTabStopPositions) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    DWORD ret = orgGetTabbedTextExtentA(hdc, lpString, chCount, nTabPositions, lpnTabStopPositions);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
-
-DWORD WINAPI newGetTabbedTextExtentW(HDC hdc, LPCWSTR lpString, int chCount, int nTabPositions, const int* lpnTabStopPositions) {
-    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
-    DWORD ret = orgGetTabbedTextExtentW(hdc, lpString, chCount, nTabPositions, lpnTabStopPositions);
-    if (hNew) { orgSelectObject(hdc, hOld); DeleteObject(hNew); }
-    return ret;
-}
-
-// ===================== GDI+ Measure Hooks (Passthrough) =====================
-GpStatus WINAPI newGdipMeasureString(GpGraphics* graphics, const WCHAR* string, INT length, const GpFont* font, const RectF* layoutRect, const GpStringFormat* stringFormat, RectF* boundingBox, INT* codepointsFitted, INT* linesFilled) {
-    return orgGdipMeasureString(graphics, string, length, font, layoutRect, stringFormat, boundingBox, codepointsFitted, linesFilled);
-}
-
-GpStatus WINAPI newGdipMeasureCharacterRanges(GpGraphics* graphics, const WCHAR* string, INT length, const GpFont* font, const RectF* layoutRect, const GpStringFormat* stringFormat, INT regionCount, GpRegion** regions) {
-    return orgGdipMeasureCharacterRanges(graphics, string, length, font, layoutRect, stringFormat, regionCount, regions);
-}
-
-GpStatus WINAPI newGdipMeasureDriverString(GpGraphics* graphics, const UINT16* text, INT length, const GpFont* font, const PointF* positions, INT flags, const Matrix* matrix, RectF* boundingBox) {
-    return orgGdipMeasureDriverString(graphics, text, length, font, positions, flags, matrix, boundingBox);
-}
 
 // ===================== GDI Font Creation Hooks =====================
 HFONT WINAPI newCreateFontA(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS, DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCSTR lpszF) {
@@ -1104,6 +980,7 @@ HFONT WINAPI newCreateFontA(int nH, int nW, int nE, int nO, int nWt, DWORD fI, D
 
 HFONT WINAPI newCreateFontIndirectA(const LOGFONTA* lplf) {
     if (!lplf) return orgCreateFontIndirectA(lplf);
+    if (IsPickerThread()) return orgCreateFontIndirectA(lplf);
     EnsureInitialized();
     DetectCharset(lplf->lfCharSet);
 
@@ -1148,7 +1025,7 @@ HFONT WINAPI newCreateFontIndirectA(const LOGFONTA* lplf) {
 HFONT WINAPI newCreateFontW(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS, DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCWSTR lpszF) {
     EnsureInitialized();
     DetectCharset(fC);
-    if (!Config::EnableFontHook && !Config::EnableCodepageSpoof)
+    if (IsPickerThread() || (!Config::EnableFontHook && !Config::EnableCodepageSpoof))
         return orgCreateFontW(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, lpszF);
 
     LPCWSTR fF = Config::EnableFaceNameReplace ? Config::ForcedFontNameW : lpszF;
@@ -1164,6 +1041,7 @@ HFONT WINAPI newCreateFontW(int nH, int nW, int nE, int nO, int nWt, DWORD fI, D
 
 HFONT WINAPI newCreateFontIndirectW(const LOGFONTW* lplf) {
     if (!lplf) return orgCreateFontIndirectW(lplf);
+    if (IsPickerThread()) return orgCreateFontIndirectW(lplf);
     EnsureInitialized();
     DetectCharset(lplf->lfCharSet);
     if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectW(lplf);
@@ -1217,25 +1095,7 @@ GpStatus WINAPI newGdipCreateFontFromLogfontA(HDC hdc, const LOGFONTA* logfont, 
     return orgGdipCreateFontFromLogfontA(hdc, logfont, font);
 }
 
-GpStatus WINAPI newGdipCreateFontFromHFONT(HDC hdc, HFONT hfont, GpFont** font) {
-    return orgGdipCreateFontFromHFONT(hdc, hfont, font);
-}
 
-GpStatus WINAPI newGdipCreateFontFromDC(HDC hdc, GpFont** font) {
-    return orgGdipCreateFontFromDC(hdc, font);
-}
-
-GpStatus WINAPI newGdipCreateFont(const GpFontFamily* fontFamily, REAL emSize, INT style, Unit unit, GpFont** font) {
-    return orgGdipCreateFont(fontFamily, emSize, style, unit, font);
-}
-
-GpStatus WINAPI newGdipDrawString(GpGraphics* graphics, const WCHAR* string, INT length, const GpFont* font, const RectF* layoutRect, const GpStringFormat* stringFormat, const GpBrush* brush) {
-    return orgGdipDrawString(graphics, string, length, font, layoutRect, stringFormat, brush);
-}
-
-GpStatus WINAPI newGdipDrawDriverString(GpGraphics* graphics, const UINT16* text, INT length, const GpFont* font, const GpBrush* brush, const PointF* positions, INT flags, const Matrix* matrix) {
-    return orgGdipDrawDriverString(graphics, text, length, font, brush, positions, flags, matrix);
-}
 
 // ===================== DirectWrite Hooks =====================
 
@@ -1258,9 +1118,7 @@ HRESULT STDMETHODCALLTYPE newCreateTextFormat(
     return orgCreateTextFormat(This, targetFont, fontCollection, fontWeight, fontStyle, fontStretch, fontSize, localeName, textFormat);
 }
 
-HRESULT STDMETHODCALLTYPE newIDWriteTextLayout_Draw(IDWriteTextLayout* This, void* clientDrawingContext, IDWriteTextRenderer* renderer, FLOAT originX, FLOAT originY) {
-    return orgIDWriteTextLayout_Draw(This, clientDrawingContext, renderer, originX, originY);
-}
+
 
 HRESULT STDMETHODCALLTYPE newCreateTextLayout(IDWriteFactory* This, const WCHAR* string, UINT32 stringLength, IDWriteTextFormat* textFormat, FLOAT maxWidth, FLOAT maxHeight, IDWriteTextLayout** textLayout) {
     HRESULT hr = orgCreateTextLayout(This, string, stringLength, textFormat, maxWidth, maxHeight, textLayout);
@@ -1270,10 +1128,7 @@ HRESULT STDMETHODCALLTYPE newCreateTextLayout(IDWriteFactory* This, const WCHAR*
         // 如果需要进一步拦截文本渲染，在这里 hook IDWriteTextLayout 的 vtable
         if (orgIDWriteTextLayout_Draw == NULL) {
             void** vtable = *(void***)(*textLayout);
-            orgIDWriteTextLayout_Draw = (pIDWriteTextLayout_Draw)vtable[18]; // Draw 索引通常为 18
-            DetourTransactionBegin(); DetourUpdateThread(GetCurrentThread());
-            DetourAttach(&(PVOID&)orgIDWriteTextLayout_Draw, newIDWriteTextLayout_Draw);
-            DetourTransactionCommit();
+            orgIDWriteTextLayout_Draw = (pIDWriteTextLayout_Draw)vtable[18]; // Draw Index is usually 18
         }
     }
     return hr;
@@ -1361,14 +1216,6 @@ void InstallGdiPlusHooks() {
     orgGdipCreateFontFamilyFromName = (pGdipCreateFontFamilyFromName)GetProcAddress(hGdiPlus, "GdipCreateFontFamilyFromName");
     orgGdipCreateFontFromLogfontW = (pGdipCreateFontFromLogfontW)GetProcAddress(hGdiPlus, "GdipCreateFontFromLogfontW");
     orgGdipCreateFontFromLogfontA = (pGdipCreateFontFromLogfontA)GetProcAddress(hGdiPlus, "GdipCreateFontFromLogfontA");
-    orgGdipCreateFontFromHFONT = (pGdipCreateFontFromHFONT)GetProcAddress(hGdiPlus, "GdipCreateFontFromHFONT");
-    orgGdipCreateFontFromDC = (pGdipCreateFontFromDC)GetProcAddress(hGdiPlus, "GdipCreateFontFromDC");
-    orgGdipCreateFont = (pGdipCreateFont)GetProcAddress(hGdiPlus, "GdipCreateFont");
-    orgGdipDrawString = (pGdipDrawString)GetProcAddress(hGdiPlus, "GdipDrawString");
-    orgGdipDrawDriverString = (pGdipDrawDriverString)GetProcAddress(hGdiPlus, "GdipDrawDriverString");
-    orgGdipMeasureString = (pGdipMeasureString)GetProcAddress(hGdiPlus, "GdipMeasureString");
-    orgGdipMeasureCharacterRanges = (pGdipMeasureCharacterRanges)GetProcAddress(hGdiPlus, "GdipMeasureCharacterRanges");
-    orgGdipMeasureDriverString = (pGdipMeasureDriverString)GetProcAddress(hGdiPlus, "GdipMeasureDriverString");
 
     LoadGdiPlusPrivateFont();
 
@@ -1377,14 +1224,6 @@ void InstallGdiPlusHooks() {
     if (orgGdipCreateFontFamilyFromName) DetourAttach(&(PVOID&)orgGdipCreateFontFamilyFromName, newGdipCreateFontFamilyFromName);
     if (orgGdipCreateFontFromLogfontW) DetourAttach(&(PVOID&)orgGdipCreateFontFromLogfontW, newGdipCreateFontFromLogfontW);
     if (orgGdipCreateFontFromLogfontA) DetourAttach(&(PVOID&)orgGdipCreateFontFromLogfontA, newGdipCreateFontFromLogfontA);
-    if (orgGdipCreateFontFromHFONT) DetourAttach(&(PVOID&)orgGdipCreateFontFromHFONT, newGdipCreateFontFromHFONT);
-    if (orgGdipCreateFontFromDC) DetourAttach(&(PVOID&)orgGdipCreateFontFromDC, newGdipCreateFontFromDC);
-    if (orgGdipCreateFont) DetourAttach(&(PVOID&)orgGdipCreateFont, newGdipCreateFont);
-    if (orgGdipDrawString) DetourAttach(&(PVOID&)orgGdipDrawString, newGdipDrawString);
-    if (orgGdipDrawDriverString) DetourAttach(&(PVOID&)orgGdipDrawDriverString, newGdipDrawDriverString);
-    if (orgGdipMeasureString) DetourAttach(&(PVOID&)orgGdipMeasureString, newGdipMeasureString);
-    if (orgGdipMeasureCharacterRanges) DetourAttach(&(PVOID&)orgGdipMeasureCharacterRanges, newGdipMeasureCharacterRanges);
-    if (orgGdipMeasureDriverString) DetourAttach(&(PVOID&)orgGdipMeasureDriverString, newGdipMeasureDriverString);
     DetourTransactionCommit();
 
     g_GdiPlusHooksInstalled = true;
@@ -1415,10 +1254,6 @@ void InstallHooks(HMODULE hModule) {
     DetourAttach(&(PVOID&)orgDrawTextW, newDrawTextW);
     DetourAttach(&(PVOID&)orgDrawTextExA, newDrawTextExA);
     DetourAttach(&(PVOID&)orgDrawTextExW, newDrawTextExW);
-    DetourAttach(&(PVOID&)orgPolyTextOutA, newPolyTextOutA);
-    DetourAttach(&(PVOID&)orgPolyTextOutW, newPolyTextOutW);
-    DetourAttach(&(PVOID&)orgTabbedTextOutA, newTabbedTextOutA);
-    DetourAttach(&(PVOID&)orgTabbedTextOutW, newTabbedTextOutW);
 
     // SelectObject — intercepts cached font selection into any DC
     DetourAttach(&(PVOID&)orgSelectObject, newSelectObject);
@@ -1461,17 +1296,7 @@ void InstallHooks(HMODULE hModule) {
     DetourAttach(&(PVOID&)orgCreateFontIndirectExA, newCreateFontIndirectExA);
     DetourAttach(&(PVOID&)orgCreateFontIndirectExW, newCreateFontIndirectExW);
 
-    // Font resource loading/unloading
-    DetourAttach(&(PVOID&)orgAddFontResourceA, newAddFontResourceA);
-    DetourAttach(&(PVOID&)orgAddFontResourceW, newAddFontResourceW);
-    DetourAttach(&(PVOID&)orgAddFontResourceExA, newAddFontResourceExA);
-    DetourAttach(&(PVOID&)orgAddFontResourceExW, newAddFontResourceExW);
-    DetourAttach(&(PVOID&)orgAddFontMemResourceEx, newAddFontMemResourceEx);
-    DetourAttach(&(PVOID&)orgRemoveFontResourceA, newRemoveFontResourceA);
-    DetourAttach(&(PVOID&)orgRemoveFontResourceW, newRemoveFontResourceW);
-    DetourAttach(&(PVOID&)orgRemoveFontResourceExA, newRemoveFontResourceExA);
-    DetourAttach(&(PVOID&)orgRemoveFontResourceExW, newRemoveFontResourceExW);
-    DetourAttach(&(PVOID&)orgRemoveFontMemResourceEx, newRemoveFontMemResourceEx);
+
 
     // Old-style font enumeration
     DetourAttach(&(PVOID&)orgEnumFontsA, newEnumFontsA);
@@ -1503,10 +1328,7 @@ void InstallHooks(HMODULE hModule) {
     DetourAttach(&(PVOID&)orgGetFontUnicodeRanges, newGetFontUnicodeRanges);
 
     // User32 text supplement
-    DetourAttach(&(PVOID&)orgGrayStringA, newGrayStringA);
-    DetourAttach(&(PVOID&)orgGrayStringW, newGrayStringW);
-    DetourAttach(&(PVOID&)orgGetTabbedTextExtentA, newGetTabbedTextExtentA);
-    DetourAttach(&(PVOID&)orgGetTabbedTextExtentW, newGetTabbedTextExtentW);
+
 
     // DirectWrite
     HMODULE hDWrite = GetModuleHandleW(L"dwrite.dll");
