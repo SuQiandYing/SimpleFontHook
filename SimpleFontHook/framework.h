@@ -54,6 +54,7 @@ namespace Config {
     extern bool DxLibDisableFontCache;
     extern bool DxLibReplaceFontDataQueries;
     extern bool DxLibClearRuntimeFontCacheOnSwitch;
+    extern bool EnableTinkerBellHook;
     extern wchar_t DxLibCachedFontNameW[LF_FACESIZE];
 
     extern wchar_t ForcedFontNameW[LF_FACESIZE];

@@ -1,0 +1,103 @@
+namespace TinkerBellCompat {
+
+static int g_engineProbe = -1;
+
+static bool PathExistsW(const wchar_t* path) {
+    return path && path[0] && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool AppendRootFile(wchar_t* out, size_t outCount, const wchar_t* root, const wchar_t* fileName) {
+    if (!out || outCount == 0 || !root || !fileName) return false;
+    out[0] = L'\0';
+    if (wcscpy_s(out, outCount, root) != 0) return false;
+    return PathAppendW(out, fileName) != FALSE;
+}
+
+static bool BufferContainsAscii(const std::vector<BYTE>& bytes, const char* needle) {
+    if (!needle || !needle[0]) return false;
+    size_t needleLen = lstrlenA(needle);
+    if (bytes.size() < needleLen) return false;
+
+    for (size_t i = 0; i <= bytes.size() - needleLen; ++i) {
+        if (memcmp(bytes.data() + i, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
+
+static bool FileContainsAnyAsciiMarker(const wchar_t* path, const char* const* markers, size_t markerCount) {
+    if (!path || !path[0] || !markers || markerCount == 0) return false;
+
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 32 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<BYTE> bytes((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size()) return false;
+
+    for (size_t i = 0; i < markerCount; ++i) {
+        if (BufferContainsAscii(bytes, markers[i])) return true;
+    }
+    return false;
+}
+
+static bool LooksLikeEngineRoot() {
+    if (g_engineProbe != -1) return g_engineProbe != 0;
+
+    wchar_t exePath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(NULL, exePath, _countof(exePath)) || !exePath[0]) {
+        g_engineProbe = 0;
+        return false;
+    }
+
+    wchar_t root[MAX_PATH] = {};
+    if (wcscpy_s(root, exePath) != 0 || !PathRemoveFileSpecW(root)) {
+        g_engineProbe = 0;
+        return false;
+    }
+
+    wchar_t arc00[MAX_PATH] = {};
+    wchar_t arc01[MAX_PATH] = {};
+    wchar_t renderDll[MAX_PATH] = {};
+    bool hasArc00 = AppendRootFile(arc00, _countof(arc00), root, L"Arc00.dat") && PathExistsW(arc00);
+    bool hasArc01 = AppendRootFile(arc01, _countof(arc01), root, L"Arc01.dat") && PathExistsW(arc01);
+    bool hasRenderDll = AppendRootFile(renderDll, _countof(renderDll), root, L"render.dll") && PathExistsW(renderDll);
+
+    static const char* const markers[] = {
+        "Software\\TinkerBell\\",
+        "Cyberworks \"TinkerBell\"",
+        "TinkerBell",
+        "Tinkerbell",
+    };
+    bool hasMarker = FileContainsAnyAsciiMarker(exePath, markers, sizeof(markers) / sizeof(markers[0]));
+    bool detected = hasArc00 && hasArc01 && hasRenderDll && hasMarker;
+    g_engineProbe = detected ? 1 : 0;
+
+    if (detected) {
+        Utils::Trace("[DEBUG][TinkerBell] engine-root detected arc00=%d arc01=%d render=%d marker=%d wideFontCreation=off selectObjectTrackedOnly=on",
+            hasArc00 ? 1 : 0, hasArc01 ? 1 : 0, hasRenderDll ? 1 : 0, hasMarker ? 1 : 0);
+    }
+    return detected;
+}
+
+static bool IsCompatibilityActive() {
+    return Config::EnableTinkerBellHook && LooksLikeEngineRoot();
+}
+
+static bool ShouldSkipWideFontCreationHook() {
+    return IsCompatibilityActive();
+}
+
+static bool ShouldPassThroughUntrackedSelectObject() {
+    return IsCompatibilityActive();
+}
+
+} // namespace TinkerBellCompat

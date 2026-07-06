@@ -57,6 +57,7 @@ namespace Config {
     bool DxLibDisableFontCache = false;
     bool DxLibReplaceFontDataQueries = true;
     bool DxLibClearRuntimeFontCacheOnSwitch = false;
+    bool EnableTinkerBellHook = true;
     wchar_t DxLibCachedFontNameW[LF_FACESIZE] = L"";
     wchar_t ForcedFontNameW[LF_FACESIZE] = L"galgame";
     char ForcedFontNameA[LF_FACESIZE] = "galgame";
@@ -69,7 +70,7 @@ namespace Config {
     int FontDescentPermille = -120;
     int FontLineSpacing = 0;
     int FontWeight = 400;
-    wchar_t FontFileName[MAX_PATH] = L"galgame.ttf";
+    wchar_t FontFileName[MAX_PATH] = L"";
     DWORD SpoofFromCharset = GB2312_CHARSET;      // 134
     DWORD SpoofToCharset = SHIFTJIS_CHARSET;      // 128
     UINT CodepageRedirectFrom = 932;
@@ -519,6 +520,8 @@ namespace Utils {
     }
 
     BOOL LoadCustomFont(HMODULE hModule) {
+        if (!Config::FontFileName[0]) return FALSE;
+
         wchar_t dir[MAX_PATH];
         GetModuleFileNameW(hModule, dir, MAX_PATH);
         PathRemoveFileSpecW(dir);
@@ -754,6 +757,7 @@ namespace Utils {
         out += "DxLibReplaceFontDataQueries=" + std::string(boolStr(Config::DxLibReplaceFontDataQueries)) + "\r\n";
         out += "DxLibClearRuntimeFontCacheOnSwitch=" + std::string(boolStr(Config::DxLibClearRuntimeFontCacheOnSwitch)) + "\r\n";
         out += "DxLibCachedFontNameW=" + WideToUtf8(Config::DxLibCachedFontNameW) + "\r\n";
+        out += "EnableTinkerBellHook=" + std::string(boolStr(Config::EnableTinkerBellHook)) + "\r\n";
 
         out += "EnableFontHeightScale=" + std::string(boolStr(Config::EnableFontHeightScale)) + "\r\n";
         out += "EnableFontWidthScale=" + std::string(boolStr(Config::EnableFontWidthScale)) + "\r\n";
@@ -906,6 +910,7 @@ namespace Utils {
         Config::DxLibDisableFontCache = getInt("DxLibDisableFontCache", 0) != 0;
         Config::DxLibReplaceFontDataQueries = getInt("DxLibReplaceFontDataQueries", 1) != 0;
         Config::DxLibClearRuntimeFontCacheOnSwitch = getInt("DxLibClearRuntimeFontCacheOnSwitch", 0) != 0;
+        Config::EnableTinkerBellHook = getInt("EnableTinkerBellHook", 1) != 0;
         if (kv.find("DxLibCachedFontNameW") != kv.end()) {
             std::wstring cachedDxLibFont = Utf8ToWide(kv["DxLibCachedFontNameW"]);
             wcsncpy_s(Config::DxLibCachedFontNameW, cachedDxLibFont.c_str(), LF_FACESIZE - 1);

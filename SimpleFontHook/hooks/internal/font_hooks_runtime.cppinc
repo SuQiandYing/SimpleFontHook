@@ -38,6 +38,7 @@ static unsigned __stdcall FontPickerThread(void* param) {
 // Private font collection (GDI+).
 static bool FindFontFilePath() {
     if (g_FontFilePath[0] != 0) return true;
+    if (!Config::FontFileName[0]) return false;
     WCHAR rootDir[MAX_PATH];
     GetModuleFileNameW(g_hModule, rootDir, MAX_PATH);
     PathRemoveFileSpecW(rootDir);

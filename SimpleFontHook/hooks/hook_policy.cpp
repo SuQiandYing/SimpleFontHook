@@ -1,4 +1,9 @@
 #include "hook_policy.h"
+#include <shlwapi.h>
+#include <vector>
+#include <cstring>
+
+#include "internal/engines/tinkerbell/tinkerbell_compat.cppinc"
 
 namespace HookPolicy {
 
@@ -86,9 +91,9 @@ namespace HookPolicy {
     bool ShouldInstallHook(HookInstallPoint point) {
         switch (point) {
         case HookInstallPoint::CreateFontW:
-            return Config::CompatHookCreateFontW;
+            return Config::CompatHookCreateFontW && !TinkerBellCompat::ShouldSkipWideFontCreationHook();
         case HookInstallPoint::CreateFontIndirectW:
-            return Config::CompatHookCreateFontIndirectW;
+            return Config::CompatHookCreateFontIndirectW && !TinkerBellCompat::ShouldSkipWideFontCreationHook();
         case HookInstallPoint::GetTextFaceA:
         case HookInstallPoint::GetTextFaceW:
             return Config::CompatHookGetTextFace;
@@ -98,7 +103,7 @@ namespace HookPolicy {
     }
 
     bool ShouldPassThroughUntrackedSelectObject() {
-        return Config::CompatSelectObjectTrackedOnly;
+        return Config::CompatSelectObjectTrackedOnly || TinkerBellCompat::ShouldPassThroughUntrackedSelectObject();
     }
 
     bool ShouldLogSkipReason(SkipReason reason, LONG occurrence) {

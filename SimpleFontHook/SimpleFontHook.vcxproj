@@ -216,6 +216,7 @@
     <None Include="hooks\internal\engines\majiro\majiro_font_cache.cppinc" />
     <None Include="hooks\internal\engines\mirai\mirai_font_data.cppinc" />
     <None Include="hooks\internal\engines\softpal\softpal_default_font.cppinc" />
+    <None Include="hooks\internal\engines\tinkerbell\tinkerbell_compat.cppinc" />
     <None Include="hooks\internal\model\font_hooks_codepage_epoch.cppinc" />
     <None Include="hooks\internal\model\font_hooks_metric_adjust.cppinc" />
     <None Include="hooks\internal\model\font_hooks_replacement_cache.cppinc" />
