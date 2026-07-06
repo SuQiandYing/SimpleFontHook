@@ -115,7 +115,7 @@ EnableFontWeight=0
 | `EnableCharsetReplace` | 是否强制 `LOGFONT` 字符集。 |
 | `ForcedCharset` | 强制字符集，例如 `128` 是 Shift-JIS，`134` 是 GB2312。 |
 | `EnableTextSubstitution` | 启用字符映射。 |
-| `TextSubstitutionMode` | `0` 日文旧字体/异体字到繁体，`1` 繁转简，`2` 简转繁。 |
+| `TextSubstitutionMode` | `0` 日繁，`1` 繁转简，`2` 简转繁。 |
 | `EnableCodepageRedirect` | 重定向 WinAPI 代码页转换。 |
 | `CodepageRedirectFrom` / `CodepageRedirectTo` | 例如 `932 -> 65001` 可把 CP932 解码请求改为 UTF-8。 |
 | `EnableCodepageSpoof` | 修补字体代码页声明，供会读取字体表的引擎使用。 |
