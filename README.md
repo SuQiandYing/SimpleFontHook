@@ -1,59 +1,233 @@
 # SimpleFontHook
 
-SimpleFontHook 是一个面向 Windows 视觉小说/galgame 的字体替换与兼容性 DLL。它通过 `winmm.dll` 代理加载进入游戏进程，拦截 GDI/GDI+/部分 DirectWrite 字体相关 API，让旧游戏可以在运行时切换系统字体或本地字体，并处理常见的日文引擎字形、字体缓存、预渲染字体和编码问题。
+SimpleFontHook 是一个面向 Windows 视觉小说/galgame 的运行时字体替换 DLL。
 
-项目地址：[SuQiandYing/SimpleFontHook](https://github.com/SuQiandYing/SimpleFontHook)
+它被构建成 `winmm.dll` 代理：把生成的 DLL 放到游戏主程序同目录后，游戏会优先加载这个本地 `winmm.dll`。DLL 会继续把原本的 `winmm` 导出转发到系统 `C:\Windows\System32\winmm.dll`，同时在游戏进程内用 Microsoft Detours 挂钩字体、文本、编码转换、字体文件读取和若干引擎特定路径。
 
-## 主要功能
+这个项目的目标不是做通用翻译器，而是解决游戏里常见的字体替换问题：
 
-- 游戏内字体选择器：搜索系统字体和同目录本地字体，预览后双击或回车应用。
-- 字体替换：替换 `CreateFont*` / `CreateFontIndirect*` 创建出来的字体句柄，并跟踪 `SelectObject` 后的 HDC 字体状态。
-- 文本绘制兼容：覆盖 `TextOut`、`ExtTextOut`、`DrawText`、`GetGlyphOutline`、`GetTextExtent*`、`GetCharWidth*`、`GetCharABCWidths*`、`GetGlyphIndices*` 等常见 GDI 文本路径。
-- 字体参数微调：字宽、字高、字距、上行、下行、行距、粗细。
-- 字体表修补：可修补字体 `OS/2` 代码页范围、垂直度量、name 表，以及部分 Unicode `cmap` 映射。
-- 文本映射：支持日文旧字体/异体字到繁体字、繁简互转、指定代码页文本替换。
-- 代码页重定向：拦截 `MultiByteToWideChar` / `WideCharToMultiByte`，用于处理硬编码 CP932、UTF-8 补丁等场景。
-- 引擎兼容层：针对 Artemis、旧版 Artemis、KiriKiri、Softpal、Escu:de、Mirai、Majiro、DxLib、TinkerBell / Cyberworks 做了专门处理。
-- 调试和诊断：输出 `FontHook.trace.log`，包含启动、热切换、字体数据、引擎兼容层、崩溃和卡死诊断信息。
+- 游戏硬编码了日文字体、宋体、黑体或某个不存在的字体。
+- 字体枚举、字符集、字体数据查询和实际绘制结果不一致。
+- 引擎使用预渲染字库、字体缓存或私有字体文件，单纯改 `CreateFont` 不生效。
+- 更换字体后行距、字距、字形索引缓存、字体表信息导致显示错位或乱码。
 
 ## 快速使用
 
-1. 下载或编译得到 `winmm.dll`。
-2. 确认游戏位数：
-   - 绝大多数旧 galgame 是 32 位程序，使用 `Release/winmm.dll`。
-   - 64 位游戏才使用 `x64/Release/winmm.dll`。
-3. 把 `winmm.dll` 复制到游戏主程序 `.exe` 同目录。
-4. 如果想让工具加载本地字体，把 `.ttf` / `.otf` / `.ttc` / `.fon` 放到同目录，字体选择器会扫描并加载这些本地字体。
-5. 启动游戏。字体选择器会弹出，选择字体后双击或按回车应用。
-6. 之后配置会写入游戏目录下的 `FontHook.ini`。再次启动时会自动恢复上次字体。
+前提：目标游戏进程需要会加载 `winmm.dll`。如果游戏本身不导入或加载 `winmm.dll`，只把代理 DLL 放到目录里不会自动生效。
 
-如果游戏目录已有同名 `winmm.dll`，先备份原文件。DLL 位数必须和游戏位数一致，否则不会加载。
+1. 确认游戏位数。
+   - 32 位游戏使用 `Release\winmm.dll`。
+   - 64 位游戏使用 `x64\Release\winmm.dll`。
+2. 把对应的 `winmm.dll` 复制到游戏 `.exe` 同目录。
+3. 启动游戏。首次没有配置时会弹出字体选择窗口。
+4. 选择字体后点击应用，配置会写入游戏目录下的 `FontHook.ini`。
+5. 之后如果窗口不自动显示，可以用热键呼出：
+   - 优先注册 `Ctrl+Alt+F`
+   - 如果冲突，回退到 `Ctrl+Alt+Shift+F`
+   - 再冲突，回退到 `Ctrl+Alt+F8`
 
-## 字体选择器
+如果想使用游戏目录里的字体文件，把 `.ttf`、`.otf`、`.ttc` 或 `.fon` 放在游戏主程序同目录。字体选择器启动时会用私有字体方式加载这些文件并加入列表。
 
-默认启动后显示字体选择窗口。保存过配置后，可以通过 `PickerShowOnStartup=0` 让窗口启动时隐藏。
+## 主要功能
 
-常用操作：
+### 字体选择器
 
-- `Ctrl+Alt+F`：显示/隐藏字体选择器。
-- 如果热键被占用，会依次尝试 `Ctrl+Alt+Shift+F`、`Ctrl+Alt+F8`。
-- 搜索框：按字体名过滤。
-- 上下键 / PageUp / PageDown / Home / End：切换选中项。
-- 回车或双击：应用字体。
-- Esc：隐藏窗口。
-- 标题栏 `A-` / `A+`：缩放选择器界面。
+字体选择器运行在游戏进程里的独立 UI 线程，窗口标题为 `Font Selection Assistant`。它支持：
 
-选择器里的参数栏可以调整字宽、字高、字距、上行、下行、行距和粗细。部分参数会创建临时的字体克隆并修补字体表，用来影响直接读取字体数据的引擎。
+- 搜索和筛选字体。
+- 枚举系统字体和游戏目录下的本地字体文件。
+- 按字符集查看字体，覆盖默认、简体中文、日文、繁体中文、韩文等常见 GDI 字符集。
+- 双击或按 Enter 应用字体。
+- 上下、PageUp/PageDown、Home/End 导航列表，Esc 隐藏窗口。
+- A-/A+ 调整选择器自身缩放。
+- 运行时调整字体高度、宽度、字距、纵向指标、行距和字重。
+- 根据参考字体自动推导纵向指标。
+- 切换代码页伪装、文本替换和代码页重定向选项。
+
+设置会保存到 `FontHook.ini`。如果配置中 `PickerShowOnStartup=0`，已有配置时选择器默认隐藏，但热键仍然注册。
+
+### GDI 字体替换
+
+核心路径围绕 GDI 实现，覆盖游戏最常见的文本渲染方式：
+
+- `CreateFontA/W`
+- `CreateFontIndirectA/W`
+- `CreateFontIndirectExA/W`
+- `SelectObject`
+- `GetCurrentObject`
+- `TextOutA/W`
+- `ExtTextOutA/W`
+- `DrawTextA/W`
+- `DrawTextExA/W`
+
+启用字体替换后，Hook 会尽量把游戏创建或选入 DC 的字体替换为配置字体，并维护原始字体到替换字体的缓存，避免每次绘制重复创建字体。
+
+### 字体查询和布局兼容
+
+很多游戏不会只看绘制结果，还会查询字体名称、字符集、字形宽度、字形轮廓、字体表或 Unicode 范围。项目因此也挂钩了大量查询函数，例如：
+
+- `GetTextMetricsA/W`
+- `GetTextCharset`
+- `GetTextCharsetInfo`
+- `EnumFontFamiliesExA/W`
+- `EnumFontsA/W`
+- `EnumFontFamiliesA/W`
+- `GetGlyphOutlineA/W`
+- `GetGlyphIndicesA/W`
+- `GetCharacterPlacementA/W`
+- `GetCharWidth*`
+- `GetCharABCWidths*`
+- `GetTextExtent*`
+- `GetOutlineTextMetricsA/W`
+- `GetKerningPairsA/W`
+- `GetFontData`
+- `GetFontLanguageInfo`
+- `GetFontUnicodeRanges`
+
+`GetTextFaceA/W` 默认不启用替换，因为部分游戏会依赖真实字体名判断内部逻辑；需要时可以通过 `CompatHookGetTextFace=1` 打开。
+
+### GDI+ 和 DirectWrite
+
+项目包含有限的 GDI+ 与 DirectWrite 支持：
+
+- GDI+：挂钩字体族创建和从 `LOGFONT` 创建字体的路径，按当前配置字体名做替换。
+- DirectWrite：挂钩 `DWriteCreateFactory`，再处理 `IDWriteFactory::CreateTextFormat` 和 `CreateTextLayout`。目前主要用于字体族替换、部分字号/字重调整和创建布局时的文本替换。
+
+这部分不是完整的 DirectWrite 渲染管线替换。如果游戏完全绕过 GDI/GDI+ 并自己管理字形贴图，仍然可能需要引擎兼容层配合。
+
+### 字体表、字符集和字形缓存处理
+
+当启用相关选项时，SimpleFontHook 会对运行时字体和返回给游戏的字体信息做补丁：
+
+- 修改 `OS/2` 表的代码页范围，解决游戏按字体表判断字符集的问题。
+- 修改 `hhea`/`OS/2` 纵向指标，缓解行高、上沿、下沿不合适的问题。
+- 为文本替换场景维护虚拟字形索引，减少游戏缓存旧 glyph index 后显示错字的情况。
+- 对部分字体文件或内存字体克隆改写 name/cmap/metric 信息。
+
+字体选择器在启用代码页伪装或纵向指标补丁时，会尽量从当前字体文件创建一个内部克隆字体。内部克隆字体名形如 `SFxxxx`，保存配置时会尽量保存原始字体名，而不是这个临时名字。
+
+### 文本与代码页处理
+
+项目包含三类文本/编码相关能力：
+
+- 代码页伪装：让字体或字体查询看起来属于另一个 GDI 字符集，例如把 GB2312 字体伪装成 Shift-JIS 可用字体。
+- 代码页重定向：挂钩 `MultiByteToWideChar` 和 `WideCharToMultiByte`，把指定来源代码页重定向到目标代码页。
+- 文本替换：内置字符映射表，支持日文兼容/繁体代理、繁转简、简转繁三种模式。
+
+这些功能会影响进程内 API 行为，不建议无脑全开。通常先只改字体；如果字体能替换但文字乱码、缺字或游戏坚持使用日文字体，再逐项开启。
+
+## 引擎兼容层
+
+代码里包含针对若干常见 galgame 引擎的兼容处理。检测通过文件布局、资源标记或可执行文件内容完成，只有命中对应特征时才会走更深的路径。
+
+### Artemis
+
+当前 Artemis 路径支持：
+
+- 检测 `.pfs`、`system\table` 等目录结构。
+- 虚拟化 `system\table\list_windows*.tbl`。
+- 修改表里的 `face`、`rubyface`、`kerning`、`spacemiddle`、`size`、`rubysize` 等字体相关字段。
+- 支持从 PFS 资源或 loose file 读取表数据。
+- 提供虚拟字体路径，默认类似 `FontHook.ttf`，并在配置变更时附加版本后缀以绕过缓存。
+- 在 32 位 Artemis 上尝试刷新部分内部 FreeType 对象和字体 atlas；64 位路径避免不可靠的内部地址扫描。
+
+### Artemis Legacy
+
+旧 Artemis 路径主要处理 loose `.iet` 脚本和旧式资源：
+
+- 修改 `.iet` 里的 `face`、`rubyface`、`font_face`、`g.font_face`、`kerning`、`spacemiddle`、`size`、`rubysize` 等字段。
+- 可对脚本文本做内置文本替换。
+- 隐藏 `.rft` 预渲染字体文件。
+- 提供虚拟字体文件，并可对字体 name/cmap/metric/codepage 表做补丁。
+
+旧 Artemis 没有安全的通用运行时缓存布局，因此配置变更后主要同步虚拟文件和诊断信息，不做现代 Artemis 那种对象扫描。
+
+### KiriKiri/KRKR
+
+KRKR 兼容层主要处理预渲染字体：
+
+- 检测 `.xp3` 和 `font\*.tft`。
+- 把主模块里的 `mapPrerenderedFont` 字符串改为 `sfhPrerenderedFont`，使引擎不再命中原预渲染路径。
+- 隐藏 `.tft` 文件，迫使游戏走可替换字体路径。
+
+### Softpal
+
+Softpal 兼容层主要处理 `Pal.dll` 和 `DEFAULT_FONT.DAT`：
+
+- 检测 `dll\Pal.dll` 和 `.pac` 资源。
+- 挂钩 `PalFontBegin`、`PalFontSetType`、`PalFontGetType`。
+- 可隐藏 `DEFAULT_FONT.DAT`。
+- 可把默认字体选项映射到系统字体路径。
+- 在替换字体构造时保留 Softpal 更依赖的自然宽度行为。
+
+### Escu:de
+
+Escu:de 兼容层处理配置文件里的字体项：
+
+- 检测 `configure.cfg` 里的 `[General] Company=ESCUDE`。
+- 虚拟化 `[Font]` 下的 `Face` 或 `Font`。
+- 同时覆盖游戏目录和 `Documents\ESCUDE\<Product>\configure.cfg` 的读取。
+
+### Mirai
+
+Mirai 兼容层围绕 FreeType 和字体文件读取：
+
+- 检测 `arc0.dat`、`script.dat`、`Setting.exe` 及可执行文件中的 FreeType/字体配置标记。
+- 可替换 `GetFontData` 返回的数据源。
+- 可把游戏读取的 Windows 字体文件重定向到当前选择字体。
+- 可在配置变更时固定一份字体数据源，减少运行时切换导致的查询不一致。
+
+### Majiro
+
+Majiro 兼容层主要处理字体缓存：
+
+- 检测 `.arc` 和 Majiro 相关可执行文件标记。
+- 可隐藏或绕过 `savedata` 下的字体缓存文件。
+- 配置变更时尝试刷新运行时字体缓存和脏标记。
+- 对部分 A 系文本路径提供 CP932 fallback。
+
+### DxLib
+
+DxLib 兼容层处理 DxLib 字体缓存和字体数据查询：
+
+- 检测可执行文件里的 `DxLib`、`GetGlyphOutlineA`、`CreateFontToHandle` 等标记。
+- 可替换 `GetFontData` 查询结果。
+- 可按配置隐藏或绕过 `_FONTSET.MED` 等字体缓存文件。
+- 可记录缓存字体名。
+- 可选运行时清理字体缓存；默认关闭，因为这类内部缓存布局更容易随游戏版本变化。
+
+### TinkerBell/Cyberworks
+
+TinkerBell 兼容层偏保守：
+
+- 检测 `Arc00.dat`、`Arc01.dat`、`render.dll` 和可执行文件中的 TinkerBell/Cyberworks 标记。
+- 命中后会跳过部分宽字符字体创建 Hook。
+- 对未被 SimpleFontHook 跟踪的 `SelectObject` 字体句柄尽量放行，减少引擎内部字体对象被误替换。
 
 ## 配置文件
 
-配置文件位于游戏目录：
+配置文件路径固定为游戏主程序同目录的 `FontHook.ini`，保存时使用 UTF-8 BOM。读取配置时只要求存在 `FontNameW`；没有配置时默认弹出字体选择器。
 
-```ini
-FontHook.ini
-```
+常见字符集数值：
 
-典型配置示例：
+| 名称 | 数值 |
+| --- | ---: |
+| `ANSI_CHARSET` | `0` |
+| `DEFAULT_CHARSET` | `1` |
+| `SHIFTJIS_CHARSET` | `128` |
+| `HANGUL_CHARSET` | `129` |
+| `GB2312_CHARSET` | `134` |
+| `CHINESEBIG5_CHARSET` | `136` |
+
+文本替换模式：
+
+| `TextSubstitutionMode` | 含义 |
+| ---: | --- |
+| `0` | 日文兼容/繁体代理映射 |
+| `1` | 繁体中文转简体中文 |
+| `2` | 简体中文转繁体中文 |
+
+下面是当前代码会保存和读取的主要字段示例：
 
 ```ini
 [FontHook]
@@ -62,39 +236,66 @@ FontNameA=Microsoft YaHei
 EnableFontHook=1
 EnableFaceNameReplace=1
 EnableCharsetReplace=1
-ForcedCharset=128
-PickerShowOnStartup=1
-EnableDebugLog=0
+ForcedCharset=134
+
+EnableCodepageSpoof=0
+EnableCodepageRuntimeReplace=0
+SpoofFromCharset=134
+SpoofToCharset=128
+
+EnableCodepageRedirect=0
+CodepageRedirectFrom=932
+CodepageRedirectTo=65001
 
 EnableTextSubstitution=0
 TextSubstitutionMode=0
 TextSubstitutionCodepage=932
 
-EnableCodepageSpoof=0
-EnableCodepageRuntimeReplace=0
-EnableCodepageRedirect=0
-CodepageRedirectFrom=932
-CodepageRedirectTo=65001
+PickerShowOnStartup=1
+EnableDebugLog=0
+DebugSlowMs=50
+DebugTraceSampleLimit=0
+DebugPickerThreadLogLimit=0
+
+CompatSkipDrawTextA=1
+CompatSkipFontDataQueries=1
+CompatSelectObjectTrackedOnly=0
+CompatHookCreateFontW=1
+CompatHookCreateFontIndirectW=1
+CompatHookGetTextFace=0
 
 EnableArtemisHook=1
 ArtemisPatchTables=1
 ArtemisRedirectFontFiles=1
 ArtemisClearFontCacheOnSwitch=1
+ArtemisFontPath=
+ArtemisFontSize=0
+ArtemisRubySize=-1
 
 EnableKrkrHook=1
 KrkrDisablePrerenderedFonts=1
+
 EnableSoftpalHook=1
 SoftpalDisableDefaultFontDat=1
 SoftpalForceDefaultOptionToSystemFont=1
+
 EnableEscudeHook=1
 EscudeVirtualFontConfig=1
+
 EnableMiraiHook=1
 MiraiReplaceFontDataQueries=1
 MiraiRedirectFontFiles=1
+MiraiPinFontDataSource=1
+
 EnableMajiroHook=1
 MajiroDisableFontCache=1
+
 EnableDxLibHook=1
 DxLibDisableFontCache=0
+DxLibReplaceFontDataQueries=1
+DxLibClearRuntimeFontCacheOnSwitch=0
+DxLibCachedFontNameW=
+
 EnableTinkerBellHook=1
 
 EnableFontHeightScale=0
@@ -103,186 +304,148 @@ EnableFontCharSpacing=0
 EnableFontVerticalMetrics=0
 EnableFontLineSpacing=0
 EnableFontWeight=0
+FontHeightScale1000=1000
+FontWidthScale1000=1000
+FontCharSpacing=0
+FontAscentPermille=880
+FontDescentPermille=-120
+FontLineSpacing=0
+FontWeight=400
 ```
 
-常用开关说明：
+说明：
 
-| 配置项 | 作用 |
-| --- | --- |
-| `FontNameW` / `FontNameA` | 当前目标字体名。选择器会自动写入。 |
-| `EnableFontHook` | 是否启用字体替换主逻辑。 |
-| `EnableFaceNameReplace` | 是否替换字体名。 |
-| `EnableCharsetReplace` | 是否强制 `LOGFONT` 字符集。 |
-| `ForcedCharset` | 强制字符集，例如 `128` 是 Shift-JIS，`134` 是 GB2312。 |
-| `EnableTextSubstitution` | 启用字符映射。 |
-| `TextSubstitutionMode` | `0` 日繁，`1` 繁转简，`2` 简转繁。 |
-| `EnableCodepageRedirect` | 重定向 WinAPI 代码页转换。 |
-| `CodepageRedirectFrom` / `CodepageRedirectTo` | 例如 `932 -> 65001` 可把 CP932 解码请求改为 UTF-8。 |
-| `EnableCodepageSpoof` | 修补字体代码页声明，供会读取字体表的引擎使用。 |
-| `EnableTinkerBellHook` | 启用 TinkerBell / Cyberworks 自动兼容策略。 |
-| `EnableDebugLog` | 输出更详细的 `FontHook.trace.log`。 |
-| `Compat*` | 兼容性保护开关，遇到个别游戏崩溃或卡死时再调整。 |
+- `FontNameW` 是主要字体名，选择器应用字体时会更新它。
+- `FontNameA` 用于 ANSI 路径的往返保存，通常保持和 `FontNameW` 一致即可。
+- `EnableFontHook=1` 才会启用核心替换。没有字体名时，代码会强制关闭字体替换。
+- `EnableFaceNameReplace=1` 替换字体名。
+- `EnableCharsetReplace=1` 替换 `LOGFONT` 字符集。
+- `ForcedCharset` 是替换后的 GDI 字符集。
+- `FontHeightScale1000=1000` 表示 100%，`1200` 表示 120%。
+- `FontWidthScale1000=1000` 表示 100%，`800` 表示 80%。
+- `FontAscentPermille`、`FontDescentPermille` 和 `FontLineSpacing` 用于纵向指标补丁，选择器里的自动按钮会尝试从参考字体推导。
+- `DebugTraceSampleLimit=0` 表示关闭受采样限制的详细 trace；大于 `0` 时才记录对应的有限样本。
 
-## 引擎兼容层
+注意：源码中存在内部变量 `Config::FontFileName`，但当前 `FontHook.ini` 的读写逻辑没有把 `FontFile` 作为配置项保存或读取。需要加载本地字体时，推荐把字体文件放到游戏目录，让字体选择器自动扫描并加载。
 
-这些兼容层不是简单的字体名替换，而是针对引擎绕过 GDI、预渲染位图字体、字体缓存或私有配置的情况做补丁。
+## 诊断日志
 
-### Artemis
+项目会在游戏目录写入诊断日志：
 
-支持现代 Artemis 的资源表和字体路径虚拟化：
+- `FontHook.trace.log`
 
-- 修补 `_windows` / `_windows_ja` 等表中的字体路径和字号字段。
-- 为引擎提供虚拟字体文件，例如 `_base/font/FontHook.ttf`。
-- 支持从系统字体或本地字体导出/修补代理字体数据。
-- 配置热切换时尝试清理 Artemis 字体缓存。
+普通 `Log` 输出走 `OutputDebugString`，需要调试器或 DebugView 这类工具查看。
 
-### 旧版 Artemis
+常用排查方法：
 
-支持 loose `.iet` 脚本和旧式资源路径：
+- 游戏没反应：先确认 DLL 位数和游戏位数一致。
+- 选择器没出现：尝试热键 `Ctrl+Alt+F`、`Ctrl+Alt+Shift+F`、`Ctrl+Alt+F8`，并检查日志是否加载成功。
+- 字体能换但乱码：先尝试切换字符集，再考虑代码页伪装、文本替换或代码页重定向。
+- 字体能换但行距错：使用选择器里的高度、宽度、字距、纵向指标和行距调节。
+- 字体换了但部分文本没变：游戏可能使用预渲染字库、贴图字库、引擎缓存或 DirectWrite/FreeType 私有管线，检查是否命中了对应引擎兼容层。
+- 游戏崩溃或卡死：关闭更激进的兼容项，例如运行时缓存清理、代码页重定向、`GetTextFace` 替换，保留最小字体替换配置再逐项打开。
 
-- 修补 `system/*.iet`、`scenario/*.iet` 中的 `face`、`rubyface`、`rendered`、字号和间距字段。
-- 支持 `face="$g.font_face"` 这种变量间接引用，会修补对应 `[var name="g.font_face" data="..."]`。
-- 可把旧版 `.rft` 预渲染字体路径重定向到运行时代理字体。
-- 对直接读取字体文件的路径提供内存虚拟字体。
+诊断模块还包含：
 
-### KiriKiri / TVP
+- 首次机会异常和未处理异常记录。
+- 关键阶段 watchdog。
+- 配置变更后的引擎状态 trace。
+- 字体切换后窗口响应状态检查。
 
-部分 KiriKiri 游戏使用 `.tft` 预渲染字体缓存，普通 GDI 字体替换不会生效。兼容层会尝试禁用 `mapPrerenderedFont` 注册或隐藏 `.tft`，让脚本回退到普通字体渲染。
+## 编译
 
-### Softpal
+需要：
 
-Softpal 的默认字体选项可能优先使用 `DEFAULT_FONT.DAT` 位图字体。兼容层会尝试把默认字体类型切换到系统字体分支，并隐藏默认位图字体文件。
+- Visual Studio 2022 或兼容 MSVC v143 工具链。
+- Windows SDK。
+- MSBuild。
+- 仓库根目录下的 Detours 头文件和库文件：
+  - `detours.h`
+  - `detours.lib`
+  - `detours_x64.lib`
 
-### Escu:de
-
-Escu:de 会从 `configure.cfg` 读取字体配置。兼容层会虚拟化 `[Font] Face` / `Font` 配置项，让游戏表现得像配置工具已经选择了当前字体。
-
-### Mirai
-
-Mirai 部分游戏会先创建 HFONT，再把原始 sfnt 字体数据交给 FreeType/D3D。兼容层会重定向 `GetFontData` 和字体文件来源，避免只在 `TextOut` 时替换导致失效。
-
-### Majiro
-
-Majiro 会在 `savedata` 下缓存预渲染字形页。兼容层会绕过 `fc_*.fcd` / `fca_*.fcd` 等缓存读取，并尝试刷新运行时字体缓存，让引擎重新通过被 hook 的 GDI 路径生成字形。
-
-### DxLib
-
-DxLib 可使用 `_FONTSET.MED` 字体缓存。兼容层默认不生成额外的 SFH 缓存文件，只在启用 `DxLibDisableFontCache=1` 且缓存字体和当前选择字体不一致时，让游戏重建原始 `_FONTSET.MED`。
-
-### TinkerBell
-
-部分 TinkerBell / Cyberworks 游戏在 `CreateFontW` 或 `CreateFontIndirectW` 被 hook 后会在启动阶段崩溃。兼容层会检测 `Arc00.dat`、`Arc01.dat`、`render.dll` 和主程序里的 TinkerBell 标记，命中后自动跳过 W 系列字体创建 hook，保留 ANSI 字体创建、绘制和度量路径。
-
-这类游戏也不适合替换外部创建、未被 SimpleFontHook 登记过的 `HFONT`。命中 TinkerBell 检测后会自动启用等效于 `CompatSelectObjectTrackedOnly=1` 的选择策略，只替换本 hook 创建或缓存过的字体对象。
-
-## 支持范围与限制
-
-SimpleFontHook 主要处理“游戏运行时仍然存在文本或字体数据”的路径。
-
-通常可处理：
-
-- 使用 GDI/GDI+/部分 DirectWrite 创建字体和绘制文本的游戏。
-- 使用系统字体、TTF/OTF/TTC、可被替换的私有字体文件的游戏。
-- 有预渲染字体缓存，但能被禁用或重建的引擎。
-- Artemis、KiriKiri、Softpal、Escu:de、Mirai、Majiro、DxLib、TinkerBell / Cyberworks 等已做专门适配的路径。
-
-通常不能直接处理：
-
-- 文本已经烘焙成整张图片的情况。
-- 完全自研的位图字体图集，且没有可切回系统字体/TTF 的路径。
-- 不加载 `winmm.dll`、不走 WinAPI 字体栈、或字体渲染完全封闭在自有渲染器里的游戏。
-- 受强校验、完整性检查或特殊加载器保护而拒绝旁加载 DLL 的游戏。
-
-遇到这类情况，通常需要逆向具体字库格式、生成替换字库，或编写更深的引擎级 hook。
-
-## 构建
-
-需求：
-
-- Windows
-- Visual Studio 2022 或兼容的 MSVC 工具链
-- Desktop development with C++
-- Detours 头文件和库文件。本仓库根目录已包含 `detours.h`、`detours.lib`、`detours_x64.lib`
-
-构建 32 位版本：
+构建 32 位：
 
 ```bat
 build_x32.bat
 ```
 
-输出：
-
-```text
-Release\winmm.dll
-```
-
-构建 64 位版本：
+构建 64 位：
 
 ```bat
 build_x64.bat
 ```
 
-输出：
+脚本会通过 `vswhere` 查找 Visual Studio，再调用对应的 `vcvars32.bat` 或 `vcvars64.bat`，最后用 MSBuild 重新构建 Release 配置。
 
-```text
-x64\Release\winmm.dll
-```
-
-也可以直接用 MSBuild：
+也可以手动构建：
 
 ```bat
 msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=Win32 /t:Rebuild
 msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=x64 /t:Rebuild
 ```
 
+输出文件：
+
+- `Release\winmm.dll`
+- `x64\Release\winmm.dll`
+
 ## 项目结构
 
 ```text
-SimpleFontHook/
-  dllmain.cpp                 DLL 入口，只负责初始化诊断和 hook
-  winmm_proxy.h               winmm 导出转发
-  framework.h                 全局配置和公共接口
-  utils.cpp                   配置、日志、诊断、本地字体加载
-  font/
-    font_patcher.*            TTF/OTF/TTC 表修补
-  hooks/
-    font_hooks.cpp            Detours hook 聚合翻译单元
-    hook_policy.*             hook 策略和兼容性开关
-    internal/                 GDI/GDI+/DWrite/API hook 细分模块
-    internal/engines/         各引擎专用兼容层
-  ui/
-    font_picker.cpp           字体选择器入口
-    internal/                 字体选择器状态、绘制、输入和配置应用
+SimpleFontHook.sln
+SimpleFontHook\
+  dllmain.cpp
+  framework.h
+  utils.cpp
+  winmm_proxy.h
+  font\
+    font_patcher.*
+  hooks\
+    font_hooks.cpp
+    hook_policy.*
+    internal\
+      font_hooks_*.cppinc
+      model\
+      queries\
+      engines\
+  ui\
+    font_picker.cpp
+    internal\
+build_x32.bat
+build_x64.bat
+detours.h
+detours.lib
+detours_x64.lib
 ```
 
-内部 `*.cppinc` 文件由对应的 `.cpp` 聚合编译，不是独立编译单元。
+关键文件：
 
-## 调试
+- `dllmain.cpp`：进程附加入口，安装诊断和 Hook。
+- `winmm_proxy.h`：转发系统 `winmm.dll` 导出。
+- `utils.cpp`：配置读写、日志、诊断、字体加载辅助。
+- `font/font_patcher.*`：解析和修改 TTF/TTC/OTF 相关表。
+- `hooks/font_hooks.cpp`：聚合所有 Hook 实现。
+- `hooks/hook_policy.*`：集中管理兼容策略和是否安装某些高风险 Hook。
+- `hooks/internal/model`：字体替换缓存、指标调整、代码页伪装、虚拟 glyph index。
+- `hooks/internal/queries`：字体枚举、字体身份、字体数据和布局查询 Hook。
+- `hooks/internal/engines`：各引擎兼容层。
+- `ui/font_picker.cpp`：字体选择器入口。
 
-打开详细日志：
+## 使用边界
 
-```ini
-EnableDebugLog=1
-```
+- 必须匹配游戏进程位数。32 位 DLL 不能加载到 64 位游戏，反之亦然。
+- 这是进程内 Hook DLL，不适合带反作弊、联网对战或不允许注入的程序。
+- 对已经完全渲染成图片的文字无能为力，除非对应引擎兼容层能阻止它使用预渲染缓存。
+- 对自研引擎、强混淆引擎或深度定制字体缓存，可能只能覆盖一部分文本路径。
+- 代码页重定向和文本替换会影响整个进程内相关 API，应按游戏逐项验证。
 
-日志文件：
+## 建议调试顺序
 
-```text
-FontHook.trace.log
-```
-
-建议排查顺序：
-
-1. 确认 `winmm.dll` 位数和游戏一致。
-2. 确认 `FontHook.trace.log` 里出现 hook 安装记录。
-3. 确认字体选择器能打开，且 `ApplySelectedFont` 有记录。
-4. 如果引擎使用字体缓存，尝试删除游戏自己的字体缓存或打开对应引擎兼容开关。
-5. 如果是 Artemis / 旧版 Artemis，查看是否有 `Artemis` / `ArtemisLegacy` 的 `table-patched`、`iet-patched`、`font-sync`、`font-redirect` 记录。
-6. 如果文本是乱码，优先检查 `EnableTextSubstitution` 和 `EnableCodepageRedirect`。
-7. 如果游戏崩溃或卡死，保留 `FontHook.trace.log`，并尝试关闭相关 `Compat*` 或引擎专用开关定位。
-
-## 安全说明
-
-本项目通过 DLL 代理和 API hook 修改当前游戏进程内的字体行为。请只在你合法拥有并允许本地修改的游戏副本上使用。不要把它用于带有在线校验、反作弊或多人对战环境的程序。
-
-字体文件也受授权限制。使用第三方字体时，请确认该字体允许在你的使用场景中加载和分发。
+1. 只复制对应位数的 `winmm.dll`，启动游戏，看选择器和日志是否出现。
+2. 只选择字体，不开启代码页伪装、文本替换或代码页重定向。
+3. 如果字体列表里没有目标字体，把字体文件放到游戏目录后重启。
+4. 如果游戏仍使用旧字体，检查是否需要引擎兼容层或是否被预渲染缓存挡住。
+5. 如果缺字或乱码，再尝试字符集替换、代码页伪装、文本替换。
+6. 如果布局不对，再调整高度、宽度、字距、纵向指标、行距和字重。
+7. 每次只改一个方向，并保留 `FontHook.trace.log` 方便回退和定位。
