@@ -1,0 +1,69 @@
+static WORD VirtualizeGlyphIndex(HFONT font, WORD realGlyph) {
+    if (!font || realGlyph == 0 || realGlyph == 0xFFFF)
+        return realGlyph;
+
+    RefreshFontCacheEpoch();
+
+    std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+    LONG version = Config::ConfigVersion;
+    GlyphMapKey realKey = { font, version, realGlyph };
+    auto existing = g_realToVirtualGlyph.find(realKey);
+    if (existing != g_realToVirtualGlyph.end())
+        return existing->second;
+
+    WORD salt = (WORD)(((version * 251u) ^ (((uintptr_t)font >> 4) & 0xFFFFu)) & 0xFFFFu);
+    WORD candidate = (WORD)(realGlyph ^ salt);
+    if (candidate == 0 || candidate == 0xFFFF) candidate = (WORD)(realGlyph + 1);
+    if (candidate == 0 || candidate == 0xFFFF) candidate = 1;
+
+    for (int i = 0; i < 0xFFFE; ++i) {
+        GlyphMapKey virtualKey = { font, version, candidate };
+        auto mapped = g_virtualToRealGlyph.find(virtualKey);
+        if (mapped == g_virtualToRealGlyph.end() || mapped->second == realGlyph) {
+            g_realToVirtualGlyph[realKey] = candidate;
+            g_virtualToRealGlyph[virtualKey] = realGlyph;
+            return candidate;
+        }
+        ++candidate;
+        if (candidate == 0 || candidate == 0xFFFF) candidate = 1;
+    }
+
+    return realGlyph;
+}
+
+static WORD TranslateVirtualGlyphIndex(HFONT font, WORD glyph) {
+    if (!font || glyph == 0 || glyph == 0xFFFF)
+        return glyph;
+
+    RefreshFontCacheEpoch();
+
+    std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+    GlyphMapKey key = { font, Config::ConfigVersion, glyph };
+    auto it = g_virtualToRealGlyph.find(key);
+    if (it == g_virtualToRealGlyph.end())
+        return glyph;
+    return it->second;
+}
+
+static void VirtualizeGlyphIndices(HDC hdc, LPWORD glyphs, int count) {
+    if (IsPickerThread() || !glyphs || count <= 0 || (!Config::EnableFontHook && !Config::EnableCodepageSpoof))
+        return;
+
+    HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    for (int i = 0; i < count; ++i) {
+        glyphs[i] = VirtualizeGlyphIndex(font, glyphs[i]);
+    }
+}
+
+static void TranslateGlyphIndexArray(HDC hdc, const WORD* input, int count, std::vector<WORD>& output) {
+    output.clear();
+    if (IsPickerThread() || !input || count <= 0)
+        return;
+
+    HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    output.assign(input, input + count);
+    for (int i = 0; i < count; ++i) {
+        output[i] = TranslateVirtualGlyphIndex(font, output[i]);
+    }
+}
+

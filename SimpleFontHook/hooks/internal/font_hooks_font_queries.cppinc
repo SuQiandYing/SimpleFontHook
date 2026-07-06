@@ -1,0 +1,3 @@
+#include "queries/font_hooks_identity_queries.cppinc"
+#include "queries/font_hooks_enumeration.cppinc"
+#include "queries/font_hooks_metric_queries.cppinc"

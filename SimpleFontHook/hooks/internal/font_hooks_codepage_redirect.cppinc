@@ -1,0 +1,109 @@
+// Codepage conversion hooks.
+// Some engines decode script text with hard-coded CP932 even when the patched
+// script is UTF-8. Charset/font spoofing is too late for those cases: the text
+// has already become '?' or mojibake before GDI sees it. This layer rewrites the
+// WinAPI codepage argument at the conversion boundary.
+
+static volatile LONG g_codepageRedirectTraceCount = 0;
+static __declspec(thread) bool g_inCodepageRedirect = false;
+
+static bool CodepageRedirectIsUtfFamily(UINT codepage) {
+    return codepage == CP_UTF8 || codepage == CP_UTF7 || codepage == 54936;
+}
+
+static bool CodepageRedirectMatches(UINT codepage, UINT fromCodepage) {
+    if (codepage == fromCodepage)
+        return true;
+
+    if ((codepage == CP_ACP || codepage == CP_THREAD_ACP) && GetACP() == fromCodepage)
+        return true;
+
+    return false;
+}
+
+static bool ResolveRedirectCodepage(UINT codepage, UINT* redirected) {
+    if (redirected) *redirected = codepage;
+    if (!Config::EnableCodepageRedirect ||
+        g_inCodepageRedirect ||
+        IsPickerThread() ||
+        Config::CodepageRedirectFrom == Config::CodepageRedirectTo) {
+        return false;
+    }
+
+    if (!CodepageRedirectMatches(codepage, Config::CodepageRedirectFrom))
+        return false;
+
+    if (redirected) *redirected = Config::CodepageRedirectTo;
+    return true;
+}
+
+static DWORD SanitizeMultiByteToWideFlags(UINT codepage, DWORD flags) {
+    if (!CodepageRedirectIsUtfFamily(codepage))
+        return flags;
+
+    return flags & MB_ERR_INVALID_CHARS;
+}
+
+static DWORD SanitizeWideCharToMultiByteFlags(UINT codepage, DWORD flags) {
+    if (!CodepageRedirectIsUtfFamily(codepage))
+        return flags;
+
+    return flags & WC_ERR_INVALID_CHARS;
+}
+
+static void TraceCodepageRedirect(const char* apiName, UINT from, UINT to, DWORD flags, DWORD useFlags) {
+    if (!Config::EnableDebugLog)
+        return;
+
+    LONG hit = InterlockedIncrement(&g_codepageRedirectTraceCount);
+    if (hit > 48)
+        return;
+
+    Utils::Trace("[DEBUG][CodePageRedirect] %s codepage %u -> %u flags=0x%lX useFlags=0x%lX",
+        apiName, from, to, flags, useFlags);
+}
+
+int WINAPI newMultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByteStr,
+                                  int cbMultiByte, LPWSTR lpWideCharStr, int cchWideChar) {
+    int substitutedRet = 0;
+    if (ArtemisLegacyTrySubstituteMultiByteToWideChar(CodePage, dwFlags,
+        lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar, &substitutedRet)) {
+        return substitutedRet;
+    }
+
+    UINT redirected = CodePage;
+    if (!ResolveRedirectCodepage(CodePage, &redirected))
+        return orgMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+
+    DWORD useFlags = SanitizeMultiByteToWideFlags(redirected, dwFlags);
+    TraceCodepageRedirect("MultiByteToWideChar", CodePage, redirected, dwFlags, useFlags);
+
+    g_inCodepageRedirect = true;
+    int ret = orgMultiByteToWideChar(redirected, useFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+    g_inCodepageRedirect = false;
+    return ret;
+}
+
+int WINAPI newWideCharToMultiByte(UINT CodePage, DWORD dwFlags, LPCWCH lpWideCharStr,
+                                  int cchWideChar, LPSTR lpMultiByteStr, int cbMultiByte,
+                                  LPCCH lpDefaultChar, LPBOOL lpUsedDefaultChar) {
+    UINT redirected = CodePage;
+    if (!ResolveRedirectCodepage(CodePage, &redirected))
+        return orgWideCharToMultiByte(CodePage, dwFlags, lpWideCharStr, cchWideChar,
+            lpMultiByteStr, cbMultiByte, lpDefaultChar, lpUsedDefaultChar);
+
+    DWORD useFlags = SanitizeWideCharToMultiByteFlags(redirected, dwFlags);
+    LPCCH useDefaultChar = lpDefaultChar;
+    LPBOOL useUsedDefaultChar = lpUsedDefaultChar;
+    if (CodepageRedirectIsUtfFamily(redirected)) {
+        useDefaultChar = NULL;
+        useUsedDefaultChar = NULL;
+    }
+    TraceCodepageRedirect("WideCharToMultiByte", CodePage, redirected, dwFlags, useFlags);
+
+    g_inCodepageRedirect = true;
+    int ret = orgWideCharToMultiByte(redirected, useFlags, lpWideCharStr, cchWideChar,
+        lpMultiByteStr, cbMultiByte, useDefaultChar, useUsedDefaultChar);
+    g_inCodepageRedirect = false;
+    return ret;
+}

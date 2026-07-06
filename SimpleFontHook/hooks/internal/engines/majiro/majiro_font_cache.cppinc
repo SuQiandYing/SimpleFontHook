@@ -1,0 +1,488 @@
+// Majiro savedata font-cache bypass.
+//
+// Majiro can store prerendered system-font glyph pages in savedata/fc_*.fcd
+// and savedata/fca_*.fcd. Once those files exist, the engine may reuse them
+// instead of asking GDI for glyphs, so the normal font hooks never see text
+// rendering. Hide read-only cache opens and let Majiro regenerate the cache
+// through the hooked GDI path.
+
+static int g_majiroEngineProbe = -1;
+static volatile LONG g_majiroTraceCount = 0;
+static volatile LONG g_majiroFontCacheBypassActive = 0;
+static volatile LONG g_majiroLastNotifyVersion = LONG_MIN;
+static volatile LONG g_majiroLastRuntimeFlushVersion = LONG_MIN;
+
+struct MajiroRuntimeFontCacheLayout {
+    BYTE* glyphWidthTable;
+    DWORD* glyphOffsetTable;
+    DWORD* dataCapacity;
+    DWORD* dataUsed;
+    BYTE** dataBuffer;
+    DWORD* dirtyFlag;
+};
+
+static std::mutex g_majiroRuntimeCacheMutex;
+static bool g_majiroRuntimeCacheScanned = false;
+static std::vector<MajiroRuntimeFontCacheLayout> g_majiroRuntimeFontCaches;
+
+static void MajiroTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_majiroTraceCount);
+    if (hit > 512) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][Majiro] %s", message);
+}
+
+static bool MajiroFindFirstFileInRoot(const wchar_t* pattern) {
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, ArtemisGetGameRoot().c_str());
+    PathAppendW(search, pattern);
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = orgFindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    FindClose(hFind);
+    return true;
+}
+
+static bool MajiroBufferContainsAscii(const std::vector<BYTE>& bytes, const char* needle) {
+    if (!needle || !needle[0]) return false;
+    size_t needleLen = strlen(needle);
+    if (bytes.size() < needleLen) return false;
+
+    for (size_t i = 0; i <= bytes.size() - needleLen; ++i) {
+        if (memcmp(bytes.data() + i, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
+
+static DWORD MajiroReadU32(const BYTE* p) {
+    DWORD value = 0;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static bool MajiroMemoryContains(const BYTE* bytes, size_t size, const char* needle) {
+    if (!bytes || !needle || !needle[0]) return false;
+    size_t needleLen = strlen(needle);
+    if (size < needleLen) return false;
+
+    for (size_t i = 0; i <= size - needleLen; ++i) {
+        if (memcmp(bytes + i, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
+
+static bool MajiroAddressInRange(uintptr_t address, uintptr_t begin, uintptr_t end, size_t size = 1) {
+    if (address < begin || address >= end) return false;
+    return size <= (size_t)(end - address);
+}
+
+static bool MajiroRangeWritable(void* address, SIZE_T size) {
+    if (!address || size == 0) return false;
+
+    BYTE* current = (BYTE*)address;
+    BYTE* end = current + size;
+    if (end < current) return false;
+
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(current, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+
+        DWORD protect = mbi.Protect & 0xFF;
+        bool writable =
+            protect == PAGE_READWRITE ||
+            protect == PAGE_WRITECOPY ||
+            protect == PAGE_EXECUTE_READWRITE ||
+            protect == PAGE_EXECUTE_WRITECOPY;
+        if (!writable) return false;
+
+        BYTE* regionEnd = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= current) return false;
+        current = regionEnd < end ? regionEnd : end;
+    }
+
+    return true;
+}
+
+static bool MajiroTryAddRuntimeCacheLayout(uintptr_t moduleBegin, uintptr_t moduleEnd,
+    uintptr_t glyphWidthTable, uintptr_t glyphOffsetTable, uintptr_t dataBuffer,
+    uintptr_t dataUsed, uintptr_t dataCapacity, uintptr_t dirtyFlag) {
+    if (!MajiroAddressInRange(glyphWidthTable, moduleBegin, moduleEnd, 0x10000) ||
+        !MajiroAddressInRange(glyphOffsetTable, moduleBegin, moduleEnd, 0x40000) ||
+        !MajiroAddressInRange(dataBuffer, moduleBegin, moduleEnd, sizeof(void*)) ||
+        !MajiroAddressInRange(dataUsed, moduleBegin, moduleEnd, sizeof(DWORD)) ||
+        !MajiroAddressInRange(dataCapacity, moduleBegin, moduleEnd, sizeof(DWORD))) {
+        return false;
+    }
+
+    for (size_t i = 0; i < g_majiroRuntimeFontCaches.size(); ++i) {
+        const MajiroRuntimeFontCacheLayout& existing = g_majiroRuntimeFontCaches[i];
+        if (existing.glyphWidthTable == (BYTE*)glyphWidthTable &&
+            existing.glyphOffsetTable == (DWORD*)glyphOffsetTable) {
+            return false;
+        }
+    }
+
+    MajiroRuntimeFontCacheLayout layout = {};
+    layout.glyphWidthTable = (BYTE*)glyphWidthTable;
+    layout.glyphOffsetTable = (DWORD*)glyphOffsetTable;
+    layout.dataBuffer = (BYTE**)dataBuffer;
+    layout.dataUsed = (DWORD*)dataUsed;
+    layout.dataCapacity = (DWORD*)dataCapacity;
+    if (dirtyFlag && MajiroAddressInRange(dirtyFlag, moduleBegin, moduleEnd, sizeof(DWORD))) {
+        layout.dirtyFlag = (DWORD*)dirtyFlag;
+    }
+    g_majiroRuntimeFontCaches.push_back(layout);
+
+    MajiroTraceLimited("runtime-cache-layout width=%p offsets=%p used=%p cap=%p buffer=%p dirty=%p",
+        layout.glyphWidthTable, layout.glyphOffsetTable, layout.dataUsed,
+        layout.dataCapacity, layout.dataBuffer, layout.dirtyFlag);
+    return true;
+}
+
+static uintptr_t MajiroFindRuntimeCacheDirtyFlag(const BYTE* moduleBytes, size_t moduleSize,
+    uintptr_t moduleBegin, uintptr_t moduleEnd, uintptr_t dataBuffer) {
+    uintptr_t searchBegin = dataBuffer;
+    uintptr_t searchEnd = dataBuffer + 0x80;
+    if (searchEnd < searchBegin) return 0;
+
+    for (size_t i = 0; i + 10 <= moduleSize; ++i) {
+        const BYTE* p = moduleBytes + i;
+        if (p[0] != 0xC7 || p[1] != 0x05 || MajiroReadU32(p + 6) != 1) continue;
+
+        uintptr_t candidate = (uintptr_t)MajiroReadU32(p + 2);
+        if (candidate >= searchBegin && candidate < searchEnd &&
+            MajiroAddressInRange(candidate, moduleBegin, moduleEnd, sizeof(DWORD))) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+static void MajiroDiscoverRuntimeFontCachesLocked() {
+    if (g_majiroRuntimeCacheScanned) return;
+    g_majiroRuntimeCacheScanned = true;
+    g_majiroRuntimeFontCaches.clear();
+
+    HMODULE mainModule = GetModuleHandleW(NULL);
+    MODULEINFO moduleInfo = {};
+    if (!mainModule ||
+        !GetModuleInformation(GetCurrentProcess(), mainModule, &moduleInfo, sizeof(moduleInfo)) ||
+        !moduleInfo.lpBaseOfDll || moduleInfo.SizeOfImage < 0x1000) {
+        return;
+    }
+
+    BYTE* moduleBytes = (BYTE*)moduleInfo.lpBaseOfDll;
+    size_t moduleSize = (size_t)moduleInfo.SizeOfImage;
+    uintptr_t moduleBegin = (uintptr_t)moduleBytes;
+    uintptr_t moduleEnd = moduleBegin + moduleSize;
+    if (moduleEnd < moduleBegin) return;
+
+    if (!MajiroMemoryContains(moduleBytes, moduleSize, "savedata\\fc_%s_%03dx%03d.fcd")) {
+        return;
+    }
+
+    for (size_t i = 0; i + 72 <= moduleSize; ++i) {
+        BYTE* p = moduleBytes + i;
+        if (p[0] != 0xB9 || MajiroReadU32(p + 1) != 0x4000 ||
+            p[5] != 0xBF ||
+            p[10] != 0xF3 || p[11] != 0xAB ||
+            p[12] != 0xB9 || MajiroReadU32(p + 13) != 0x10000 ||
+            p[17] != 0xBF ||
+            p[22] != 0x68 || MajiroReadU32(p + 23) != 0x80000 ||
+            p[27] != 0xF3 || p[28] != 0xAB ||
+            p[29] != 0xE8) {
+            continue;
+        }
+
+        uintptr_t glyphWidthTable = (uintptr_t)MajiroReadU32(p + 6);
+        uintptr_t glyphOffsetTable = (uintptr_t)MajiroReadU32(p + 18);
+        uintptr_t dataBuffer = 0;
+        uintptr_t dataUsed = 0;
+        uintptr_t dataCapacity = 0;
+
+        for (size_t j = 34; j + 10 <= 96 && i + j + 10 <= moduleSize; ++j) {
+            BYTE* q = p + j;
+            if (q[0] == 0xA3) {
+                uintptr_t candidate = (uintptr_t)MajiroReadU32(q + 1);
+                if (MajiroAddressInRange(candidate, moduleBegin, moduleEnd, sizeof(void*))) {
+                    dataBuffer = candidate;
+                }
+            } else if (q[0] == 0xC7 && q[1] == 0x05) {
+                uintptr_t candidate = (uintptr_t)MajiroReadU32(q + 2);
+                DWORD value = MajiroReadU32(q + 6);
+                if (value == 4 &&
+                    MajiroAddressInRange(candidate, moduleBegin, moduleEnd, sizeof(DWORD))) {
+                    dataUsed = candidate;
+                } else if (value == 0x80000 &&
+                    MajiroAddressInRange(candidate, moduleBegin, moduleEnd, sizeof(DWORD))) {
+                    dataCapacity = candidate;
+                }
+            }
+        }
+
+        uintptr_t dirtyFlag = dataBuffer
+            ? MajiroFindRuntimeCacheDirtyFlag(moduleBytes, moduleSize, moduleBegin, moduleEnd, dataBuffer)
+            : 0;
+        MajiroTryAddRuntimeCacheLayout(moduleBegin, moduleEnd,
+            glyphWidthTable, glyphOffsetTable, dataBuffer, dataUsed, dataCapacity, dirtyFlag);
+    }
+}
+
+static void MajiroFlushRuntimeFontCaches(LONG version) {
+    if (version <= 0) return;
+    if (InterlockedExchange(&g_majiroLastRuntimeFlushVersion, version) == version) return;
+
+    std::lock_guard<std::mutex> lock(g_majiroRuntimeCacheMutex);
+    MajiroDiscoverRuntimeFontCachesLocked();
+
+    size_t resetCount = 0;
+    for (size_t i = 0; i < g_majiroRuntimeFontCaches.size(); ++i) {
+        MajiroRuntimeFontCacheLayout& layout = g_majiroRuntimeFontCaches[i];
+        if (!MajiroRangeWritable(layout.glyphWidthTable, 0x10000) ||
+            !MajiroRangeWritable(layout.glyphOffsetTable, 0x40000) ||
+            !MajiroRangeWritable(layout.dataUsed, sizeof(DWORD))) {
+            continue;
+        }
+
+        SecureZeroMemory(layout.glyphWidthTable, 0x10000);
+        SecureZeroMemory(layout.glyphOffsetTable, 0x40000);
+        *layout.dataUsed = 4;
+        if (layout.dirtyFlag && MajiroRangeWritable(layout.dirtyFlag, sizeof(DWORD))) {
+            *layout.dirtyFlag = 1;
+        }
+        ++resetCount;
+    }
+
+    MajiroTraceLimited("runtime-cache-flush version=%ld layouts=%u reset=%u",
+        version, (unsigned)g_majiroRuntimeFontCaches.size(), (unsigned)resetCount);
+}
+
+static bool MajiroMainModuleHasMarkers() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (!exePath[0]) return false;
+
+    HANDLE hFile = orgCreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 32 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<BYTE> bytes((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size()) return false;
+
+    return MajiroBufferContainsAscii(bytes, "MajiroObj") ||
+        MajiroBufferContainsAscii(bytes, "MajiroArcV") ||
+        MajiroBufferContainsAscii(bytes, "MajiroSavV") ||
+        MajiroBufferContainsAscii(bytes, "savedata\\fc_%s_%03dx%03d.fcd");
+}
+
+static bool MajiroLooksLikeEngineRoot() {
+    if (g_majiroEngineProbe != -1) return g_majiroEngineProbe != 0;
+
+    bool hasArchives = MajiroFindFirstFileInRoot(L"*.arc");
+    bool hasMarkers = MajiroMainModuleHasMarkers();
+    bool isMajiro = hasArchives && hasMarkers;
+    g_majiroEngineProbe = isMajiro ? 1 : 0;
+
+    MajiroTraceLimited("engine-probe result=%d archives=%d markers=%d",
+        isMajiro ? 1 : 0, hasArchives ? 1 : 0, hasMarkers ? 1 : 0);
+    return isMajiro;
+}
+
+static bool MajiroIsDigits3(const std::wstring& text, size_t pos) {
+    return pos + 3 <= text.size() &&
+        iswdigit(text[pos]) &&
+        iswdigit(text[pos + 1]) &&
+        iswdigit(text[pos + 2]);
+}
+
+static bool MajiroIsFontCacheFileName(const std::wstring& fileName, bool allowWildcard) {
+    bool hasPrefix =
+        fileName.compare(0, 3, L"fc_") == 0 ||
+        fileName.compare(0, 4, L"fca_") == 0;
+    bool hasWildcard =
+        fileName.find(L'*') != std::wstring::npos ||
+        fileName.find(L'?') != std::wstring::npos;
+
+    if (allowWildcard && hasWildcard) {
+        return hasPrefix || fileName == L"*.fcd";
+    }
+
+    if (fileName.size() < 12) return false;
+    if (!hasPrefix) return false;
+
+    size_t suffix = fileName.size() - 12;
+    if (fileName.compare(fileName.size() - 4, 4, L".fcd") != 0) return false;
+    return fileName[suffix] == L'_' &&
+        MajiroIsDigits3(fileName, suffix + 1) &&
+        fileName[suffix + 4] == L'x' &&
+        MajiroIsDigits3(fileName, suffix + 5);
+}
+
+static bool MajiroIsSavedataFontCachePath(const std::wstring& normalizedFullPath, bool allowWildcard) {
+    if (!ArtemisHasExtension(normalizedFullPath, L".fcd")) return false;
+
+    std::wstring root = ArtemisNormalizePath(ArtemisGetGameRoot());
+    if (root.empty()) return false;
+    std::wstring savedataPrefix = root;
+    if (!savedataPrefix.empty() && savedataPrefix.back() != L'\\') savedataPrefix += L"\\";
+    savedataPrefix += L"savedata\\";
+
+    if (normalizedFullPath.size() <= savedataPrefix.size() ||
+        normalizedFullPath.compare(0, savedataPrefix.size(), savedataPrefix) != 0) {
+        return false;
+    }
+
+    std::wstring fileName = normalizedFullPath.substr(savedataPrefix.size());
+    if (fileName.find(L'\\') != std::wstring::npos || fileName.find(L'/') != std::wstring::npos) {
+        return false;
+    }
+    return MajiroIsFontCacheFileName(fileName, allowWildcard);
+}
+
+static bool MajiroIsReadOnlyOpen(DWORD desiredAccess, DWORD creationDisposition) {
+    if (creationDisposition != OPEN_EXISTING && creationDisposition != OPEN_ALWAYS) return false;
+    if ((desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+        FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool MajiroTryClassifyFontCachePathW(const wchar_t* fileName, std::wstring* fullPathOut) {
+    if (!Config::EnableMajiroHook || !Config::MajiroDisableFontCache ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+
+    std::wstring fullPath = ArtemisFullPath(fileName);
+    if (fullPath.empty() || !ArtemisIsUnderRoot(fullPath)) return false;
+
+    std::wstring normalized = ArtemisNormalizePath(fullPath);
+    if (!MajiroIsSavedataFontCachePath(normalized, false)) return false;
+    if (!MajiroLooksLikeEngineRoot()) return false;
+
+    if (fullPathOut) *fullPathOut = fullPath;
+    return true;
+}
+
+static bool MajiroTryOpenFontCacheW(const wchar_t* fileName, DWORD desiredAccess, DWORD shareMode,
+    LPSECURITY_ATTRIBUTES securityAttributes, DWORD creationDisposition,
+    DWORD flagsAndAttributes, HANDLE templateFile, HANDLE* outHandle) {
+    if (outHandle) *outHandle = INVALID_HANDLE_VALUE;
+
+    std::wstring fullPath;
+    if (!MajiroTryClassifyFontCachePathW(fileName, &fullPath)) return false;
+
+    InterlockedExchange(&g_majiroFontCacheBypassActive, 1);
+
+    bool readOnly = MajiroIsReadOnlyOpen(desiredAccess, creationDisposition);
+    LONG version = Config::ConfigVersion;
+
+    if (readOnly) {
+        MajiroTraceLimited("hide-font-cache request='%s' version=%ld",
+            ArtemisWideToUtf8(fullPath).c_str(), version);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return true;
+    }
+
+    return false;
+}
+
+static bool MajiroTryGetFontCacheAttributesW(const wchar_t* fileName,
+    WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    if (attrs) *attrs = INVALID_FILE_ATTRIBUTES;
+
+    std::wstring fullPath;
+    if (!MajiroTryClassifyFontCachePathW(fileName, &fullPath)) return false;
+
+    InterlockedExchange(&g_majiroFontCacheBypassActive, 1);
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    return true;
+}
+
+static bool MajiroShouldHideFontCachePathW(const wchar_t* fileName, bool allowWildcard) {
+    if (!Config::EnableMajiroHook || !Config::MajiroDisableFontCache ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+
+    std::wstring fullPath = ArtemisFullPath(fileName);
+    if (fullPath.empty() || !ArtemisIsUnderRoot(fullPath)) return false;
+
+    std::wstring normalized = ArtemisNormalizePath(fullPath);
+    if (!MajiroIsSavedataFontCachePath(normalized, allowWildcard)) return false;
+    if (!MajiroLooksLikeEngineRoot()) return false;
+
+    InterlockedExchange(&g_majiroFontCacheBypassActive, 1);
+    MajiroTraceLimited("hide-font-cache request='%s'",
+        ArtemisWideToUtf8(fullPath).c_str());
+    return true;
+}
+
+static bool MajiroShouldHideFontCacheSearchW(const wchar_t* fileName) {
+    return MajiroShouldHideFontCachePathW(fileName, true);
+}
+
+static bool MajiroShouldReplaceFontDataQueries() {
+    return Config::EnableMajiroHook &&
+        Config::MajiroDisableFontCache &&
+        !IsPickerThread() &&
+        InterlockedCompareExchange(&g_majiroFontCacheBypassActive, 0, 0) != 0 &&
+        MajiroLooksLikeEngineRoot();
+}
+
+static bool MajiroShouldDecodeAnsiTextAsCp932Wide() {
+    return Config::EnableMajiroHook &&
+        Config::MajiroDisableFontCache &&
+        !IsPickerThread() &&
+        MajiroLooksLikeEngineRoot();
+}
+
+static bool MajiroShouldPreserveDefaultCharset(const LOGFONTW& sourceLogfont) {
+    if (!Config::EnableMajiroHook ||
+        !Config::EnableFaceNameReplace ||
+        !Config::EnableCharsetReplace ||
+        IsPickerThread() ||
+        sourceLogfont.lfCharSet != DEFAULT_CHARSET ||
+        GetACP() == 932) {
+        return false;
+    }
+
+    // In non-Japanese system locales, Majiro has a scenario/name-entry path
+    // that uses DEFAULT_CHARSET system fonts. Forcing those handles to
+    // SHIFTJIS_CHARSET while also changing the face can make the engine exit
+    // cleanly right after New Game. Keep the source charset for that branch;
+    // real Shift-JIS cache-generation fonts still arrive as SHIFTJIS_CHARSET.
+    return MajiroLooksLikeEngineRoot();
+}
+
+static void MajiroNotifyConfigChanged(LONG version) {
+    if (!Config::EnableMajiroHook || !Config::MajiroDisableFontCache || IsPickerThread())
+        return;
+    if (!MajiroLooksLikeEngineRoot()) return;
+
+    InterlockedExchange(&g_majiroLastNotifyVersion, version);
+    InterlockedExchange(&g_majiroFontCacheBypassActive, 1);
+    InterlockedExchange(&g_majiroTraceCount, 0);
+    MajiroFlushRuntimeFontCaches(version);
+    MajiroTraceLimited("notify-config-changed version=%ld face='%s'",
+        version, ArtemisWideToUtf8(Config::ForcedFontNameW).c_str());
+}

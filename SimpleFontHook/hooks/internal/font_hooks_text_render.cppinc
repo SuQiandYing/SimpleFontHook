@@ -1,0 +1,459 @@
+// GDI text output hooks.
+BOOL WINAPI newTextOutA(HDC hdc, int x, int y, LPCSTR lpString, int nCount) {
+    DEBUG_API_CONTEXT("TextOutA");
+    TraceApiHit(TRACE_TEXT_DRAW, "TextOutA hdc=%p count=%d xy=%d,%d", hdc, nCount, x, y);
+    std::wstring subTextW;
+    int useCount = nCount;
+    bool useWide = SubstituteTextAToWide(lpString, nCount, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    int drawX = x;
+    int drawY = y;
+    ApplyTextDrawSpacing(hdc, x, y, useCount, &drawX, &drawY);
+    DEBUG_GDI_ENTER("TextOutA", hdc, hNew);
+    BOOL ret = useWide
+        ? orgTextOutW(hdc, drawX, drawY, subTextW.c_str(), useCount)
+        : orgTextOutA(hdc, drawX, drawY, lpString, nCount);
+    DEBUG_GDI_EXIT("TextOutA", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newTextOutW(HDC hdc, int x, int y, LPCWSTR lpString, int nCount) {
+    DEBUG_API_CONTEXT("TextOutW");
+    TraceApiHit(TRACE_TEXT_DRAW, "TextOutW hdc=%p count=%d xy=%d,%d", hdc, nCount, x, y);
+    std::wstring subText;
+    int useCount = nCount;
+    LPCWSTR useText = lpString;
+    if (SubstituteTextW(lpString, nCount, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    int drawX = x;
+    int drawY = y;
+    ApplyTextDrawSpacing(hdc, x, y, useCount, &drawX, &drawY);
+    DEBUG_GDI_ENTER("TextOutW", hdc, hNew);
+    BOOL ret = orgTextOutW(hdc, drawX, drawY, useText, useCount);
+    DEBUG_GDI_EXIT("TextOutW", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newExtTextOutA(HDC hdc, int x, int y, UINT options, const RECT* lprect, LPCSTR lpString, UINT nCount, const int* lpDx) {
+    DEBUG_API_CONTEXT("ExtTextOutA");
+    TraceApiHit(TRACE_TEXT_DRAW, "ExtTextOutA hdc=%p count=%u xy=%d,%d options=0x%X dx=%d", hdc, nCount, x, y, options, lpDx ? 1 : 0);
+    std::wstring subTextW;
+    int subCount = (int)nCount;
+    bool useWide = false;
+    UINT useCount = nCount;
+    if ((options & ETO_GLYPH_INDEX) == 0 && SubstituteTextAToWide(lpString, (int)nCount, subTextW, &subCount)) {
+        useWide = true;
+        useCount = (UINT)subCount;
+    }
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<int> adjustedDx;
+    const int* sourceDx = (useWide && useCount != nCount) ? NULL : lpDx;
+    const int* useDx = BuildAdjustedDx(sourceDx, useCount, options, adjustedDx);
+    int oldExtra = ApplyHdcCharSpacing(hdc, (int)useCount, useDx != NULL);
+    int drawX = x;
+    int drawY = y;
+    ApplyTextDrawSpacing(hdc, x, y, (int)useCount, &drawX, &drawY);
+    DEBUG_GDI_ENTER("ExtTextOutA", hdc, hNew);
+    BOOL ret = useWide
+        ? orgExtTextOutW(hdc, drawX, drawY, options, lprect, subTextW.c_str(), useCount, useDx)
+        : orgExtTextOutA(hdc, drawX, drawY, options, lprect, lpString, nCount, useDx);
+    DEBUG_GDI_EXIT("ExtTextOutA", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newExtTextOutW(HDC hdc, int x, int y, UINT options, const RECT* lprect, LPCWSTR lpString, UINT nCount, const int* lpDx) {
+    DEBUG_API_CONTEXT("ExtTextOutW");
+    TraceApiHit(TRACE_TEXT_DRAW, "ExtTextOutW hdc=%p count=%u xy=%d,%d options=0x%X dx=%d", hdc, nCount, x, y, options, lpDx ? 1 : 0);
+    std::wstring subText;
+    int subCount = (int)nCount;
+    LPCWSTR useText = lpString;
+    UINT useCount = nCount;
+    if ((options & ETO_GLYPH_INDEX) == 0 && SubstituteTextW(lpString, (int)nCount, subText, &subCount)) {
+        useText = subText.c_str();
+        useCount = (UINT)subCount;
+    }
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<int> adjustedDx;
+    const int* useDx = BuildAdjustedDx(lpDx, useCount, options, adjustedDx);
+    int oldExtra = ApplyHdcCharSpacing(hdc, (int)useCount, useDx != NULL);
+    int drawX = x;
+    int drawY = y;
+    ApplyTextDrawSpacing(hdc, x, y, (int)useCount, &drawX, &drawY);
+    DEBUG_GDI_ENTER("ExtTextOutW", hdc, hNew);
+    BOOL ret = orgExtTextOutW(hdc, drawX, drawY, options, lprect, useText, useCount, useDx);
+    DEBUG_GDI_EXIT("ExtTextOutW", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+int WINAPI newDrawTextA(HDC hdc, LPCSTR lpchText, int nCount, LPRECT lpRect, UINT format) {
+    DEBUG_API_CONTEXT("DrawTextA");
+    TraceApiHit(TRACE_TEXT_DRAW, "DrawTextA hdc=%p count=%d format=0x%X", hdc, nCount, format);
+    std::wstring subTextW;
+    int useCount = nCount;
+    bool useWide = SubstituteTextAToWide(lpchText, nCount, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    DEBUG_GDI_ENTER("DrawTextA", hdc, hNew);
+    int ret = useWide
+        ? orgDrawTextW(hdc, subTextW.c_str(), useCount, lpRect, format)
+        : orgDrawTextA(hdc, lpchText, nCount, lpRect, format);
+    DEBUG_GDI_EXIT("DrawTextA", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+int WINAPI newDrawTextW(HDC hdc, LPCWSTR lpchText, int nCount, LPRECT lpRect, UINT format) {
+    DEBUG_API_CONTEXT("DrawTextW");
+    TraceApiHit(TRACE_TEXT_DRAW, "DrawTextW hdc=%p count=%d format=0x%X", hdc, nCount, format);
+    std::wstring subText;
+    int useCount = nCount;
+    LPCWSTR useText = lpchText;
+    if (SubstituteTextW(lpchText, nCount, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    DEBUG_GDI_ENTER("DrawTextW", hdc, hNew);
+    int ret = orgDrawTextW(hdc, useText, useCount, lpRect, format);
+    DEBUG_GDI_EXIT("DrawTextW", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+int WINAPI newDrawTextExA(HDC hdc, LPSTR lpchText, int nCount, LPRECT lpRect, UINT format, LPDRAWTEXTPARAMS lpdtp) {
+    DEBUG_API_CONTEXT("DrawTextExA");
+    TraceApiHit(TRACE_TEXT_DRAW, "DrawTextExA hdc=%p count=%d format=0x%X", hdc, nCount, format);
+    std::wstring subTextW;
+    int useCount = nCount;
+    bool useWide = (format & DT_MODIFYSTRING) == 0 &&
+        SubstituteTextAToWide(lpchText, nCount, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    DEBUG_GDI_ENTER("DrawTextExA", hdc, hNew);
+    int ret = useWide
+        ? orgDrawTextExW(hdc, &subTextW[0], useCount, lpRect, format, lpdtp)
+        : orgDrawTextExA(hdc, lpchText, nCount, lpRect, format, lpdtp);
+    DEBUG_GDI_EXIT("DrawTextExA", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+int WINAPI newDrawTextExW(HDC hdc, LPWSTR lpchText, int nCount, LPRECT lpRect, UINT format, LPDRAWTEXTPARAMS lpdtp) {
+    DEBUG_API_CONTEXT("DrawTextExW");
+    TraceApiHit(TRACE_TEXT_DRAW, "DrawTextExW hdc=%p count=%d format=0x%X", hdc, nCount, format);
+    std::wstring subText;
+    int useCount = nCount;
+    LPWSTR useText = lpchText;
+    if ((format & DT_MODIFYSTRING) == 0 && SubstituteTextW(lpchText, nCount, subText, &useCount)) useText = &subText[0];
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    int oldExtra = ApplyHdcCharSpacing(hdc, useCount, false);
+    DEBUG_GDI_ENTER("DrawTextExW", hdc, hNew);
+    int ret = orgDrawTextExW(hdc, useText, useCount, lpRect, format, lpdtp);
+    DEBUG_GDI_EXIT("DrawTextExW", hdc, ret, hNew);
+    RestoreHdcCharSpacing(hdc, oldExtra);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+
+
+// SelectObject hook.
+// This is the KEY hook for games that cache HFONT handles.
+// When the game selects a cached font into a DC, we intercept it and
+// replace with our font before any glyph rendering happens.
+HGDIOBJ WINAPI newSelectObject(HDC hdc, HGDIOBJ h) {
+    DEBUG_API_CONTEXT("SelectObject");
+    if (g_inSelectObject || IsPickerThread() || (!Config::EnableFontHook && !Config::EnableCodepageSpoof))
+        return orgSelectObject(hdc, h);
+
+    // Only intercept font objects (OBJ_FONT)
+    if (h && GetObjectType(h) == OBJ_FONT) {
+        HFONT hFont = (HFONT)h;
+        if (IsStockFontHandle(hFont)) {
+            if (Config::EnableDebugLog)
+                Utils::Trace("[DEBUG][SelectObject] hdc=%p font=%p action=passthrough reason=stock-font", hdc, hFont);
+            return orgSelectObject(hdc, h);
+        }
+
+        ReplacementFontInfo info = {};
+        LOGFONTW sourceLogfont = {};
+        HFONT originalFont = hFont;
+        TraceApiHit(TRACE_SELECT_OBJECT, "request hdc=%p font=%p", hdc, hFont);
+
+        if (TryGetReplacementInfo(hFont, &info)) {
+            if (info.configVersion == Config::ConfigVersion) {
+                TraceApiHit(TRACE_SELECT_OBJECT, "select managed-current hdc=%p font=%p version=%ld", hdc, hFont, info.configVersion);
+                HGDIOBJ old = orgSelectObject(hdc, h);
+                if (Config::EnableDebugLog)
+                    Utils::Trace("[DEBUG][SelectObject] hdc=%p font=%p action=select-managed old=%p version=%ld",
+                        hdc, hFont, old, info.configVersion);
+                return ExposeLogicalFontObject(old);
+            }
+            sourceLogfont = info.sourceLogfont;
+            originalFont = info.originalFont;
+        } else if (HookPolicy::ShouldPassThroughUntrackedSelectObject()) {
+            HGDIOBJ old = orgSelectObject(hdc, h);
+            if (Config::EnableDebugLog)
+                Utils::Trace("[DEBUG][SelectObject] hdc=%p font=%p action=passthrough old=%p reason=untracked-font",
+                    hdc, hFont, old);
+            return ExposeLogicalFontObject(old);
+        } else if (orgGetObjectW(hFont, sizeof(sourceLogfont), &sourceLogfont) == 0) {
+            HGDIOBJ old = orgSelectObject(hdc, h);
+            if (Config::EnableDebugLog)
+                Utils::Trace("[DEBUG][SelectObject] hdc=%p font=%p action=passthrough old=%p reason=getobject-failed err=%lu",
+                    hdc, hFont, old, GetLastError());
+            return ExposeLogicalFontObject(old);
+        }
+
+        HFONT hReplacement = GetOrCreateReplacementFont(originalFont, sourceLogfont);
+        if (hReplacement && hReplacement != hFont) {
+            g_inSelectObject = true;
+            HGDIOBJ old = orgSelectObject(hdc, hReplacement);
+            g_inSelectObject = false;
+            HGDIOBJ exposedOld = ExposeLogicalFontObject(old);
+            TraceApiHit(TRACE_SELECT_OBJECT, "replace hdc=%p from=%p to=%p old=%p exposedOld=%p original=%p", hdc, hFont, hReplacement, old, exposedOld, originalFont);
+            return exposedOld;
+        }
+
+        HGDIOBJ old = orgSelectObject(hdc, h);
+        if (Config::EnableDebugLog)
+            Utils::Trace("[DEBUG][SelectObject] hdc=%p font=%p action=passthrough old=%p reason=no-replacement",
+                hdc, hFont, old);
+        return ExposeLogicalFontObject(old);
+    }
+
+    return orgSelectObject(hdc, h);
+}
+
+HGDIOBJ WINAPI newGetCurrentObject(HDC hdc, UINT type) {
+    HGDIOBJ obj = orgGetCurrentObject(hdc, type);
+    if (type == OBJ_FONT && !IsPickerThread() && (Config::EnableFontHook || Config::EnableCodepageSpoof))
+        return ExposeLogicalFontObject(obj);
+    return obj;
+}
+
+// GetGlyphOutline hooks.
+// Many Galgame engines (KiriKiri, BGI, CMVS, YU-RIS, etc.) use GetGlyphOutlineW
+// to extract glyph bitmaps and render them as textures. This is the most critical
+// hook for engines that cache rendered text.
+DWORD WINAPI newGetGlyphOutlineA(HDC hdc, UINT uChar, UINT fuFormat, LPGLYPHMETRICS lpgm, DWORD cjBuffer, LPVOID pvBuffer, const MAT2* lpmat2) {
+    DEBUG_API_CONTEXT("GetGlyphOutlineA");
+    TraceApiHit(TRACE_GLYPH_OUTLINE, "GetGlyphOutlineA hdc=%p char=0x%X format=0x%X bytes=%lu", hdc, uChar, fuFormat, cjBuffer);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    UINT queryChar = uChar;
+    wchar_t queryWideChar = 0;
+    bool useWideOutline = false;
+    if ((fuFormat & GGO_GLYPH_INDEX) && uChar <= 0xFFFF) {
+        HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+        queryChar = TranslateVirtualGlyphIndex(font, (WORD)uChar);
+    } else if (SubstituteSingleTextCharA(uChar, &queryWideChar)) {
+        useWideOutline = true;
+    }
+    DEBUG_GDI_ENTER("GetGlyphOutlineA", hdc, hNew);
+    DWORD ret = useWideOutline
+        ? orgGetGlyphOutlineW(hdc, (UINT)queryWideChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2)
+        : orgGetGlyphOutlineA(hdc, queryChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+    DEBUG_GDI_EXIT("GetGlyphOutlineA", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetGlyphOutlineW(HDC hdc, UINT uChar, UINT fuFormat, LPGLYPHMETRICS lpgm, DWORD cjBuffer, LPVOID pvBuffer, const MAT2* lpmat2) {
+    DEBUG_API_CONTEXT("GetGlyphOutlineW");
+    TraceApiHit(TRACE_GLYPH_OUTLINE, "GetGlyphOutlineW hdc=%p char=0x%X format=0x%X bytes=%lu", hdc, uChar, fuFormat, cjBuffer);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    UINT queryChar = uChar;
+    if ((fuFormat & GGO_GLYPH_INDEX) && uChar <= 0xFFFF) {
+        HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+        queryChar = TranslateVirtualGlyphIndex(font, (WORD)uChar);
+    } else if (uChar <= 0xFFFF) {
+        wchar_t replacement = 0;
+        if (SubstituteSingleTextCharW((wchar_t)uChar, &replacement)) {
+            queryChar = (UINT)replacement;
+        }
+    }
+    DEBUG_GDI_ENTER("GetGlyphOutlineW", hdc, hNew);
+    DWORD ret = orgGetGlyphOutlineW(hdc, queryChar, fuFormat, lpgm, cjBuffer, pvBuffer, lpmat2);
+    DEBUG_GDI_EXIT("GetGlyphOutlineW", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+// Character width and metrics hooks.
+// Engines measure text layout using these APIs. Without hooking them, the
+// text layout uses the OLD font's metrics, causing misaligned/clipped text.
+BOOL WINAPI newGetCharABCWidthsA(HDC hdc, UINT wFirst, UINT wLast, LPABC lpABC) {
+    DEBUG_API_CONTEXT("GetCharABCWidthsA");
+    TraceApiHit(TRACE_METRICS, "GetCharABCWidthsA hdc=%p range=%u-%u", hdc, wFirst, wLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharABCWidthsA", hdc, hNew);
+    BOOL ret = orgGetCharABCWidthsA(hdc, wFirst, wLast, lpABC);
+    DEBUG_GDI_EXIT("GetCharABCWidthsA", hdc, ret, hNew);
+    if (ret && wLast >= wFirst) AdjustAbcArray(lpABC, wLast - wFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharABCWidthsW(HDC hdc, UINT wFirst, UINT wLast, LPABC lpABC) {
+    DEBUG_API_CONTEXT("GetCharABCWidthsW");
+    TraceApiHit(TRACE_METRICS, "GetCharABCWidthsW hdc=%p range=%u-%u", hdc, wFirst, wLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharABCWidthsW", hdc, hNew);
+    BOOL ret = orgGetCharABCWidthsW(hdc, wFirst, wLast, lpABC);
+    DEBUG_GDI_EXIT("GetCharABCWidthsW", hdc, ret, hNew);
+    if (ret && wLast >= wFirst) AdjustAbcArray(lpABC, wLast - wFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharABCWidthsFloatA(HDC hdc, UINT iFirst, UINT iLast, LPABCFLOAT lpABC) {
+    DEBUG_API_CONTEXT("GetCharABCWidthsFloatA");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharABCWidthsFloatA", hdc, hNew);
+    BOOL ret = orgGetCharABCWidthsFloatA(hdc, iFirst, iLast, lpABC);
+    DEBUG_GDI_EXIT("GetCharABCWidthsFloatA", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustAbcFloatArray(lpABC, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharABCWidthsFloatW(HDC hdc, UINT iFirst, UINT iLast, LPABCFLOAT lpABC) {
+    DEBUG_API_CONTEXT("GetCharABCWidthsFloatW");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharABCWidthsFloatW", hdc, hNew);
+    BOOL ret = orgGetCharABCWidthsFloatW(hdc, iFirst, iLast, lpABC);
+    DEBUG_GDI_EXIT("GetCharABCWidthsFloatW", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustAbcFloatArray(lpABC, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidthA(HDC hdc, UINT iFirst, UINT iLast, LPINT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidthA");
+    TraceApiHit(TRACE_METRICS, "GetCharWidthA hdc=%p range=%u-%u", hdc, iFirst, iLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidthA", hdc, hNew);
+    BOOL ret = orgGetCharWidthA(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidthA", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustWidthArray(lpBuffer, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidthW(HDC hdc, UINT iFirst, UINT iLast, LPINT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidthW");
+    TraceApiHit(TRACE_METRICS, "GetCharWidthW hdc=%p range=%u-%u", hdc, iFirst, iLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidthW", hdc, hNew);
+    BOOL ret = orgGetCharWidthW(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidthW", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustWidthArray(lpBuffer, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidth32A(HDC hdc, UINT iFirst, UINT iLast, LPINT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidth32A");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidth32A", hdc, hNew);
+    BOOL ret = orgGetCharWidth32A(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidth32A", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustWidthArray(lpBuffer, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidth32W(HDC hdc, UINT iFirst, UINT iLast, LPINT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidth32W");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidth32W", hdc, hNew);
+    BOOL ret = orgGetCharWidth32W(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidth32W", hdc, ret, hNew);
+    if (ret && iLast >= iFirst) AdjustWidthArray(lpBuffer, iLast - iFirst + 1);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentPoint32A(HDC hdc, LPCSTR lpString, int c, LPSIZE psizl) {
+    DEBUG_API_CONTEXT("GetTextExtentPoint32A");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentPoint32A hdc=%p count=%d", hdc, c);
+    std::wstring subTextW;
+    int useCount = c;
+    bool useWide = SubstituteTextAToWide(lpString, c, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentPoint32A", hdc, hNew);
+    BOOL ret = useWide
+        ? orgGetTextExtentPoint32W(hdc, subTextW.c_str(), useCount, psizl)
+        : orgGetTextExtentPoint32A(hdc, lpString, c, psizl);
+    DEBUG_GDI_EXIT("GetTextExtentPoint32A", hdc, ret, hNew);
+    if (ret) AdjustTextExtentSize(hdc, psizl, useCount);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentPoint32W(HDC hdc, LPCWSTR lpString, int c, LPSIZE psizl) {
+    DEBUG_API_CONTEXT("GetTextExtentPoint32W");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentPoint32W hdc=%p count=%d", hdc, c);
+    std::wstring subText;
+    int useCount = c;
+    LPCWSTR useText = lpString;
+    if (SubstituteTextW(lpString, c, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentPoint32W", hdc, hNew);
+    BOOL ret = orgGetTextExtentPoint32W(hdc, useText, useCount, psizl);
+    DEBUG_GDI_EXIT("GetTextExtentPoint32W", hdc, ret, hNew);
+    if (ret) AdjustTextExtentSize(hdc, psizl, useCount);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentExPointA(HDC hdc, LPCSTR lpszString, int cchString, int nMaxExtent, LPINT lpnFit, LPINT lpnDx, LPSIZE lpSize) {
+    DEBUG_API_CONTEXT("GetTextExtentExPointA");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentExPointA hdc=%p count=%d max=%d", hdc, cchString, nMaxExtent);
+    std::wstring subTextW;
+    int useCount = cchString;
+    bool useWide = SubstituteTextAToWide(lpszString, cchString, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentExPointA", hdc, hNew);
+    BOOL ret = useWide
+        ? orgGetTextExtentExPointW(hdc, subTextW.c_str(), useCount, nMaxExtent, lpnFit, lpnDx, lpSize)
+        : orgGetTextExtentExPointA(hdc, lpszString, cchString, nMaxExtent, lpnFit, lpnDx, lpSize);
+    DEBUG_GDI_EXIT("GetTextExtentExPointA", hdc, ret, hNew);
+    if (ret) {
+        AdjustTextExtentSize(hdc, lpSize, useCount);
+        AdjustPartialExtents(lpnDx, useCount);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentExPointW(HDC hdc, LPCWSTR lpszString, int cchString, int nMaxExtent, LPINT lpnFit, LPINT lpnDx, LPSIZE lpSize) {
+    DEBUG_API_CONTEXT("GetTextExtentExPointW");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentExPointW hdc=%p count=%d max=%d", hdc, cchString, nMaxExtent);
+    std::wstring subText;
+    int useCount = cchString;
+    LPCWSTR useText = lpszString;
+    if (SubstituteTextW(lpszString, cchString, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentExPointW", hdc, hNew);
+    BOOL ret = orgGetTextExtentExPointW(hdc, useText, useCount, nMaxExtent, lpnFit, lpnDx, lpSize);
+    DEBUG_GDI_EXIT("GetTextExtentExPointW", hdc, ret, hNew);
+    if (ret) {
+        AdjustTextExtentSize(hdc, lpSize, useCount);
+        AdjustPartialExtents(lpnDx, useCount);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+

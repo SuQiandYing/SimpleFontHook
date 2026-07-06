@@ -1,0 +1,369 @@
+static LONG ScaleLogFontValue(LONG value, float scale) {
+    LONG scaled = (LONG)(value * scale);
+    if (value != 0 && scaled == 0) scaled = (value < 0) ? -1 : 1;
+    return scaled;
+}
+
+static LONG ScaleLogFontWidth(LONG width, LONG height) {
+    if (!Config::EnableFontHook || !Config::EnableFontWidthScale)
+        return width;
+
+    if (width != 0)
+        return ScaleLogFontValue(width, Config::FontWidthScale);
+
+    LONG absHeight = height < 0 ? -height : height;
+    if (absHeight <= 0)
+        return width;
+
+    LONG derivedWidth = std::max<LONG>(1, absHeight / 2);
+    return ScaleLogFontValue(derivedWidth, Config::FontWidthScale);
+}
+
+static bool HasFontCharSpacing() {
+    return !IsPickerThread() &&
+        Config::EnableFontHook && Config::EnableFontCharSpacing && Config::FontCharSpacing != 0;
+}
+
+static bool HasFontLineSpacing() {
+    return !IsPickerThread() &&
+        Config::EnableFontHook && Config::EnableFontLineSpacing && Config::FontLineSpacing != 0;
+}
+
+static bool HasFontMetricPatch() {
+    return !IsPickerThread() &&
+        Config::EnableFontHook &&
+        (Config::EnableFontVerticalMetrics || HasFontLineSpacing() || HasFontCharSpacing());
+}
+
+static int ClampMetricInt(int value, int lo, int hi) {
+    return std::max(lo, std::min(hi, value));
+}
+
+static LONG ScalePermilleToLong(LONG base, int permille) {
+    long long value = (long long)base * (long long)permille;
+    if (value >= 0) return (LONG)((value + 500) / 1000);
+    return (LONG)((value - 500) / 1000);
+}
+
+static int ScalePermilleToInt(int base, int permille) {
+    long long value = (long long)base * (long long)permille;
+    if (value >= 0) return (int)((value + 500) / 1000);
+    return (int)((value - 500) / 1000);
+}
+
+static LONG QueryHdcBaseEm(HDC hdc, LONG fallback) {
+    if (!hdc) return std::max<LONG>(1, fallback);
+
+    TEXTMETRICW tm = {};
+    if (orgGetTextMetricsW(hdc, &tm)) {
+        LONG em = tm.tmAscent + tm.tmDescent;
+        if (em > 0) return em;
+        if (tm.tmHeight > tm.tmExternalLeading)
+            return std::max<LONG>(1, tm.tmHeight - tm.tmExternalLeading);
+    }
+
+    return std::max<LONG>(1, fallback);
+}
+
+static LONG ResolveConfiguredLineGap(LONG baseEm, LONG fallbackLineGap) {
+    if (!HasFontLineSpacing()) return fallbackLineGap;
+
+    // With vertical metrics enabled this value is a hhea/OS2-style
+    // per-em lineGap, matching GalFontTool. Kept pixel-based when used alone.
+    if (Config::EnableFontVerticalMetrics)
+        return ScalePermilleToLong(std::max<LONG>(1, baseEm), Config::FontLineSpacing);
+
+    return (LONG)Config::FontLineSpacing;
+}
+
+static LONG ResolveConfiguredLineGapForHdc(HDC hdc) {
+    if (!HasFontLineSpacing()) return 0;
+    if (!Config::EnableFontVerticalMetrics) return (LONG)Config::FontLineSpacing;
+    LONG baseEm = QueryHdcBaseEm(hdc, 1000);
+    return ResolveConfiguredLineGap(baseEm, 0);
+}
+
+static int ApplyHdcCharSpacing(HDC hdc, int charCount, bool hasDxArray) {
+    if (!HasFontCharSpacing() || hasDxArray || charCount == 1)
+        return 0x80000000;
+    return SetTextCharacterExtra(hdc, Config::FontCharSpacing);
+}
+
+static void RestoreHdcCharSpacing(HDC hdc, int oldExtra) {
+    if (oldExtra != 0x80000000 && oldExtra != 0x7FFFFFFF) {
+        SetTextCharacterExtra(hdc, oldExtra);
+    }
+}
+
+struct TextDrawSpacingState {
+    bool active;
+    HDC hdc;
+    LONG configVersion;
+    int lineY;
+    int lastX;
+    int xOffset;
+    int yOffset;
+    DWORD lastTick;
+};
+
+static __declspec(thread) TextDrawSpacingState g_textDrawSpacing = {};
+static volatile LONG g_textSpacingTraceCount = 0;
+
+static int AbsInt(int value) {
+    return value < 0 ? -value : value;
+}
+
+static void ApplyTextDrawSpacing(HDC hdc, int x, int y, int charCount, int* outX, int* outY) {
+    if (outX) *outX = x;
+    if (outY) *outY = y;
+    if (!hdc || charCount <= 0 || (x == 0 && y == 0))
+        return;
+
+    bool charSpacing = HasFontCharSpacing();
+    bool lineSpacing = HasFontLineSpacing();
+    if (!charSpacing && !lineSpacing)
+        return;
+    LONG lineGap = lineSpacing ? ResolveConfiguredLineGapForHdc(hdc) : 0;
+
+    DWORD now = GetTickCount();
+    bool reset =
+        !g_textDrawSpacing.active ||
+        g_textDrawSpacing.hdc != hdc ||
+        g_textDrawSpacing.configVersion != Config::ConfigVersion ||
+        now - g_textDrawSpacing.lastTick > 750;
+
+    if (reset) {
+        g_textDrawSpacing.active = true;
+        g_textDrawSpacing.hdc = hdc;
+        g_textDrawSpacing.configVersion = Config::ConfigVersion;
+        g_textDrawSpacing.lineY = y;
+        g_textDrawSpacing.lastX = x;
+        g_textDrawSpacing.xOffset = 0;
+        g_textDrawSpacing.yOffset = 0;
+    } else if (AbsInt(y - g_textDrawSpacing.lineY) > 2) {
+        if (lineSpacing && y > g_textDrawSpacing.lineY) {
+            g_textDrawSpacing.yOffset += (int)lineGap;
+        }
+        g_textDrawSpacing.lineY = y;
+        g_textDrawSpacing.xOffset = 0;
+    } else if (charSpacing && x < g_textDrawSpacing.lastX - 4) {
+        g_textDrawSpacing.xOffset = 0;
+    }
+
+    if (outX && charSpacing) *outX = x + g_textDrawSpacing.xOffset;
+    if (outY && lineSpacing) *outY = y + g_textDrawSpacing.yOffset;
+
+    int appliedX = outX ? *outX : x;
+    int appliedY = outY ? *outY : y;
+    if (charSpacing) {
+        g_textDrawSpacing.xOffset += Config::FontCharSpacing * charCount;
+    }
+    g_textDrawSpacing.lastX = x;
+    g_textDrawSpacing.lastTick = now;
+
+    if (Config::EnableDebugLog) {
+        LONG hit = InterlockedIncrement(&g_textSpacingTraceCount);
+        if (hit <= 24) {
+            Utils::Trace("[DEBUG][TextSpacing] #%ld hdc=%p count=%d raw=%d,%d adjusted=%d,%d xOffset=%d yOffset=%d charGap=%d lineGap=%d",
+            hit, hdc, charCount, x, y, appliedX, appliedY, g_textDrawSpacing.xOffset, g_textDrawSpacing.yOffset,
+                Config::FontCharSpacing, (int)lineGap);
+        }
+    }
+}
+
+static const int* BuildAdjustedDx(const int* lpDx, UINT count, UINT options, std::vector<int>& adjustedDx) {
+    if (!lpDx || !HasFontCharSpacing() || count <= 1)
+        return lpDx;
+
+    bool hasPdy = (options & ETO_PDY) != 0;
+    int stride = hasPdy ? 2 : 1;
+    adjustedDx.assign(lpDx, lpDx + count * stride);
+    for (UINT i = 0; i + 1 < count; ++i) {
+        adjustedDx[i * stride] += Config::FontCharSpacing;
+    }
+    return adjustedDx.data();
+}
+
+static void AdjustTextExtentSize(HDC hdc, LPSIZE size, int count) {
+    if (!size) return;
+    if (HasFontCharSpacing() && count > 1)
+        size->cx += Config::FontCharSpacing * (count - 1);
+    if (HasFontLineSpacing()) {
+        LONG baseEm = QueryHdcBaseEm(hdc, size->cy);
+        size->cy = std::max<LONG>(1, size->cy + ResolveConfiguredLineGap(baseEm, 0));
+    }
+}
+
+static void AdjustPartialExtents(LPINT dx, int count) {
+    if (!dx || !HasFontCharSpacing() || count <= 1) return;
+    for (int i = 0; i < count; ++i) {
+        dx[i] += Config::FontCharSpacing * i;
+    }
+}
+
+template<typename TM>
+static void PatchTextMetric(TM* tm) {
+    if (!tm) return;
+
+    if (Config::EnableCodepageSpoof) {
+        tm->tmCharSet = SpoofReportedCharsetB(tm->tmCharSet);
+    }
+
+    if (!HasFontMetricPatch()) return;
+
+    if (HasFontCharSpacing()) {
+        tm->tmAveCharWidth = std::max<LONG>(1, tm->tmAveCharWidth + Config::FontCharSpacing);
+        tm->tmMaxCharWidth = std::max<LONG>(1, tm->tmMaxCharWidth + Config::FontCharSpacing);
+    }
+
+    LONG baseEm = tm->tmAscent + tm->tmDescent;
+    if (baseEm <= 0) baseEm = std::max<LONG>(1, tm->tmHeight - tm->tmExternalLeading);
+
+    if (Config::EnableFontVerticalMetrics) {
+        int asc = ClampMetricInt(Config::FontAscentPermille, 100, 2000);
+        int desc = abs(ClampMetricInt(Config::FontDescentPermille, -2000, -1));
+        LONG newAscent = std::max<LONG>(1, (LONG)(baseEm * asc / 1000));
+        LONG newDescent = std::max<LONG>(1, (LONG)(baseEm * desc / 1000));
+        tm->tmAscent = newAscent;
+        tm->tmDescent = newDescent;
+    }
+
+    if (Config::EnableFontVerticalMetrics || HasFontLineSpacing()) {
+        LONG lineExtra = ResolveConfiguredLineGap(baseEm, tm->tmExternalLeading);
+        tm->tmExternalLeading = std::max<LONG>(0, lineExtra);
+        tm->tmHeight = std::max<LONG>(1, tm->tmAscent + tm->tmDescent + lineExtra);
+    }
+}
+
+template<typename OTM>
+static void PatchOutlineTextMetric(OTM* otm) {
+    if (!otm) return;
+    PatchTextMetric(&otm->otmTextMetrics);
+    if (!Config::EnableFontVerticalMetrics) return;
+
+    int em = (int)otm->otmEMSquare;
+    if (em <= 0) em = 1000;
+
+    int ascPermille = ClampMetricInt(Config::FontAscentPermille, 100, 2000);
+    int descPermille = ClampMetricInt(Config::FontDescentPermille, -2000, -1);
+    int linePermille = HasFontLineSpacing()
+        ? ClampMetricInt(Config::FontLineSpacing, -2000, 2000)
+        : 0;
+
+    LONG ascent = std::max<LONG>(1, ScalePermilleToInt(em, ascPermille));
+    LONG descent = std::min<LONG>(-1, ScalePermilleToInt(em, descPermille));
+    LONG lineGap = ScalePermilleToInt(em, linePermille);
+
+    otm->otmAscent = ascent;
+    otm->otmDescent = descent;
+    otm->otmLineGap = (UINT)std::max<LONG>(0, lineGap);
+    otm->otmMacAscent = ascent;
+    otm->otmMacDescent = descent;
+    otm->otmMacLineGap = (UINT)std::max<LONG>(0, lineGap);
+}
+
+static WORD ReadU16BEFromMetricData(const BYTE* p) {
+    return (WORD)((p[0] << 8) | p[1]);
+}
+
+static void WriteReturnedU16BE(BYTE* buffer, DWORD bufferOffset, DWORD bufferSize, DWORD fieldOffset, WORD value) {
+    BYTE be[2] = {
+        (BYTE)((value >> 8) & 0xFF),
+        (BYTE)(value & 0xFF),
+    };
+
+    for (DWORD i = 0; i < 2; ++i) {
+        DWORD tablePos = fieldOffset + i;
+        if (tablePos >= bufferOffset && tablePos - bufferOffset < bufferSize) {
+            buffer[tablePos - bufferOffset] = be[i];
+        }
+    }
+}
+
+static void OrReturnedU32BitBE(BYTE* buffer, DWORD bufferOffset, DWORD bufferSize, DWORD fieldOffset, int bitIndex) {
+    if (!buffer || bitIndex < 0 || bitIndex > 31) return;
+    DWORD tablePos = fieldOffset + (DWORD)(3 - bitIndex / 8);
+    if (tablePos >= bufferOffset && tablePos - bufferOffset < bufferSize) {
+        buffer[tablePos - bufferOffset] |= (BYTE)(1u << (bitIndex % 8));
+    }
+}
+
+static void PatchReturnedFontCodepageTable(DWORD table, DWORD offset, PVOID buffer, DWORD bytesCopied) {
+    if (!buffer || bytesCopied == 0 || !Config::EnableCodepageSpoof) return;
+
+    static const DWORD GDI_TABLE_OS2 = 0x322F534F;  // 'OS/2'
+    if (table != GDI_TABLE_OS2) return;
+
+    int bit = FontPatcher::CodePageRangeBitForCharset(Config::SpoofToCharset);
+    if (bit < 0 || bit > 31) return;
+
+    BYTE* bytes = (BYTE*)buffer;
+    OrReturnedU32BitBE(bytes, offset, bytesCopied, 78, bit);
+    OrReturnedU32BitBE(bytes, offset, bytesCopied, 78, 0);
+}
+
+static int ReadCurrentFontUnitsPerEm(HDC hdc) {
+    static const DWORD GDI_TABLE_HEAD = 0x64616568; // 'head'
+    BYTE upmBytes[2] = {};
+    DWORD ret = orgGetFontData(hdc, GDI_TABLE_HEAD, 18, upmBytes, sizeof(upmBytes));
+    if (ret == sizeof(upmBytes)) {
+        int upm = (int)ReadU16BEFromMetricData(upmBytes);
+        if (upm > 0) return upm;
+    }
+    return 1000;
+}
+
+static void PatchReturnedFontMetricTable(HDC hdc, DWORD table, DWORD offset, PVOID buffer, DWORD bytesCopied) {
+    if (!buffer || bytesCopied == 0 || !Config::EnableFontVerticalMetrics) return;
+
+    static const DWORD GDI_TABLE_HHEA = 0x61656868; // 'hhea'
+    static const DWORD GDI_TABLE_OS2 = 0x322F534F;  // 'OS/2'
+
+    if (table != GDI_TABLE_HHEA && table != GDI_TABLE_OS2) return;
+
+    int em = ReadCurrentFontUnitsPerEm(hdc);
+    int ascPermille = ClampMetricInt(Config::FontAscentPermille, 100, 2000);
+    int descPermille = ClampMetricInt(Config::FontDescentPermille, -2000, -1);
+    int linePermille = HasFontLineSpacing()
+        ? ClampMetricInt(Config::FontLineSpacing, -2000, 2000)
+        : 0;
+
+    int ascent = ClampMetricInt(ScalePermilleToInt(em, ascPermille), -32768, 32767);
+    int descent = ClampMetricInt(ScalePermilleToInt(em, descPermille), -32768, 32767);
+    int lineGap = ClampMetricInt(ScalePermilleToInt(em, linePermille), -32768, 32767);
+
+    BYTE* bytes = (BYTE*)buffer;
+    if (table == GDI_TABLE_HHEA) {
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 4, (WORD)(SHORT)ascent);
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 6, (WORD)(SHORT)descent);
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 8, (WORD)(SHORT)lineGap);
+    } else {
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 68, (WORD)(SHORT)ascent);
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 70, (WORD)(SHORT)descent);
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 72, (WORD)(SHORT)lineGap);
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 74, (WORD)ClampMetricInt(ascent, 0, 65535));
+        WriteReturnedU16BE(bytes, offset, bytesCopied, 76, (WORD)ClampMetricInt(-descent, 0, 65535));
+    }
+}
+
+static void AdjustWidthArray(LPINT widths, UINT count) {
+    if (!widths || !HasFontCharSpacing()) return;
+    for (UINT i = 0; i < count; ++i) {
+        widths[i] += Config::FontCharSpacing;
+    }
+}
+
+static void AdjustAbcArray(LPABC abc, UINT count) {
+    if (!abc || !HasFontCharSpacing()) return;
+    for (UINT i = 0; i < count; ++i) {
+        abc[i].abcB += Config::FontCharSpacing;
+    }
+}
+
+static void AdjustAbcFloatArray(LPABCFLOAT abc, UINT count) {
+    if (!abc || !HasFontCharSpacing()) return;
+    for (UINT i = 0; i < count; ++i) {
+        abc[i].abcfB += (FLOAT)Config::FontCharSpacing;
+    }
+}
+

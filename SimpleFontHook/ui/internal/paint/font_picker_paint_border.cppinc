@@ -1,0 +1,15 @@
+static void PaintWindowBorder(HDC mem, const RECT& rc)
+{
+    if (rc.right <= 1 || rc.bottom <= 1) return;
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, COL_BORDER);
+    HGDIOBJ oldPen = SelectObject(mem, borderPen);
+    MoveToEx(mem, 0, 0, NULL);
+    LineTo(mem, rc.right - 1, 0);
+    LineTo(mem, rc.right - 1, rc.bottom - 1);
+    LineTo(mem, 0, rc.bottom - 1);
+    LineTo(mem, 0, 0);
+    SetPixel(mem, rc.right - 1, rc.bottom - 1, COL_BORDER);
+    SelectObject(mem, oldPen);
+    DeleteObject(borderPen);
+}

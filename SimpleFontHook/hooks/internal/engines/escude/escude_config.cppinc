@@ -1,0 +1,177 @@
+// Escu:de font configuration shim.
+//
+// Escu:de stores per-user settings in Documents\ESCUDE\<Product>\configure.cfg.
+// If the [Font] Face entry is missing, the engine stays on its non-configured
+// font path and normal GDI font replacement may never get a useful HFONT. We
+// virtualize that single INI value so the game behaves as if configure.exe had
+// selected the current replacement font.
+
+static int g_escudeEngineProbe = -1;
+static volatile LONG g_escudeTraceCount = 0;
+static std::wstring g_escudeProductName;
+
+static void EscudeTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_escudeTraceCount);
+    if (hit > 256) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][Escude] %s", message);
+}
+
+static bool EscudeEqualsI(const char* left, const char* right) {
+    return left && right && _stricmp(left, right) == 0;
+}
+
+static bool EscudeEqualsI(const wchar_t* left, const wchar_t* right) {
+    return left && right && _wcsicmp(left, right) == 0;
+}
+
+static std::wstring EscudeRootConfigurePath() {
+    std::wstring path = ArtemisGetGameRoot();
+    if (path.empty()) return L"";
+    if (!path.empty() && path.back() != L'\\') path += L"\\";
+    path += L"configure.cfg";
+    return path;
+}
+
+static bool EscudeLooksLikeEngineRoot() {
+    if (g_escudeEngineProbe != -1) return g_escudeEngineProbe != 0;
+
+    std::wstring rootConfig = EscudeRootConfigurePath();
+    wchar_t company[64] = {};
+    wchar_t product[128] = {};
+
+    if (!rootConfig.empty()) {
+        orgGetPrivateProfileStringW(L"General", L"Company", L"", company, _countof(company), rootConfig.c_str());
+        orgGetPrivateProfileStringW(L"General", L"Product", L"", product, _countof(product), rootConfig.c_str());
+    }
+
+    bool isEscude = _wcsicmp(company, L"ESCUDE") == 0 && product[0] != L'\0';
+    if (isEscude) {
+        g_escudeProductName = product;
+        EscudeTraceLimited("engine-root product='%s' rootConfig='%s'",
+            ArtemisWideToUtf8(g_escudeProductName).c_str(),
+            ArtemisWideToUtf8(rootConfig).c_str());
+    }
+
+    g_escudeEngineProbe = isEscude ? 1 : 0;
+    return isEscude;
+}
+
+static bool EscudeIsConfigureCfgPath(const std::wstring& fullPath) {
+    if (fullPath.empty()) return false;
+
+    const wchar_t* baseName = PathFindFileNameW(fullPath.c_str());
+    if (!baseName || _wcsicmp(baseName, L"configure.cfg") != 0) return false;
+
+    if (ArtemisIsUnderRoot(fullPath)) return true;
+
+    if (g_escudeProductName.empty()) return false;
+    std::wstring normalized = ArtemisNormalizePath(fullPath);
+    std::wstring product = ArtemisNormalizePath(g_escudeProductName);
+    std::wstring suffix = L"\\escude\\" + product + L"\\configure.cfg";
+    if (normalized.size() < suffix.size()) return false;
+    return normalized.compare(normalized.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool EscudeIsConfigureCfgPathA(const char* fileName) {
+    std::wstring wide = ArtemisWideFromAnsi(fileName);
+    if (wide.empty()) return false;
+    return EscudeIsConfigureCfgPath(ArtemisFullPath(wide.c_str()));
+}
+
+static bool EscudeIsConfigureCfgPathW(const wchar_t* fileName) {
+    if (!fileName || !fileName[0]) return false;
+    return EscudeIsConfigureCfgPath(ArtemisFullPath(fileName));
+}
+
+static bool EscudeIsFontFaceRequestA(const char* appName, const char* keyName) {
+    return EscudeEqualsI(appName, "Font") &&
+        (EscudeEqualsI(keyName, "Face") || EscudeEqualsI(keyName, "Font"));
+}
+
+static bool EscudeIsFontFaceRequestW(const wchar_t* appName, const wchar_t* keyName) {
+    return EscudeEqualsI(appName, L"Font") &&
+        (EscudeEqualsI(keyName, L"Face") || EscudeEqualsI(keyName, L"Font"));
+}
+
+static bool EscudeShouldVirtualizeFontFaceA(const char* appName, const char* keyName, const char* fileName) {
+    return Config::EnableEscudeHook &&
+        Config::EscudeVirtualFontConfig &&
+        Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        !IsPickerThread() &&
+        EscudeIsFontFaceRequestA(appName, keyName) &&
+        EscudeLooksLikeEngineRoot() &&
+        EscudeIsConfigureCfgPathA(fileName);
+}
+
+static bool EscudeShouldVirtualizeFontFaceW(const wchar_t* appName, const wchar_t* keyName, const wchar_t* fileName) {
+    return Config::EnableEscudeHook &&
+        Config::EscudeVirtualFontConfig &&
+        Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        !IsPickerThread() &&
+        EscudeIsFontFaceRequestW(appName, keyName) &&
+        EscudeLooksLikeEngineRoot() &&
+        EscudeIsConfigureCfgPathW(fileName);
+}
+
+static DWORD EscudeCopyProfileStringA(const char* value, char* out, DWORD outCount) {
+    if (!value) value = "";
+    size_t valueLen = strlen(value);
+    if (!out || outCount == 0) return (DWORD)valueLen;
+
+    strncpy_s(out, outCount, value, _TRUNCATE);
+    size_t copied = strlen(out);
+    return (DWORD)copied;
+}
+
+static DWORD EscudeCopyProfileStringW(const wchar_t* value, wchar_t* out, DWORD outCount) {
+    if (!value) value = L"";
+    size_t valueLen = wcslen(value);
+    if (!out || outCount == 0) return (DWORD)valueLen;
+
+    wcsncpy_s(out, outCount, value, _TRUNCATE);
+    size_t copied = wcslen(out);
+    return (DWORD)copied;
+}
+
+DWORD WINAPI newGetPrivateProfileStringA(LPCSTR lpAppName, LPCSTR lpKeyName, LPCSTR lpDefault,
+    LPSTR lpReturnedString, DWORD nSize, LPCSTR lpFileName) {
+    if (EscudeShouldVirtualizeFontFaceA(lpAppName, lpKeyName, lpFileName)) {
+        EscudeTraceLimited("virtual-profile-string file='%s' section='%s' key='%s' face='%s'",
+            lpFileName ? lpFileName : "",
+            lpAppName ? lpAppName : "",
+            lpKeyName ? lpKeyName : "",
+            Config::ForcedFontNameA);
+        return EscudeCopyProfileStringA(Config::ForcedFontNameA, lpReturnedString, nSize);
+    }
+
+    return orgGetPrivateProfileStringA(lpAppName, lpKeyName, lpDefault, lpReturnedString, nSize, lpFileName);
+}
+
+DWORD WINAPI newGetPrivateProfileStringW(LPCWSTR lpAppName, LPCWSTR lpKeyName, LPCWSTR lpDefault,
+    LPWSTR lpReturnedString, DWORD nSize, LPCWSTR lpFileName) {
+    if (EscudeShouldVirtualizeFontFaceW(lpAppName, lpKeyName, lpFileName)) {
+        EscudeTraceLimited("virtual-profile-string-w file='%s' face='%s'",
+            lpFileName ? ArtemisWideToUtf8(lpFileName).c_str() : "",
+            ArtemisWideToUtf8(Config::ForcedFontNameW).c_str());
+        return EscudeCopyProfileStringW(Config::ForcedFontNameW, lpReturnedString, nSize);
+    }
+
+    return orgGetPrivateProfileStringW(lpAppName, lpKeyName, lpDefault, lpReturnedString, nSize, lpFileName);
+}
+
+UINT WINAPI newGetPrivateProfileIntA(LPCSTR lpAppName, LPCSTR lpKeyName, INT nDefault, LPCSTR lpFileName) {
+    return orgGetPrivateProfileIntA(lpAppName, lpKeyName, nDefault, lpFileName);
+}
+
+UINT WINAPI newGetPrivateProfileIntW(LPCWSTR lpAppName, LPCWSTR lpKeyName, INT nDefault, LPCWSTR lpFileName) {
+    return orgGetPrivateProfileIntW(lpAppName, lpKeyName, nDefault, lpFileName);
+}

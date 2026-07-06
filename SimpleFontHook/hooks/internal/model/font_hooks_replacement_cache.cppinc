@@ -1,0 +1,256 @@
+static bool SameSourceLogFont(const LOGFONTW& a, const LOGFONTW& b) {
+    return a.lfHeight == b.lfHeight &&
+        a.lfWidth == b.lfWidth &&
+        a.lfEscapement == b.lfEscapement &&
+        a.lfOrientation == b.lfOrientation &&
+        a.lfWeight == b.lfWeight &&
+        a.lfItalic == b.lfItalic &&
+        a.lfUnderline == b.lfUnderline &&
+        a.lfStrikeOut == b.lfStrikeOut &&
+        a.lfCharSet == b.lfCharSet &&
+        a.lfOutPrecision == b.lfOutPrecision &&
+        a.lfClipPrecision == b.lfClipPrecision &&
+        a.lfQuality == b.lfQuality &&
+        a.lfPitchAndFamily == b.lfPitchAndFamily &&
+        wcscmp(a.lfFaceName, b.lfFaceName) == 0;
+}
+
+static bool TryGetReplacementInfo(HFONT font, ReplacementFontInfo* info) {
+    if (!font) return false;
+    std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+    auto it = g_replacementInfoByFont.find(font);
+    if (it == g_replacementInfoByFont.end()) return false;
+    if (info) *info = it->second;
+    return true;
+}
+
+static HGDIOBJ ExposeLogicalFontObject(HGDIOBJ obj) {
+    if (!obj || GetObjectType(obj) != OBJ_FONT) return obj;
+
+    ReplacementFontInfo info = {};
+    if (!TryGetReplacementInfo((HFONT)obj, &info)) return obj;
+    if (info.originalFont && info.originalFont != (HFONT)obj) return (HGDIOBJ)info.originalFont;
+    return obj;
+}
+
+static bool IsStockFontHandle(HFONT font) {
+    if (!font) return false;
+
+    static const int stockFonts[] = {
+        OEM_FIXED_FONT,
+        ANSI_FIXED_FONT,
+        ANSI_VAR_FONT,
+        SYSTEM_FONT,
+        SYSTEM_FIXED_FONT,
+        DEVICE_DEFAULT_FONT,
+        DEFAULT_GUI_FONT,
+    };
+
+    for (int stockFont : stockFonts) {
+        if (font == (HFONT)GetStockObject(stockFont))
+            return true;
+    }
+    return false;
+}
+
+static bool IsManagedReplacementFont(HFONT font) {
+    return TryGetReplacementInfo(font, nullptr);
+}
+
+static void RefreshFontCacheEpoch() {
+    LONG currentVersion = Config::ConfigVersion;
+    if (g_observedConfigVersion == currentVersion && InterlockedCompareExchange(&Config::NeedFontReload, 0, 0) == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+    LONG needReload = InterlockedExchange(&Config::NeedFontReload, 0);
+    if (g_observedConfigVersion == currentVersion && needReload == 0)
+        return;
+
+    // Drop derived replacement lookups for the old settings. Keep per-HFONT source
+    // metadata so stale handles can still be unwrapped without scaling twice.
+    g_replacementByOriginal.clear();
+    g_realToVirtualGlyph.clear();
+    g_virtualToRealGlyph.clear();
+    g_observedConfigVersion = currentVersion;
+    Utils::Log("[FontCache] Cleared replacement lookup cache for config version %ld.", currentVersion);
+}
+
+static HFONT FindCachedReplacementFont(HFONT originalFont, const LOGFONTW& sourceLogfont, LONG configVersion) {
+    std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+    auto byOriginal = g_replacementByOriginal.find(originalFont);
+    if (byOriginal == g_replacementByOriginal.end()) return NULL;
+    auto info = g_replacementInfoByFont.find(byOriginal->second);
+    if (info == g_replacementInfoByFont.end()) return NULL;
+    if (info->second.configVersion != configVersion) return NULL;
+    if (!SameSourceLogFont(info->second.sourceLogfont, sourceLogfont)) return NULL;
+    return byOriginal->second;
+}
+
+static void RegisterReplacementFont(HFONT originalFont, HFONT replacementFont, const LOGFONTW& sourceLogfont, LONG configVersion) {
+    {
+        std::lock_guard<std::mutex> lock(g_fontCacheMutex);
+        g_replacementByOriginal[originalFont] = replacementFont;
+        g_replacementInfoByFont[replacementFont] = { originalFont, sourceLogfont, configVersion };
+    }
+
+    TraceApiHit(TRACE_CREATE_FONT, "register original=%p replacement=%p version=%ld h=%ld w=%ld weight=%ld charset=%u",
+        originalFont, replacementFont, configVersion,
+        sourceLogfont.lfHeight, sourceLogfont.lfWidth, sourceLogfont.lfWeight,
+        (unsigned)sourceLogfont.lfCharSet);
+}
+
+static bool BuildReplacementLogFont(const LOGFONTW& sourceLogfont, LOGFONTW& replacementLogfont) {
+    replacementLogfont = sourceLogfont;
+    bool changed = false;
+
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        if (wcscmp(replacementLogfont.lfFaceName, Config::ForcedFontNameW) != 0) {
+            wcscpy_s(replacementLogfont.lfFaceName, Config::ForcedFontNameW);
+            changed = true;
+        }
+    }
+
+    if (Config::EnableFontHook && Config::EnableCharsetReplace &&
+        !MajiroShouldPreserveDefaultCharset(sourceLogfont)) {
+        if (replacementLogfont.lfCharSet != (BYTE)Config::ForcedCharset) {
+            replacementLogfont.lfCharSet = (BYTE)Config::ForcedCharset;
+            changed = true;
+        }
+    }
+
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        SoftpalShouldUseNaturalReplacementWidth()) {
+        if (replacementLogfont.lfWidth != 0) {
+            replacementLogfont.lfWidth = 0;
+            changed = true;
+        }
+        replacementLogfont.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    }
+
+    {
+        BYTE spoofed = SpoofCharsetB(replacementLogfont.lfCharSet);
+        if (spoofed != replacementLogfont.lfCharSet) {
+            replacementLogfont.lfCharSet = spoofed;
+            changed = true;
+        }
+    }
+
+    if (Config::EnableFontHook && Config::EnableFontHeightScale) {
+        replacementLogfont.lfHeight = ScaleLogFontValue(replacementLogfont.lfHeight, Config::FontHeightScale);
+        changed = true;
+    }
+
+    if (Config::EnableFontHook && Config::EnableFontWidthScale) {
+        replacementLogfont.lfWidth = ScaleLogFontWidth(replacementLogfont.lfWidth, replacementLogfont.lfHeight);
+        changed = true;
+    }
+
+    if (Config::EnableFontHook && Config::EnableFontWeight && Config::FontWeight > 0) {
+        if (replacementLogfont.lfWeight != Config::FontWeight) {
+            replacementLogfont.lfWeight = Config::FontWeight;
+            changed = true;
+        }
+    }
+
+    return changed;
+}
+
+static HFONT GetOrCreateReplacementFont(HFONT originalFont, const LOGFONTW& sourceLogfont) {
+    RefreshFontCacheEpoch();
+
+    LOGFONTW replacementLogfont;
+    if (!BuildReplacementLogFont(sourceLogfont, replacementLogfont)) {
+        if (Config::EnableDebugLog) {
+            DebugTraceLogFontW("no-change-source", sourceLogfont);
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s original=%p action=skip reason=no-logfont-change",
+                DebugCurrentApiName(), originalFont);
+        }
+        return NULL;
+    }
+
+    LONG configVersion = Config::ConfigVersion;
+    HFONT cached = FindCachedReplacementFont(originalFont, sourceLogfont, configVersion);
+    if (cached) {
+        if (Config::EnableDebugLog) {
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s original=%p replacement=%p action=reuse-cache version=%ld",
+                DebugCurrentApiName(), originalFont, cached, configVersion);
+        }
+        return cached;
+    }
+
+    HFONT replacementFont = orgCreateFontIndirectW(&replacementLogfont);
+    DWORD createErr = GetLastError();
+    if (Config::EnableDebugLog) {
+        DebugTraceLogFontW("source", sourceLogfont);
+        DebugTraceLogFontW("replacement", replacementLogfont);
+        Utils::Trace("[DEBUG][ReplaceDecision] api=%s original=%p replacement=%p action=create err=%lu version=%ld",
+            DebugCurrentApiName(), originalFont, replacementFont, createErr, configVersion);
+    }
+    if (!replacementFont) return NULL;
+
+    RegisterReplacementFont(originalFont, replacementFont, sourceLogfont, configVersion);
+    return replacementFont;
+}
+
+static void LogFontAToW(const LOGFONTA& src, LOGFONTW& dst) {
+    dst = {};
+    dst.lfHeight = src.lfHeight;
+    dst.lfWidth = src.lfWidth;
+    dst.lfEscapement = src.lfEscapement;
+    dst.lfOrientation = src.lfOrientation;
+    dst.lfWeight = src.lfWeight;
+    dst.lfItalic = src.lfItalic;
+    dst.lfUnderline = src.lfUnderline;
+    dst.lfStrikeOut = src.lfStrikeOut;
+    dst.lfCharSet = src.lfCharSet;
+    dst.lfOutPrecision = src.lfOutPrecision;
+    dst.lfClipPrecision = src.lfClipPrecision;
+    dst.lfQuality = src.lfQuality;
+    dst.lfPitchAndFamily = src.lfPitchAndFamily;
+    MultiByteToWideChar(CP_ACP, 0, src.lfFaceName, -1, dst.lfFaceName, LF_FACESIZE);
+    dst.lfFaceName[LF_FACESIZE - 1] = L'\0';
+}
+
+static LOGFONTW MakeSourceLogFontW(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS,
+    DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCWSTR lpszF) {
+    LOGFONTW lf = {};
+    lf.lfHeight = nH;
+    lf.lfWidth = nW;
+    lf.lfEscapement = nE;
+    lf.lfOrientation = nO;
+    lf.lfWeight = nWt;
+    lf.lfItalic = (BYTE)fI;
+    lf.lfUnderline = (BYTE)fU;
+    lf.lfStrikeOut = (BYTE)fS;
+    lf.lfCharSet = (BYTE)fC;
+    lf.lfOutPrecision = (BYTE)fOP;
+    lf.lfClipPrecision = (BYTE)fCP;
+    lf.lfQuality = (BYTE)fQ;
+    lf.lfPitchAndFamily = (BYTE)fPF;
+    if (lpszF) wcsncpy_s(lf.lfFaceName, lpszF, LF_FACESIZE - 1);
+    return lf;
+}
+
+static LOGFONTW MakeSourceLogFontWFromA(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS,
+    DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCSTR lpszF) {
+    LOGFONTW lf = MakeSourceLogFontW(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, L"");
+    if (lpszF) MultiByteToWideChar(CP_ACP, 0, lpszF, -1, lf.lfFaceName, LF_FACESIZE);
+    lf.lfFaceName[LF_FACESIZE - 1] = L'\0';
+    return lf;
+}
+
+static void StripEpochSuffixFromLogFont(LOGFONTW& lf) {
+    StripEpochSuffixW(lf.lfFaceName);
+}
+
+static void StripEpochSuffixFromLogFont(LOGFONTA& lf) {
+    StripEpochSuffixA(lf.lfFaceName);
+}
+
+static void RegisterCreatedReplacementFont(HFONT createdFont, const LOGFONTW& sourceLogfont) {
+    if (!createdFont) return;
+    RefreshFontCacheEpoch();
+    RegisterReplacementFont(createdFont, createdFont, sourceLogfont, Config::ConfigVersion);
+}
+

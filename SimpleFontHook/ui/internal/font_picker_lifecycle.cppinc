@@ -1,0 +1,196 @@
+// Window creation.
+static void CreatePickerWindow() {
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = g_hModule;
+    wc.lpszClassName = WND_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.style = CS_DBLCLKS;
+    RegisterClassExW(&wc);
+
+    RecalcLayout();
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+
+    g_hWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_LAYERED,
+        WND_CLASS, L"Font Selection Assistant", WS_POPUP,
+        (screenW - WINDOW_WIDTH) / 2, (screenH - WINDOW_HEIGHT) / 2,
+        WINDOW_WIDTH, WINDOW_HEIGHT,
+        NULL, NULL, g_hModule, NULL);
+
+    // Make window slightly transparent without keeping the system resize frame.
+    SetLayeredWindowAttributes(g_hWnd, 0, 245, LWA_ALPHA);
+
+    // Search edit
+    g_hSearchEdit = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        22, TITLE_HEIGHT + 14, WINDOW_WIDTH - 62, 20,
+        g_hWnd, NULL, g_hModule, NULL);
+    SendMessage(g_hSearchEdit, EM_SETCUEBANNER, FALSE, (LPARAM)L"  \x2727 Search fonts...");
+
+    if (g_editFont) DeleteObject(g_editFont);
+    g_editFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    SendMessage(g_hSearchEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+
+    g_OldEditProc = (WNDPROC)SetWindowLongPtr(g_hSearchEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+
+    struct HotKeyCandidate {
+        int id;
+        UINT modifiers;
+        UINT vk;
+        const char* name;
+    };
+    const HotKeyCandidate hotkeys[] = {
+        { HOTKEY_TOGGLE_PICKER, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F', "Ctrl+Alt+F" },
+        { HOTKEY_TOGGLE_PICKER_ALT_SHIFT, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'F', "Ctrl+Alt+Shift+F" },
+        { HOTKEY_TOGGLE_PICKER_F8, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8, "Ctrl+Alt+F8" },
+    };
+    g_toggleHotkeyRegistered = false;
+    for (const HotKeyCandidate& hotkey : hotkeys) {
+        if (RegisterHotKey(g_hWnd, hotkey.id, hotkey.modifiers, hotkey.vk)) {
+            g_toggleHotkeyRegistered = true;
+            Utils::Trace("[Picker] Registered toggle hotkey %s", hotkey.name);
+            break;
+        }
+        Utils::Trace("[Picker] RegisterHotKey %s failed err=%lu", hotkey.name, GetLastError());
+    }
+}
+
+// Restore picker UI state from loaded Config.
+static void RestoreUIStateFromConfig() {
+    // Restore applied font name
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace && Config::ForcedFontNameW[0] != L'\0') {
+        std::wstring restoredFace = StripMetricCloneSuffix(Config::ForcedFontNameW);
+        if (!WideEqualsIgnoreCase(restoredFace, Config::ForcedFontNameW)) {
+            wcsncpy_s(Config::ForcedFontNameW, restoredFace.c_str(), LF_FACESIZE - 1);
+            WideCharToMultiByte(CP_ACP, 0, restoredFace.c_str(), -1,
+                Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+            Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+        }
+        g_appliedFont = restoredFace;
+        g_recentFonts.insert(g_recentFonts.begin(), g_appliedFont);
+    }
+
+    // Restore charset selector
+    if (Config::EnableCharsetReplace) {
+        for (int i = 0; i < g_charsetCount; i++) {
+            if (g_charsets[i].value == (BYTE)Config::ForcedCharset) {
+                g_selectedCharset = i;
+                break;
+            }
+        }
+    } else {
+        g_selectedCharset = 0;  // "All"
+    }
+
+    // Restore spoof state
+    g_spoofEnabled = Config::EnableCodepageSpoof;
+    g_spoofRuntimeReplaceEnabled = Config::EnableCodepageRuntimeReplace;
+    g_textSubstitutionEnabled = Config::EnableTextSubstitution;
+    g_codepageRedirectEnabled = Config::EnableCodepageRedirect;
+    g_codepageRedirectPresetIdx = FindCodepageRedirectPresetIndex(
+        Config::CodepageRedirectFrom, Config::CodepageRedirectTo);
+    for (int i = 0; i < g_textSubstitutionModeCount; i++) {
+        if (g_textSubstitutionModes[i].mode == Config::TextSubstitutionMode) {
+            g_textSubstitutionModeIdx = i;
+            break;
+        }
+    }
+    for (int i = 0; i < g_textSubstitutionCodepageCount; i++) {
+        if (g_textSubstitutionCodepages[i].codepage == Config::TextSubstitutionCodepage) {
+            g_textSubstitutionCodepageIdx = i;
+            break;
+        }
+    }
+    for (int i = 0; i < g_charsetCount; i++) {
+        if (g_charsets[i].value == (BYTE)Config::SpoofFromCharset) g_spoofFromIdx = i;
+        if (g_charsets[i].value == (BYTE)Config::SpoofToCharset) g_spoofToIdx = i;
+    }
+    for (int i = 0; i < g_spoofCharsetCount; i++) {
+        if (g_spoofCharsets[i].value == (BYTE)Config::SpoofToCharset) {
+            g_spoofCharsetIdx = i;
+            break;
+        }
+    }
+
+    // Try to select the applied font in the list
+    UpdateFilter();
+    if (!g_appliedFont.empty()) {
+        for (int i = 0; i < (int)g_filteredIndices.size(); i++) {
+            if (WideEqualsIgnoreCase(g_allFonts[g_filteredIndices[i]].name, g_appliedFont)) {
+                g_selectedIndex = i;
+                EnsureVisible();
+                break;
+            }
+        }
+    }
+}
+
+static void ApplyRestoredConfigToGame() {
+    if (!Config::EnableFontHook || !Config::EnableFaceNameReplace || Config::ForcedFontNameW[0] == L'\0')
+        return;
+
+    if ((Config::EnableFontVerticalMetrics || Config::EnableCodepageSpoof) &&
+        !CreatePatchedFontCloneFromCurrentTarget()) {
+        Utils::Trace("[TRACE] Restore config clone unavailable target='%S' asc=%d desc=%d line=%d codepage=%d",
+            GetMetricTargetFont().c_str(), Config::FontAscentPermille,
+            Config::FontDescentPermille, Config::FontLineSpacing,
+            Config::EnableCodepageSpoof ? 1 : 0);
+    }
+
+    RefreshFontHookEnabled();
+    ForceGameRedraw();
+}
+
+// Public picker interface.
+void Init(HMODULE hModule) {
+    g_hModule = hModule;
+
+    // Load saved config - if found, font hook is already active from Config load
+    bool hasSavedConfig = Utils::LoadConfig(hModule);
+
+    EnumerateFonts();
+
+    // Restore UI state from config
+    if (hasSavedConfig) {
+        RestoreUIStateFromConfig();
+    }
+
+    CreatePickerWindow();
+    if (hasSavedConfig) {
+        ApplyRestoredConfigToGame();
+    }
+
+    if (hasSavedConfig && !Config::PickerShowOnStartup && g_toggleHotkeyRegistered) {
+        ShowWindow(g_hWnd, SW_HIDE);
+        g_visible = false;
+    } else {
+        ShowWindow(g_hWnd, SW_SHOWNORMAL);
+        SetForegroundWindow(g_hWnd);
+        SetFocus(g_hSearchEdit);
+        g_visible = true;
+    }
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+void Toggle() {
+    if (!g_hWnd) return;
+    g_visible = !g_visible;
+    ShowWindow(g_hWnd, g_visible ? SW_RESTORE : SW_HIDE);
+    if (g_visible) {
+        SetForegroundWindow(g_hWnd);
+        SetFocus(g_hSearchEdit);
+        InvalidateRect(g_hWnd, NULL, FALSE);
+    }
+}
+
+bool IsVisible() { return g_visible; }
+

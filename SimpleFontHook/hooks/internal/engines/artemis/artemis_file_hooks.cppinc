@@ -1,0 +1,190 @@
+static bool ArtemisIsReadOnlyOpen(DWORD desiredAccess, DWORD creationDisposition) {
+    if (creationDisposition != OPEN_EXISTING && creationDisposition != OPEN_ALWAYS) return false;
+    if ((desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0) return false;
+    return true;
+}
+
+static bool ArtemisReadWholeFile(const std::wstring& path, std::vector<BYTE>& bytes) {
+    HANDLE hFile = orgCreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 16 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    bytes.resize((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size()) {
+        bytes.clear();
+        return false;
+    }
+    return true;
+}
+
+static HANDLE ArtemisCreateTempReadHandle(const std::vector<BYTE>& bytes) {
+    wchar_t tempDir[MAX_PATH] = {};
+    wchar_t tempPath[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, tempDir) == 0) return INVALID_HANDLE_VALUE;
+    if (GetTempFileNameW(tempDir, L"sfh", 0, tempPath) == 0) return INVALID_HANDLE_VALUE;
+
+    HANDLE hFile = orgCreateFileW(tempPath, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+
+    DWORD written = 0;
+    if (!bytes.empty() && (!WriteFile(hFile, bytes.data(), (DWORD)bytes.size(), &written, NULL) || written != bytes.size())) {
+        CloseHandle(hFile);
+        return INVALID_HANDLE_VALUE;
+    }
+    SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+    return hFile;
+}
+
+static bool ArtemisCopyVirtualFontBytes(std::vector<BYTE>& bytes) {
+    bytes.clear();
+    LONG version = Config::ConfigVersion;
+    if (!ArtemisSyncVirtualFontFile(version)) return false;
+
+    std::lock_guard<std::mutex> lock(g_artemisVirtualFontMutex);
+    if (g_artemisExportedFontVersion != version || g_artemisExportedFontBytes.empty()) return false;
+    bytes = g_artemisExportedFontBytes;
+    return true;
+}
+
+static HANDLE ArtemisOpenMemoryFont(const ArtemisPathInfo& info) {
+    std::vector<BYTE> bytes;
+    if (!ArtemisCopyVirtualFontBytes(bytes)) {
+        ArtemisTraceLimited("font-redirect-failed request='%s' reason=no-memory-font version=%ld",
+            ArtemisWideToUtf8(info.requestedPath).c_str(), Config::ConfigVersion);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE hFont = ArtemisCreateTempReadHandle(bytes);
+    if (hFont == INVALID_HANDLE_VALUE) {
+        ArtemisTraceLimited("font-redirect-failed request='%s' reason=temp-memory-font err=%lu bytes=%lu",
+            ArtemisWideToUtf8(info.requestedPath).c_str(), GetLastError(), (DWORD)bytes.size());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    ArtemisRecordFontRedirect();
+    ArtemisTraceLimited("font-redirect version=%ld request='%s' source='%s' bytes=%lu",
+        Config::ConfigVersion, ArtemisWideToUtf8(info.requestedPath).c_str(),
+        "<memory-export>", (DWORD)bytes.size());
+    return hFont;
+}
+
+static HANDLE ArtemisOpenPatchedTable(const ArtemisPathInfo& info) {
+    LONG version = Config::ConfigVersion;
+    InterlockedExchange(&g_artemisLastTableOpenVersion, version);
+
+    std::vector<BYTE> bytes;
+    ArtemisPathInfo patchInfo = info;
+    std::wstring resourceName = info.resourceName.empty()
+        ? ArtemisResourceNameForKind(info.kind)
+        : info.resourceName;
+
+    if (!info.sourcePath.empty()) {
+        if (!ArtemisReadWholeFile(info.sourcePath, bytes)) {
+            ArtemisTraceLimited("table-read-failed source='%s' err=%lu",
+                ArtemisWideToUtf8(info.sourcePath).c_str(), GetLastError());
+            return INVALID_HANDLE_VALUE;
+        }
+    } else {
+        std::wstring sourceLabel;
+        if (resourceName.empty() || !ArtemisReadPfsResource(resourceName, bytes, &sourceLabel)) {
+            ArtemisTraceLimited("table-source-missing request='%s' resource='%s'",
+                ArtemisWideToUtf8(info.requestedPath).c_str(), ArtemisWideToUtf8(resourceName).c_str());
+            return INVALID_HANDLE_VALUE;
+        }
+        patchInfo.sourcePath = sourceLabel;
+    }
+
+    bool patched = ArtemisPatchTableContent(patchInfo, bytes);
+    if (!patched) {
+        if (!info.sourcePath.empty()) {
+            return orgCreateFileW(info.sourcePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+        ArtemisTraceLimited("table-pass-through request='%s' reason=packed-or-unpatched",
+            ArtemisWideToUtf8(info.requestedPath).c_str());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    InterlockedExchange(&g_artemisLastTablePatchVersion, version);
+    HANDLE hVirtual = ArtemisCreateTempReadHandle(bytes);
+    if (hVirtual == INVALID_HANDLE_VALUE) {
+        ArtemisTraceLimited("table-temp-failed source='%s' err=%lu",
+            ArtemisWideToUtf8(info.sourcePath).c_str(), GetLastError());
+    }
+    return hVirtual;
+}
+
+static HANDLE ArtemisTryOpenVirtualFileW(const wchar_t* fileName, DWORD desiredAccess, DWORD shareMode,
+    LPSECURITY_ATTRIBUTES securityAttributes, DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile) {
+    UNREFERENCED_PARAMETER(securityAttributes);
+    UNREFERENCED_PARAMETER(templateFile);
+
+    if (!ArtemisIsReadOnlyOpen(desiredAccess, creationDisposition)) return INVALID_HANDLE_VALUE;
+
+    ArtemisPathInfo info = ArtemisClassifyPath(fileName);
+    if (info.kind == ARTEMIS_RESOURCE_NONE) return INVALID_HANDLE_VALUE;
+
+    if (info.kind == ARTEMIS_RESOURCE_FONT_FILE) {
+        if (info.memoryFont) return ArtemisOpenMemoryFont(info);
+
+        ArtemisRecordFontRedirect();
+        ArtemisTraceLimited("font-redirect version=%ld request='%s' source='%s'",
+            Config::ConfigVersion, ArtemisWideToUtf8(info.requestedPath).c_str(), ArtemisWideToUtf8(info.sourcePath).c_str());
+        return orgCreateFileW(info.sourcePath.c_str(), desiredAccess, shareMode, NULL,
+            OPEN_EXISTING, flagsAndAttributes, NULL);
+    }
+
+    HANDLE hTable = ArtemisOpenPatchedTable(info);
+    if (hTable != INVALID_HANDLE_VALUE) return hTable;
+    return INVALID_HANDLE_VALUE;
+}
+
+static bool ArtemisTryGetVirtualAttributesW(const wchar_t* fileName, WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    ArtemisPathInfo info = ArtemisClassifyPath(fileName);
+    if (info.kind == ARTEMIS_RESOURCE_NONE) return false;
+
+    if (info.memoryFont) {
+        std::vector<BYTE> bytes;
+        if (!ArtemisCopyVirtualFontBytes(bytes)) return false;
+
+        WIN32_FILE_ATTRIBUTE_DATA localData = {};
+        localData.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        localData.nFileSizeHigh = (DWORD)(((ULONGLONG)bytes.size()) >> 32);
+        localData.nFileSizeLow = (DWORD)((ULONGLONG)bytes.size());
+
+        FILETIME now = {};
+        GetSystemTimeAsFileTime(&now);
+        localData.ftCreationTime = now;
+        localData.ftLastAccessTime = now;
+        localData.ftLastWriteTime = now;
+
+        if (data) *data = localData;
+        if (attrs) *attrs = localData.dwFileAttributes;
+        return true;
+    }
+
+    if (info.sourcePath.empty()) {
+        // Do not claim packed table files exist as loose files unless we can
+        // return a patched clear-text stream from CreateFile. Otherwise some
+        // Artemis builds skip their normal PFS fallback and stall at startup.
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA localData = {};
+    if (!orgGetFileAttributesExW(info.sourcePath.c_str(), GetFileExInfoStandard, &localData)) return false;
+    if (data) *data = localData;
+    if (attrs) *attrs = localData.dwFileAttributes;
+    return true;
+}

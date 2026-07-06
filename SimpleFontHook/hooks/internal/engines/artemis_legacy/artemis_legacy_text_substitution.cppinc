@@ -1,0 +1,66 @@
+static volatile LONG g_artemisLegacyCodepageSubTraceCount = 0;
+static __declspec(thread) bool g_artemisLegacyCodepageSubActive = false;
+
+static bool ArtemisLegacyTrySubstituteMultiByteToWideChar(UINT codepage, DWORD flags,
+    LPCCH multiByteText, int multiByteCount, LPWSTR wideText, int wideCount, int* result) {
+    if (result) *result = 0;
+    if (g_artemisLegacyCodepageSubActive ||
+        !Config::EnableArtemisHook ||
+        !IsTextSubstitutionActive() ||
+        IsPickerThread() ||
+        !multiByteText ||
+        multiByteCount == 0 ||
+        !ArtemisLegacyLooksLikeEngineRoot()) {
+        return false;
+    }
+
+    UINT targetCodepage = TextSubstitutionAnsiCodepage();
+    if (!CodepageRedirectMatches(codepage, targetCodepage)) {
+        return false;
+    }
+
+    int sourceLen = multiByteCount < 0 ? lstrlenA(multiByteText) + 1 : multiByteCount;
+    if (sourceLen <= 0) return false;
+
+    g_artemisLegacyCodepageSubActive = true;
+    int wideLen = orgMultiByteToWideChar(codepage, flags, multiByteText, sourceLen, NULL, 0);
+    if (wideLen <= 0) {
+        g_artemisLegacyCodepageSubActive = false;
+        return false;
+    }
+
+    std::wstring wideInput(wideLen, L'\0');
+    int decoded = orgMultiByteToWideChar(codepage, flags, multiByteText, sourceLen, &wideInput[0], wideLen);
+    g_artemisLegacyCodepageSubActive = false;
+    if (decoded != wideLen) return false;
+
+    std::wstring wideOutput;
+    int outputCount = wideLen;
+    if (!SubstituteTextW(wideInput.c_str(), wideLen, wideOutput, &outputCount)) {
+        return false;
+    }
+
+    if (outputCount <= 0) return false;
+    if (!wideText || wideCount == 0) {
+        if (result) *result = outputCount;
+        return true;
+    }
+
+    if (wideCount < outputCount) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        if (result) *result = 0;
+        return true;
+    }
+
+    memcpy(wideText, wideOutput.data(), (size_t)outputCount * sizeof(wchar_t));
+    if (result) *result = outputCount;
+
+    if (Config::EnableDebugLog) {
+        LONG hit = InterlockedIncrement(&g_artemisLegacyCodepageSubTraceCount);
+        if (hit <= 48) {
+            ArtemisLegacyTraceLimited("codepage-text-sub codepage=%u bytes=%d chars=%d",
+                codepage, sourceLen, outputCount);
+        }
+    }
+    return true;
+}

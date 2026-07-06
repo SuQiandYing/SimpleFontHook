@@ -1,0 +1,29 @@
+static void PaintSearchArea(HDC mem, const RECT& rc)
+{
+    // Search area.
+    RECT searchAreaRc = { 0, TITLE_HEIGHT, rc.right, TITLE_HEIGHT + SEARCH_HEIGHT };
+    {
+        HBRUSH sbr = CreateSolidBrush(COL_SEARCH_BG);
+        FillRect(mem, &searchAreaRc, sbr);
+        DeleteObject(sbr);
+    }
+
+    // Search box outline (rounded, with pink glow when focused)
+    HWND focusWnd = GetFocus();
+    COLORREF searchBorderCol = (focusWnd == g_hSearchEdit) ? COL_ACCENT : COL_BORDER;
+    RECT searchBoxRc = { 14, TITLE_HEIGHT + 10, WINDOW_WIDTH - 14, TITLE_HEIGHT + SEARCH_HEIGHT - 10 };
+    DrawRoundRectOutline(mem, searchBoxRc, 14, searchBorderCol);
+
+    // Search icon (magnifying glass)
+    HPEN iconPen = CreatePen(PS_SOLID, 2, COL_TEXT_DIM);
+    HGDIOBJ oldPen = SelectObject(mem, iconPen);
+    HGDIOBJ oldIconBr = SelectObject(mem, GetStockObject(NULL_BRUSH));
+    int iconCx = WINDOW_WIDTH - 32, iconCy = TITLE_HEIGHT + SEARCH_HEIGHT / 2 - 2;
+    Ellipse(mem, iconCx - 6, iconCy - 6, iconCx + 4, iconCy + 4);
+    MoveToEx(mem, iconCx + 2, iconCy + 2, NULL);
+    LineTo(mem, iconCx + 7, iconCy + 7);
+    SelectObject(mem, oldIconBr);
+    SelectObject(mem, oldPen);
+    DeleteObject(iconPen);
+
+}

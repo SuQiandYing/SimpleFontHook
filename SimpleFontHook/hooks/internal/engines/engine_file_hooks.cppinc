@@ -1,0 +1,394 @@
+// Shared engine file API dispatch.
+//
+// The CreateFile/GetFileAttributes/FindFirstFile hooks are process-wide API
+// entrypoints. Keep the cross-engine dispatch here so Artemis-specific files
+// only contain Artemis resource virtualization.
+
+static __declspec(thread) bool g_inEngineFileHook = false;
+
+struct EngineFileHookGuard {
+    EngineFileHookGuard() { g_inEngineFileHook = true; }
+    ~EngineFileHookGuard() { g_inEngineFileHook = false; }
+};
+
+HANDLE WINAPI newCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    if (g_inEngineFileHook) {
+        return orgCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+            dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    }
+
+    {
+        EngineFileHookGuard guard;
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            SoftpalShouldHideDefaultFontDatW(lpFileName)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            KrkrShouldHidePrerenderedFontW(lpFileName)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            ArtemisLegacyShouldHideRenderedFontW(lpFileName)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        HANDLE hDxLibCache = INVALID_HANDLE_VALUE;
+        if (DxLibTryOpenFontCacheW(lpFileName, dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+            hTemplateFile, &hDxLibCache)) {
+            return hDxLibCache;
+        }
+
+        HANDLE hMajiroCache = INVALID_HANDLE_VALUE;
+        if (MajiroTryOpenFontCacheW(lpFileName, dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+            hTemplateFile, &hMajiroCache)) {
+            return hMajiroCache;
+        }
+
+        HANDLE hMiraiFont = MiraiTryOpenRedirectedFontFileW(lpFileName, dwDesiredAccess, dwShareMode,
+            dwCreationDisposition, dwFlagsAndAttributes);
+        if (hMiraiFont != INVALID_HANDLE_VALUE) return hMiraiFont;
+
+        HANDLE hLegacyVirtual = ArtemisLegacyTryOpenVirtualFileW(lpFileName, dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+        if (hLegacyVirtual != INVALID_HANDLE_VALUE) return hLegacyVirtual;
+
+        if (!ArtemisLegacyLooksLikeEngineRoot()) {
+            HANDLE hVirtual = ArtemisTryOpenVirtualFileW(lpFileName, dwDesiredAccess, dwShareMode,
+                lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+            if (hVirtual != INVALID_HANDLE_VALUE) return hVirtual;
+        }
+    }
+
+    return orgCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+HANDLE WINAPI newCreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
+    if (g_inEngineFileHook) {
+        return orgCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+            dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    }
+
+    std::wstring wide = ArtemisWideFromAnsi(lpFileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            SoftpalShouldHideDefaultFontDatW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            KrkrShouldHidePrerenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        if (ArtemisIsReadOnlyOpen(dwDesiredAccess, dwCreationDisposition) &&
+            ArtemisLegacyShouldHideRenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        HANDLE hDxLibCache = INVALID_HANDLE_VALUE;
+        if (DxLibTryOpenFontCacheW(wide.c_str(), dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+            hTemplateFile, &hDxLibCache)) {
+            return hDxLibCache;
+        }
+
+        HANDLE hMajiroCache = INVALID_HANDLE_VALUE;
+        if (MajiroTryOpenFontCacheW(wide.c_str(), dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+            hTemplateFile, &hMajiroCache)) {
+            return hMajiroCache;
+        }
+
+        HANDLE hMiraiFont = MiraiTryOpenRedirectedFontFileW(wide.c_str(), dwDesiredAccess, dwShareMode,
+            dwCreationDisposition, dwFlagsAndAttributes);
+        if (hMiraiFont != INVALID_HANDLE_VALUE) return hMiraiFont;
+
+        HANDLE hLegacyVirtual = ArtemisLegacyTryOpenVirtualFileW(wide.c_str(), dwDesiredAccess, dwShareMode,
+            lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+        if (hLegacyVirtual != INVALID_HANDLE_VALUE) return hLegacyVirtual;
+
+        if (!ArtemisLegacyLooksLikeEngineRoot()) {
+            HANDLE hVirtual = ArtemisTryOpenVirtualFileW(wide.c_str(), dwDesiredAccess, dwShareMode,
+                lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+            if (hVirtual != INVALID_HANDLE_VALUE) return hVirtual;
+        }
+    }
+
+    return orgCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+        dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+DWORD WINAPI newGetFileAttributesW(LPCWSTR lpFileName) {
+    if (g_inEngineFileHook) return orgGetFileAttributesW(lpFileName);
+
+    EngineFileHookGuard guard;
+    if (SoftpalShouldHideDefaultFontDatW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    if (KrkrShouldHidePrerenderedFontW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    if (ArtemisLegacyShouldHideRenderedFontW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    DWORD dxlibAttrs = INVALID_FILE_ATTRIBUTES;
+    if (DxLibTryGetFontCacheAttributesW(lpFileName, NULL, &dxlibAttrs)) {
+        return dxlibAttrs;
+    }
+
+    DWORD majiroAttrs = INVALID_FILE_ATTRIBUTES;
+    if (MajiroTryGetFontCacheAttributesW(lpFileName, NULL, &majiroAttrs)) {
+        return majiroAttrs;
+    }
+
+    DWORD miraiAttrs = INVALID_FILE_ATTRIBUTES;
+    if (MiraiTryGetRedirectedFontAttributesW(lpFileName, NULL, &miraiAttrs)) {
+        return miraiAttrs;
+    }
+
+    DWORD legacyAttrs = INVALID_FILE_ATTRIBUTES;
+    if (ArtemisLegacyTryGetVirtualAttributesW(lpFileName, NULL, &legacyAttrs)) {
+        return legacyAttrs;
+    }
+
+    DWORD attrs = INVALID_FILE_ATTRIBUTES;
+    if (!ArtemisLegacyLooksLikeEngineRoot()) {
+        if (ArtemisTryGetVirtualAttributesW(lpFileName, NULL, &attrs)) {
+            ArtemisTraceLimited("attrs-virtual request='%s' attrs=0x%08lX",
+                ArtemisWideToUtf8(lpFileName).c_str(), attrs);
+            return attrs;
+        }
+    }
+    return orgGetFileAttributesW(lpFileName);
+}
+
+DWORD WINAPI newGetFileAttributesA(LPCSTR lpFileName) {
+    if (g_inEngineFileHook) return orgGetFileAttributesA(lpFileName);
+
+    std::wstring wide = ArtemisWideFromAnsi(lpFileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (SoftpalShouldHideDefaultFontDatW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+
+        if (KrkrShouldHidePrerenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+
+        if (ArtemisLegacyShouldHideRenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+
+        DWORD dxlibAttrs = INVALID_FILE_ATTRIBUTES;
+        if (DxLibTryGetFontCacheAttributesW(wide.c_str(), NULL, &dxlibAttrs)) {
+            return dxlibAttrs;
+        }
+
+        DWORD majiroAttrs = INVALID_FILE_ATTRIBUTES;
+        if (MajiroTryGetFontCacheAttributesW(wide.c_str(), NULL, &majiroAttrs)) {
+            return majiroAttrs;
+        }
+
+        DWORD miraiAttrs = INVALID_FILE_ATTRIBUTES;
+        if (MiraiTryGetRedirectedFontAttributesW(wide.c_str(), NULL, &miraiAttrs)) {
+            return miraiAttrs;
+        }
+
+        DWORD legacyAttrs = INVALID_FILE_ATTRIBUTES;
+        if (ArtemisLegacyTryGetVirtualAttributesW(wide.c_str(), NULL, &legacyAttrs)) {
+            return legacyAttrs;
+        }
+
+        DWORD attrs = INVALID_FILE_ATTRIBUTES;
+        if (!ArtemisLegacyLooksLikeEngineRoot()) {
+            if (ArtemisTryGetVirtualAttributesW(wide.c_str(), NULL, &attrs)) {
+                ArtemisTraceLimited("attrs-virtual request='%s' attrs=0x%08lX",
+                    ArtemisWideToUtf8(wide).c_str(), attrs);
+                return attrs;
+            }
+        }
+    }
+    return orgGetFileAttributesA(lpFileName);
+}
+
+BOOL WINAPI newGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
+    if (g_inEngineFileHook || fInfoLevelId != GetFileExInfoStandard) {
+        return orgGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+    }
+
+    EngineFileHookGuard guard;
+    if (SoftpalShouldHideDefaultFontDatW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+
+    if (KrkrShouldHidePrerenderedFontW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+
+    if (ArtemisLegacyShouldHideRenderedFontW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA dxlibData = {};
+    if (DxLibTryGetFontCacheAttributesW(lpFileName, &dxlibData, NULL)) {
+        if (dxlibData.dwFileAttributes == 0) return FALSE;
+        if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = dxlibData;
+        return TRUE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA majiroData = {};
+    if (MajiroTryGetFontCacheAttributesW(lpFileName, &majiroData, NULL)) {
+        if (majiroData.dwFileAttributes == 0) return FALSE;
+        if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = majiroData;
+        return TRUE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA miraiData = {};
+    if (MiraiTryGetRedirectedFontAttributesW(lpFileName, &miraiData, NULL)) {
+        if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = miraiData;
+        return TRUE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA legacyData = {};
+    if (ArtemisLegacyTryGetVirtualAttributesW(lpFileName, &legacyData, NULL)) {
+        if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = legacyData;
+        return TRUE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (!ArtemisLegacyLooksLikeEngineRoot()) {
+        if (ArtemisTryGetVirtualAttributesW(lpFileName, &data, NULL)) {
+            if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = data;
+            ArtemisTraceLimited("attrs-ex-virtual request='%s' size=%lu",
+                ArtemisWideToUtf8(lpFileName).c_str(), data.nFileSizeLow);
+            return TRUE;
+        }
+    }
+    return orgGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+}
+
+BOOL WINAPI newGetFileAttributesExA(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
+    if (g_inEngineFileHook || fInfoLevelId != GetFileExInfoStandard) {
+        return orgGetFileAttributesExA(lpFileName, fInfoLevelId, lpFileInformation);
+    }
+
+    std::wstring wide = ArtemisWideFromAnsi(lpFileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (SoftpalShouldHideDefaultFontDatW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+
+        if (KrkrShouldHidePrerenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+
+        if (ArtemisLegacyShouldHideRenderedFontW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA dxlibData = {};
+        if (DxLibTryGetFontCacheAttributesW(wide.c_str(), &dxlibData, NULL)) {
+            if (dxlibData.dwFileAttributes == 0) return FALSE;
+            if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = dxlibData;
+            return TRUE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA majiroData = {};
+        if (MajiroTryGetFontCacheAttributesW(wide.c_str(), &majiroData, NULL)) {
+            if (majiroData.dwFileAttributes == 0) return FALSE;
+            if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = majiroData;
+            return TRUE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA miraiData = {};
+        if (MiraiTryGetRedirectedFontAttributesW(wide.c_str(), &miraiData, NULL)) {
+            if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = miraiData;
+            return TRUE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA legacyData = {};
+        if (ArtemisLegacyTryGetVirtualAttributesW(wide.c_str(), &legacyData, NULL)) {
+            if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = legacyData;
+            return TRUE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        if (!ArtemisLegacyLooksLikeEngineRoot()) {
+            if (ArtemisTryGetVirtualAttributesW(wide.c_str(), &data, NULL)) {
+                if (lpFileInformation) *(WIN32_FILE_ATTRIBUTE_DATA*)lpFileInformation = data;
+                ArtemisTraceLimited("attrs-ex-virtual request='%s' size=%lu",
+                    ArtemisWideToUtf8(wide).c_str(), data.nFileSizeLow);
+                return TRUE;
+            }
+        }
+    }
+    return orgGetFileAttributesExA(lpFileName, fInfoLevelId, lpFileInformation);
+}
+
+HANDLE WINAPI newFindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
+    if (g_inEngineFileHook) return orgFindFirstFileW(lpFileName, lpFindFileData);
+
+    EngineFileHookGuard guard;
+    if (SoftpalShouldHideDefaultFontDatW(lpFileName) ||
+        KrkrShouldHidePrerenderedFontW(lpFileName) ||
+        ArtemisLegacyShouldHideRenderedFontW(lpFileName) ||
+        DxLibShouldHideFontCacheSearchW(lpFileName) ||
+        MajiroShouldHideFontCacheSearchW(lpFileName)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    return orgFindFirstFileW(lpFileName, lpFindFileData);
+}
+
+HANDLE WINAPI newFindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData) {
+    if (g_inEngineFileHook) return orgFindFirstFileA(lpFileName, lpFindFileData);
+
+    std::wstring wide = ArtemisWideFromAnsi(lpFileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (SoftpalShouldHideDefaultFontDatW(wide.c_str()) ||
+            KrkrShouldHidePrerenderedFontW(wide.c_str()) ||
+            ArtemisLegacyShouldHideRenderedFontW(wide.c_str()) ||
+            DxLibShouldHideFontCacheSearchW(wide.c_str()) ||
+            MajiroShouldHideFontCacheSearchW(wide.c_str())) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+
+    return orgFindFirstFileA(lpFileName, lpFindFileData);
+}

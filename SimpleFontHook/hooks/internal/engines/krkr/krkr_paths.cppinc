@@ -1,0 +1,135 @@
+// KiriKiri / TVP pre-rendered font bypass.
+//
+// Some KRKR games map *.tft files through Layer.font.mapPrerenderedFont.
+// Those files are TVP pre-rendered glyph caches, not TrueType/OpenType fonts, so
+// GDI font replacement cannot affect text once they are mapped. Disabling the
+// script-visible mapPrerenderedFont entry makes the script's try/catch fall back
+// to normal font rendering. The file hiding path remains for loose-file builds.
+
+static int g_krkrEngineProbe = -1;
+static volatile LONG g_krkrTraceCount = 0;
+static volatile LONG g_krkrMapPatchAttempted = 0;
+
+static void KrkrTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_krkrTraceCount);
+    if (hit > 256) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][KRKR] %s", message);
+}
+
+static bool KrkrFindFirstFileInRoot(const wchar_t* pattern) {
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, ArtemisGetGameRoot().c_str());
+    PathAppendW(search, pattern);
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = FindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    FindClose(hFind);
+    return true;
+}
+
+static bool KrkrLooksLikeEngineRoot() {
+    if (g_krkrEngineProbe != -1) return g_krkrEngineProbe != 0;
+
+    bool hasXp3 = KrkrFindFirstFileInRoot(L"*.xp3");
+    bool hasLooseTft = KrkrFindFirstFileInRoot(L"font\\*.tft");
+    g_krkrEngineProbe = (hasXp3 && hasLooseTft) ? 1 : 0;
+    return g_krkrEngineProbe != 0;
+}
+
+static bool KrkrIsPrerenderedFontPath(const std::wstring& normalizedFullPath) {
+    return ArtemisHasExtension(normalizedFullPath, L".tft");
+}
+
+static bool KrkrBytesEqual(const BYTE* left, const BYTE* right, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        if (left[i] != right[i]) return false;
+    }
+    return true;
+}
+
+static bool KrkrPatchBytes(BYTE* address, const BYTE* replacement, size_t len) {
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(address, len, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+
+    for (size_t i = 0; i < len; ++i) {
+        address[i] = replacement[i];
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), address, len);
+    DWORD ignoredProtect = 0;
+    VirtualProtect(address, len, oldProtect, &ignoredProtect);
+    return true;
+}
+
+static DWORD KrkrPatchPatternInMainModule(const BYTE* pattern, const BYTE* replacement, size_t len) {
+    HMODULE hMain = GetModuleHandleW(NULL);
+    MODULEINFO moduleInfo = {};
+    if (!hMain || !GetModuleInformation(GetCurrentProcess(), hMain, &moduleInfo, sizeof(moduleInfo))) {
+        return 0;
+    }
+
+    BYTE* base = (BYTE*)moduleInfo.lpBaseOfDll;
+    size_t size = moduleInfo.SizeOfImage;
+    if (!base || size < len) return 0;
+
+    DWORD patched = 0;
+    for (size_t offset = 0; offset <= size - len; ++offset) {
+        BYTE* current = base + offset;
+        if (!KrkrBytesEqual(current, pattern, len)) continue;
+
+        if (KrkrPatchBytes(current, replacement, len)) {
+            ++patched;
+            offset += len - 1;
+        }
+    }
+    return patched;
+}
+
+static void KrkrPatchMapPrerenderedFontName() {
+    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts) return;
+    if (InterlockedExchange(&g_krkrMapPatchAttempted, 1) != 0) return;
+    if (!KrkrLooksLikeEngineRoot()) return;
+
+    static const char kMethodA[] = "mapPrerenderedFont";
+    static const char kDisabledA[] = "sfhPrerenderedFont";
+    static const wchar_t kMethodW[] = L"mapPrerenderedFont";
+    static const wchar_t kDisabledW[] = L"sfhPrerenderedFont";
+
+    DWORD patched = 0;
+    patched += KrkrPatchPatternInMainModule(
+        (const BYTE*)kMethodA,
+        (const BYTE*)kDisabledA,
+        sizeof(kMethodA) - 1);
+    patched += KrkrPatchPatternInMainModule(
+        (const BYTE*)kMethodW,
+        (const BYTE*)kDisabledW,
+        sizeof(kMethodW) - sizeof(wchar_t));
+
+    KrkrTraceLimited("mapPrerenderedFont registration disabled patches=%lu", patched);
+}
+
+static bool KrkrShouldHidePrerenderedFontW(const wchar_t* fileName) {
+    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+
+    std::wstring fullPath = ArtemisFullPath(fileName);
+    if (fullPath.empty() || !ArtemisIsUnderRoot(fullPath)) return false;
+
+    std::wstring normalized = ArtemisNormalizePath(fullPath);
+    if (!KrkrIsPrerenderedFontPath(normalized)) return false;
+    if (!KrkrLooksLikeEngineRoot()) return false;
+
+    KrkrTraceLimited("hide-prerendered-font request='%s'",
+        ArtemisWideToUtf8(fullPath).c_str());
+    return true;
+}

@@ -1,0 +1,365 @@
+
+// -----------------------------------------------------------------------------
+//  State
+// -----------------------------------------------------------------------------
+static HWND g_hWnd = NULL;
+static HWND g_hSearchEdit = NULL;
+static HMODULE g_hModule = NULL;
+static bool g_visible = false;
+static const int HOTKEY_TOGGLE_PICKER = 1;
+static const int HOTKEY_TOGGLE_PICKER_ALT_SHIFT = 2;
+static const int HOTKEY_TOGGLE_PICKER_F8 = 3;
+static bool g_toggleHotkeyRegistered = false;
+struct FontInfo {
+    std::wstring name;
+    std::unordered_set<BYTE> charsets;
+};
+static std::vector<FontInfo> g_allFonts;
+static std::vector<std::wstring> g_recentFonts;
+static std::vector<int> g_filteredIndices;
+static int g_selectedIndex = 0;
+static int g_scrollOffset = 0;
+static int g_hoveredIndex = -1;
+static std::wstring g_appliedFont;   // currently applied font name
+static std::unordered_map<std::wstring, std::string> g_fontAnsiNameCache;
+static std::vector<std::wstring> g_loadedLocalFontPaths;  // paths of fonts loaded via AddFontResourceExW
+static std::vector<HANDLE> g_metricCloneFonts;  // current metric-repaired in-memory clone
+static std::vector<HANDLE> g_retiredMetricCloneFonts;  // kept alive so live game HFONTs never lose their backing font
+static volatile LONG g_metricCloneBuildActive = 0;
+static std::wstring g_metricCloneFace;
+static std::wstring g_metricCloneSourceFace;
+static std::wstring g_metricReferenceFont;
+
+// Charset selector state
+struct CharsetEntry {
+    const wchar_t* label;
+    BYTE value;
+};
+static const CharsetEntry g_charsets[] = {
+    { L"默认",       DEFAULT_CHARSET },
+    { L"中文",       GB2312_CHARSET },
+    { L"日文",       SHIFTJIS_CHARSET },
+    { L"繁体",       CHINESEBIG5_CHARSET },
+    { L"韩文",       HANGUL_CHARSET },
+};
+static const int g_charsetCount = _countof(g_charsets);
+static int g_selectedCharset = 0;  // index into g_charsets, 0 = All
+static int g_hoveredCharset = -1;
+static int g_charsetScrollX = 0;   // horizontal scroll offset in pixels
+
+// Spoof bar state
+struct SpoofCharsetEntry {
+    const wchar_t* label;
+    const wchar_t* shortLabel;
+    BYTE value;
+};
+static const SpoofCharsetEntry g_spoofCharsets[] = {
+    { L"\x65E5\x6587", L"\x65E5\x6587", SHIFTJIS_CHARSET },
+    { L"\x4E2D\x6587", L"\x4E2D\x6587", GB2312_CHARSET },
+    { L"\x7E41\x4F53", L"\x7E41\x4F53", CHINESEBIG5_CHARSET },
+    { L"\x9ED8\x8BA4", L"\x9ED8\x8BA4", DEFAULT_CHARSET },
+    { L"\x97E9\x6587", L"\x97E9\x6587", HANGUL_CHARSET },
+};
+static const int g_spoofCharsetCount = _countof(g_spoofCharsets);
+static bool g_spoofEnabled = false;
+static bool g_spoofRuntimeReplaceEnabled = false;
+static int g_spoofCharsetIdx = 0;
+static bool g_textSubstitutionEnabled = false;
+static int g_spoofFromIdx = 1;   // index into g_charsets, default 日文
+static int g_spoofToIdx = 2;     // index into g_charsets, default 中文
+static bool g_spoofToggleHovered = false;
+static bool g_spoofCharsetHovered = false;
+static bool g_spoofModeHovered = false;
+static bool g_textSubstitutionHovered = false;
+
+struct TextSubstitutionModeEntry {
+    const wchar_t* label;
+    int mode;
+};
+static const TextSubstitutionModeEntry g_textSubstitutionModes[] = {
+    { L"\x65E5\x7E41", Config::TextSubstitutionModeJapaneseTraditional },
+    { L"\x7E41>\x7B80", Config::TextSubstitutionModeTraditionalToSimplified },
+    { L"\x7B80>\x7E41", Config::TextSubstitutionModeSimplifiedToTraditional },
+};
+static const int g_textSubstitutionModeCount = _countof(g_textSubstitutionModes);
+static int g_textSubstitutionModeIdx = 0;
+static bool g_textSubstitutionModeHovered = false;
+
+struct TextSubstitutionCodepageEntry {
+    const wchar_t* label;
+    UINT codepage;
+};
+static const TextSubstitutionCodepageEntry g_textSubstitutionCodepages[] = {
+    { L"\x65E5\x6587", 932 },
+    { L"\x4E2D\x6587", 936 },
+};
+static const int g_textSubstitutionCodepageCount = _countof(g_textSubstitutionCodepages);
+static int g_textSubstitutionCodepageIdx = 0;
+
+struct CodepageRedirectPresetEntry {
+    const wchar_t* label;
+    UINT fromCodepage;
+    UINT toCodepage;
+};
+static const CodepageRedirectPresetEntry g_codepageRedirectPresets[] = {
+    { L"\x65E5\x6587\x2192UTF-8", 932, CP_UTF8 },
+    { L"\x4E2D\x6587\x2192UTF-8", 936, CP_UTF8 },
+    { L"\x7CFB\x7EDF\x2192UTF-8", CP_ACP, CP_UTF8 },
+    { L"UTF-8\x2192\x65E5\x6587", CP_UTF8, 932 },
+    { L"UTF-8\x2192\x4E2D\x6587", CP_UTF8, 936 },
+};
+static const int g_codepageRedirectPresetCount = _countof(g_codepageRedirectPresets);
+static bool g_codepageRedirectEnabled = false;
+static int g_codepageRedirectPresetIdx = 0;
+static bool g_codepageRedirectHovered = false;
+static bool g_codepageRedirectPresetHovered = false;
+
+static const wchar_t* GetCharsetDisplayName(BYTE charset) {
+    switch (charset) {
+    case SHIFTJIS_CHARSET: return L"\x65E5\x6587";
+    case GB2312_CHARSET: return L"\x4E2D\x6587";
+    case CHINESEBIG5_CHARSET: return L"\x7E41\x4F53";
+    case HANGUL_CHARSET: return L"\x97E9\x6587";
+    case DEFAULT_CHARSET: return L"\x9ED8\x8BA4";
+    default: return L"\x672A\x77E5";
+    }
+}
+
+static void EnumerateFonts();
+
+
+// -----------------------------------------------------------------------------
+//  Layout constants
+// -----------------------------------------------------------------------------
+static int       ITEM_HEIGHT      = 56;
+static int       WINDOW_WIDTH     = 480;
+static int       WINDOW_HEIGHT    = 720;
+static const int TITLE_HEIGHT     = 48;
+static const int SEARCH_HEIGHT    = 50;
+static const int PREVIEW_HEIGHT   = 155;
+static const int CHARSET_HEIGHT   = 36;
+static const int SPOOF_HEIGHT     = 40;  // codepage spoof bar
+static const int TEXTSUB_HEIGHT   = 34;  // built-in text substitution bar
+static const int METRICS_HEIGHT   = 150;  // detailed game font metric controls
+static const int SCROLLBAR_WIDTH  = 8;
+static const int SCROLLBAR_MARGIN = 4;
+static int LIST_HEIGHT;
+static int VISIBLE_ITEMS;
+
+enum MetricHit {
+    METRIC_NONE = -1,
+    METRIC_WIDTH_DOWN = 0,
+    METRIC_WIDTH_UP,
+    METRIC_HEIGHT_DOWN,
+    METRIC_HEIGHT_UP,
+    METRIC_SPACING_DOWN,
+    METRIC_SPACING_UP,
+    METRIC_ASCENT_DOWN,
+    METRIC_ASCENT_UP,
+    METRIC_DESCENT_DOWN,
+    METRIC_DESCENT_UP,
+    METRIC_LINE_DOWN,
+    METRIC_LINE_UP,
+    METRIC_WEIGHT_DOWN,
+    METRIC_WEIGHT_UP,
+    METRIC_SET_REFERENCE,
+    METRIC_AUTO_VERTICAL,
+    METRIC_RESET_METRICS,
+};
+
+enum MetricValueKind {
+    METRIC_VALUE_NONE = -1,
+    METRIC_VALUE_WIDTH,
+    METRIC_VALUE_HEIGHT,
+    METRIC_VALUE_SPACING,
+    METRIC_VALUE_ASCENT,
+    METRIC_VALUE_DESCENT,
+    METRIC_VALUE_LINE,
+    METRIC_VALUE_WEIGHT,
+};
+
+// Resize support
+static const int MIN_WIDTH        = 360;
+static const int MIN_HEIGHT       = 480;
+static const int RESIZE_BORDER    = 6;   // pixels from edge for resize hit-test
+static const wchar_t* WND_CLASS = L"FontPickerOverlay";
+
+// -----------------------------------------------------------------------------
+//  Color Palette - Sakura Night (Galgame aesthetic)
+//  Inspired by visual novel UI: deep indigo sky + cherry blossom
+// -----------------------------------------------------------------------------
+//  Background layers
+static const COLORREF COL_BG_TOP       = RGB(28, 22, 48);
+static const COLORREF COL_BG_BOT       = RGB(12, 10, 24);
+static const COLORREF COL_TITLE_TOP    = RGB(60, 36, 88);
+static const COLORREF COL_TITLE_BOT    = RGB(40, 24, 60);
+static const COLORREF COL_SEARCH_BG    = RGB(32, 26, 52);
+static const COLORREF COL_PREVIEW_TOP  = RGB(34, 24, 56);
+static const COLORREF COL_PREVIEW_BOT  = RGB(18, 12, 32);
+
+//  Interactive
+static const COLORREF COL_SELECTED_BG  = RGB(100, 35, 75);
+static const COLORREF COL_SELECTED_GLO = RGB(255, 150, 200);
+static const COLORREF COL_HOVER_BG     = RGB(52, 40, 78);
+static const COLORREF COL_ITEM_BORDER  = RGB(75, 50, 100);
+
+//  Text
+static const COLORREF COL_TEXT         = RGB(250, 245, 255);
+static const COLORREF COL_TEXT_DIM     = RGB(175, 160, 210);
+static const COLORREF COL_TEXT_HINT    = RGB(120, 100, 160);
+static const COLORREF COL_ACCENT       = RGB(255, 170, 210);     // bright sakura
+static const COLORREF COL_ACCENT2      = RGB(160, 180, 255);     // sky blue
+static const COLORREF COL_ACCENT3      = RGB(210, 160, 255);     // soft violet
+
+//  UI chrome
+static const COLORREF COL_BORDER       = RGB(85, 60, 120);
+static const COLORREF COL_CLOSE_HOV    = RGB(240, 70, 100);
+static const COLORREF COL_BTN_HOV      = RGB(75, 55, 110);
+
+//  Scrollbar
+static const COLORREF COL_SB_TRACK     = RGB(32, 26, 50);
+static const COLORREF COL_SB_THUMB     = RGB(120, 80, 150);
+static const COLORREF COL_SB_THUMB_HOV = RGB(180, 120, 200);
+static const COLORREF COL_SB_THUMB_DRG = RGB(255, 150, 190);
+
+//  Badges & decorations
+static const COLORREF COL_BADGE_BG     = RGB(70, 35, 62);
+static const COLORREF COL_BADGE_TEXT   = RGB(255, 185, 215);
+static const COLORREF COL_APPLIED_BG   = RGB(30, 65, 50);
+static const COLORREF COL_APPLIED_TEXT = RGB(140, 255, 200);
+static const COLORREF COL_SEPARATOR    = RGB(45, 35, 65);
+
+// -----------------------------------------------------------------------------
+//  Internal state
+// -----------------------------------------------------------------------------
+static WNDPROC g_OldEditProc = NULL;
+static bool g_closeHovered = false;
+static bool g_minHovered = false;
+static bool g_zoomInHovered = false;
+static bool g_zoomOutHovered = false;
+static int g_metricHovered = METRIC_NONE;
+static HWND g_hMetricEdit = NULL;
+static WNDPROC g_OldMetricEditProc = NULL;
+static MetricValueKind g_metricEditKind = METRIC_VALUE_NONE;
+static bool g_metricEditClosing = false;
+
+// UI font scale
+static float g_uiScale = 1.0f;
+static const float UI_SCALE_MIN = 0.7f;
+static const float UI_SCALE_MAX = 1.8f;
+static const float UI_SCALE_STEP = 0.1f;
+static int SF(int base) { return (int)(base * g_uiScale + 0.5f); }
+static bool g_scrollbarHovered = false;
+static bool g_scrollbarDragging = false;
+static int g_scrollDragStartY = 0;
+static int g_scrollDragStartOffset = 0;
+static HFONT g_editFont = NULL;
+static bool g_trackingMouseLeave = false;
+static int g_listWheelRemainder = 0;
+static int g_charsetWheelRemainder = 0;
+
+static HDC g_paintMemDC = NULL;
+static HBITMAP g_paintBitmap = NULL;
+static HBITMAP g_paintOldBitmap = NULL;
+static int g_paintBitmapWidth = 0;
+static int g_paintBitmapHeight = 0;
+
+struct PickerFontCacheEntry {
+    std::wstring faceName;
+    int height;
+    int width;
+    int weight;
+    BYTE charset;
+    HFONT font;
+    DWORD lastUsed;
+};
+static std::vector<PickerFontCacheEntry> g_pickerFontCache;
+static DWORD g_pickerFontCacheClock = 0;
+static const size_t PICKER_FONT_CACHE_LIMIT = 96;
+
+static void ClearPickerFontCache() {
+    for (const auto& entry : g_pickerFontCache) {
+        if (entry.font) DeleteObject(entry.font);
+    }
+    g_pickerFontCache.clear();
+}
+
+static HFONT GetCachedPickerFont(const std::wstring& faceName, int height, int width, int weight, BYTE charset) {
+    if (height <= 0) height = 1;
+    DWORD useTick = ++g_pickerFontCacheClock;
+    for (auto& entry : g_pickerFontCache) {
+        if (entry.height == height && entry.width == width && entry.weight == weight &&
+            entry.charset == charset && entry.faceName == faceName) {
+            entry.lastUsed = useTick;
+            return entry.font;
+        }
+    }
+
+    HFONT font = CreateFontW(-height, width, 0, 0, weight, FALSE, FALSE, FALSE,
+        charset, 0, 0, CLEARTYPE_QUALITY, 0, faceName.c_str());
+    if (!font) return (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    if (g_pickerFontCache.size() >= PICKER_FONT_CACHE_LIMIT) {
+        size_t evictIndex = 0;
+        DWORD oldest = g_pickerFontCache[0].lastUsed;
+        for (size_t i = 1; i < g_pickerFontCache.size(); ++i) {
+            if (g_pickerFontCache[i].lastUsed < oldest) {
+                oldest = g_pickerFontCache[i].lastUsed;
+                evictIndex = i;
+            }
+        }
+        if (g_pickerFontCache[evictIndex].font) DeleteObject(g_pickerFontCache[evictIndex].font);
+        g_pickerFontCache.erase(g_pickerFontCache.begin() + evictIndex);
+    }
+
+    PickerFontCacheEntry entry = {};
+    entry.faceName = faceName;
+    entry.height = height;
+    entry.width = width;
+    entry.weight = weight;
+    entry.charset = charset;
+    entry.font = font;
+    entry.lastUsed = useTick;
+    g_pickerFontCache.push_back(entry);
+    return font;
+}
+
+static void ReleasePaintBuffer() {
+    if (g_paintMemDC) {
+        if (g_paintOldBitmap) {
+            SelectObject(g_paintMemDC, g_paintOldBitmap);
+            g_paintOldBitmap = NULL;
+        }
+        if (g_paintBitmap) {
+            DeleteObject(g_paintBitmap);
+            g_paintBitmap = NULL;
+        }
+        DeleteDC(g_paintMemDC);
+        g_paintMemDC = NULL;
+    }
+    g_paintBitmapWidth = 0;
+    g_paintBitmapHeight = 0;
+}
+
+static bool EnsurePaintBuffer(HDC hdc, int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+    if (g_paintMemDC && g_paintBitmap &&
+        g_paintBitmapWidth == width && g_paintBitmapHeight == height)
+        return true;
+
+    ReleasePaintBuffer();
+    g_paintMemDC = CreateCompatibleDC(hdc);
+    g_paintBitmap = CreateCompatibleBitmap(hdc, width, height);
+    if (!g_paintMemDC || !g_paintBitmap) {
+        ReleasePaintBuffer();
+        return false;
+    }
+    g_paintOldBitmap = (HBITMAP)SelectObject(g_paintMemDC, g_paintBitmap);
+    g_paintBitmapWidth = width;
+    g_paintBitmapHeight = height;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+//  Helpers
+// -----------------------------------------------------------------------------

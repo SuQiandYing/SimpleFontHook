@@ -1,0 +1,808 @@
+// Font enumeration and filtering.
+static std::unordered_map<std::wstring, size_t> g_nameToIndex;
+
+static int CALLBACK EnumFontProc(const LOGFONTW* lf, const TEXTMETRICW*, DWORD fontType, LPARAM lParam) {
+    std::wstring name(lf->lfFaceName);
+    if (name.empty() || name[0] == L'@') return 1;
+    
+    // Some fonts might not be reported as TRUETYPE but are still usable.
+    // However, we want to skip legacy raster/vector fonts for better quality.
+    // We allow TRUETYPE (4) or DEVICE (2) if it's a modern OpenType/TrueType font.
+    if (!(fontType & TRUETYPE_FONTTYPE) && !(fontType & DEVICE_FONTTYPE)) return 1;
+
+    BYTE cs = lf->lfCharSet;
+    auto addEffectiveCharset = [&](FontInfo& fi, BYTE charset) {
+        fi.charsets.insert(charset);
+        if (Config::EnableCodepageSpoof) {
+            BYTE source = (BYTE)Config::SpoofFromCharset;
+            BYTE target = (BYTE)Config::SpoofToCharset;
+            if (target != DEFAULT_CHARSET && source != target && charset == source)
+                fi.charsets.insert(target);
+        }
+    };
+
+    auto it = g_nameToIndex.find(name);
+    if (it != g_nameToIndex.end()) {
+        addEffectiveCharset(g_allFonts[it->second], cs);
+    } else {
+        g_nameToIndex[name] = g_allFonts.size();
+        FontInfo fi;
+        fi.name = name;
+        addEffectiveCharset(fi, cs);
+        g_allFonts.push_back(fi);
+    }
+    return 1;
+}
+
+static void UpdateFilter() {
+    wchar_t buf[256];
+    GetWindowTextW(g_hSearchEdit, buf, 256);
+    std::wstring search(buf);
+    std::transform(search.begin(), search.end(), search.begin(), ::towlower);
+    g_filteredIndices.clear();
+
+    BYTE filterCs = g_charsets[g_selectedCharset].value;
+
+    // Helper: does font at index i pass the charset filter?
+    auto passCharset = [&](int i) -> bool {
+        if (filterCs == DEFAULT_CHARSET) return true;  // "All"
+        return g_allFonts[i].charsets.count(filterCs) > 0;
+    };
+
+    for (int i = 0; i < (int)g_allFonts.size(); i++) {
+        if (!passCharset(i)) continue;
+        if (search.empty()) {
+            g_filteredIndices.push_back(i);
+            continue;
+        }
+        std::wstring name = g_allFonts[i].name;
+        std::transform(name.begin(), name.end(), name.begin(), ::towlower);
+        if (name.find(search) != std::wstring::npos)
+            g_filteredIndices.push_back(i);
+    }
+
+    if (g_selectedIndex >= (int)g_filteredIndices.size())
+        g_selectedIndex = (int)g_filteredIndices.size() - 1;
+    if (g_selectedIndex < 0 && !g_filteredIndices.empty())
+        g_selectedIndex = 0;
+}
+
+static bool WideEqualsIgnoreCase(const std::wstring& a, const std::wstring& b) {
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+static bool EndsWithMetricCloneSuffix(const std::wstring& name) {
+    static const wchar_t* suffix = L" Custom";
+    size_t suffixLen = wcslen(suffix);
+    return name.size() >= suffixLen &&
+        _wcsicmp(name.c_str() + name.size() - suffixLen, suffix) == 0;
+}
+
+static std::wstring StripMetricCloneSuffix(std::wstring name) {
+    static const wchar_t* suffix = L" Custom";
+    if (!EndsWithMetricCloneSuffix(name))
+        return name;
+
+    name.resize(name.size() - wcslen(suffix));
+    while (!name.empty() && iswspace(name.back()))
+        name.pop_back();
+    return name;
+}
+
+static std::wstring NormalizeFaceNameForMatch(std::wstring name) {
+    while (!name.empty() && iswspace(name.front()))
+        name.erase(name.begin());
+    while (!name.empty() && iswspace(name.back()))
+        name.pop_back();
+    if (!name.empty() && name.front() == L'@')
+        name.erase(name.begin());
+
+    size_t variantPos = name.find(L'(');
+    size_t fullVariantPos = name.find(L'\xff08');
+    if (variantPos == std::wstring::npos || (fullVariantPos != std::wstring::npos && fullVariantPos < variantPos))
+        variantPos = fullVariantPos;
+    if (variantPos != std::wstring::npos)
+        name.resize(variantPos);
+
+    name = StripMetricCloneSuffix(name);
+
+    std::wstring normalized;
+    normalized.reserve(name.size());
+    for (wchar_t ch : name) {
+        if (iswspace(ch) || ch == L'-' || ch == L'_')
+            continue;
+        normalized.push_back((wchar_t)towlower(ch));
+    }
+    return normalized;
+}
+
+static bool FaceNamesLikelyMatch(const std::wstring& requested, const std::wstring& actual) {
+    if (actual.empty() || WideEqualsIgnoreCase(requested, actual))
+        return true;
+
+    std::wstring req = NormalizeFaceNameForMatch(requested);
+    std::wstring act = NormalizeFaceNameForMatch(actual);
+    if (req.empty() || act.empty())
+        return false;
+    if (req == act)
+        return true;
+
+    return req.find(act) != std::wstring::npos ||
+        act.find(req) != std::wstring::npos;
+}
+
+static DWORD HashFaceNameForClone(const std::wstring& sourceFace) {
+    DWORD hash = 2166136261u;
+    auto mixByte = [&](BYTE value) {
+        hash ^= (DWORD)value;
+        hash *= 16777619u;
+    };
+    for (wchar_t ch : sourceFace) {
+        wchar_t folded = (wchar_t)towlower(ch);
+        mixByte((BYTE)(folded & 0xFF));
+        mixByte((BYTE)((folded >> 8) & 0xFF));
+    }
+    return hash;
+}
+
+static DWORD HashMetricCloneConfig() {
+    DWORD hash = 2166136261u;
+    auto mix = [&](DWORD value) {
+        for (int i = 0; i < 4; ++i) {
+            hash ^= (value >> (i * 8)) & 0xFF;
+            hash *= 16777619u;
+        }
+    };
+
+    mix(Config::EnableFontVerticalMetrics ? 1u : 0u);
+    mix((DWORD)Config::FontAscentPermille);
+    mix((DWORD)Config::FontDescentPermille);
+    mix(Config::EnableFontLineSpacing ? 1u : 0u);
+    mix((DWORD)Config::FontLineSpacing);
+    mix(Config::EnableCodepageSpoof ? 1u : 0u);
+    mix((DWORD)Config::SpoofToCharset);
+    return hash;
+}
+
+static std::wstring BuildCompactMetricCloneFaceName(const std::wstring& sourceFace) {
+    wchar_t buf[LF_FACESIZE] = {};
+    swprintf_s(buf, L"SF%04X%04X",
+        (unsigned)(HashFaceNameForClone(sourceFace) & 0xFFFF),
+        (unsigned)(HashMetricCloneConfig() & 0xFFFF));
+    return buf;
+}
+
+static BYTE GetMetricClonePreferredCharset() {
+    if (g_selectedCharset >= 0 && g_selectedCharset < g_charsetCount &&
+        g_charsets[g_selectedCharset].value != DEFAULT_CHARSET)
+        return g_charsets[g_selectedCharset].value;
+    if (Config::EnableCharsetReplace)
+        return (BYTE)Config::ForcedCharset;
+    return DEFAULT_CHARSET;
+}
+
+static void RebuildFontNameIndex() {
+    g_nameToIndex.clear();
+    for (size_t i = 0; i < g_allFonts.size(); ++i)
+        g_nameToIndex[g_allFonts[i].name] = i;
+}
+
+static void ClearMetricCloneFonts() {
+    std::wstring oldClone = g_metricCloneFace;
+
+    ClearPickerFontCache();
+    g_retiredMetricCloneFonts.insert(g_retiredMetricCloneFonts.end(),
+        g_metricCloneFonts.begin(), g_metricCloneFonts.end());
+    g_metricCloneFonts.clear();
+    if (!oldClone.empty()) {
+        g_fontAnsiNameCache.erase(oldClone);
+        g_recentFonts.erase(std::remove_if(g_recentFonts.begin(), g_recentFonts.end(),
+            [&](const std::wstring& recent) { return WideEqualsIgnoreCase(recent, oldClone); }),
+            g_recentFonts.end());
+        g_allFonts.erase(std::remove_if(g_allFonts.begin(), g_allFonts.end(),
+            [&](const FontInfo& fi) { return WideEqualsIgnoreCase(fi.name, oldClone); }),
+            g_allFonts.end());
+        RebuildFontNameIndex();
+        if (g_hSearchEdit) UpdateFilter();
+    }
+
+    g_metricCloneFace.clear();
+    g_metricCloneSourceFace.clear();
+}
+
+static bool ReadFontDataByFace(const std::wstring& face, BYTE preferredCharset, std::vector<BYTE>& outData) {
+    outData.clear();
+    if (face.empty()) return false;
+
+    HDC hdc = GetDC(NULL);
+    if (!hdc) return false;
+
+    BYTE charsets[8] = {};
+    int charsetCount = 0;
+    auto addCharset = [&](BYTE charset) {
+        for (int i = 0; i < charsetCount; ++i) {
+            if (charsets[i] == charset) return;
+        }
+        if (charsetCount < (int)_countof(charsets))
+            charsets[charsetCount++] = charset;
+    };
+    addCharset(preferredCharset);
+    addCharset(DEFAULT_CHARSET);
+    addCharset(SHIFTJIS_CHARSET);
+    addCharset(GB2312_CHARSET);
+    addCharset(ANSI_CHARSET);
+    addCharset(OEM_CHARSET);
+
+    bool ok = false;
+    for (int i = 0; i < charsetCount && !ok; ++i) {
+        Utils::BeginWatchdogStage("metric-clone ReadFontDataByFace face='%S' charset=%u",
+            face.c_str(), (unsigned)charsets[i]);
+        LOGFONTW lf = {};
+        lf.lfHeight = -1000;
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = charsets[i];
+        wcsncpy_s(lf.lfFaceName, face.c_str(), LF_FACESIZE - 1);
+
+        HFONT hFont = CreateFontIndirectW(&lf);
+        if (!hFont) {
+            Utils::EndWatchdogStage("createfont-failed");
+            continue;
+        }
+
+        HGDIOBJ old = SelectObject(hdc, hFont);
+        wchar_t actualFace[LF_FACESIZE] = {};
+        bool faceOk = GetTextFaceW(hdc, LF_FACESIZE, actualFace) <= 0 ||
+            FaceNamesLikelyMatch(face, actualFace);
+
+        DWORD size = faceOk ? GetFontData(hdc, 0, 0, NULL, 0) : GDI_ERROR;
+        if (size != GDI_ERROR && size > 12 && size < 128u * 1024u * 1024u) {
+            std::vector<BYTE> bytes(size);
+            DWORD read = GetFontData(hdc, 0, 0, bytes.data(), size);
+            if (read == size && FontPatcher::IsFontFile(bytes.data(), bytes.size())) {
+                if (actualFace[0] && !WideEqualsIgnoreCase(actualFace, face)) {
+                    Utils::Trace("[TRACE] Metric clone accepted face alias requested='%S' actual='%S' charset=%u",
+                        face.c_str(), actualFace, (unsigned)charsets[i]);
+                }
+                outData.swap(bytes);
+                ok = true;
+            } else if (read == size && FontPatcher::IsFontCollection(bytes.data(), bytes.size())) {
+                std::vector<BYTE> extracted;
+                if (FontPatcher::ExtractFontFromCollectionByName(bytes, face.c_str(), extracted)) {
+                    Utils::Trace("[TRACE] Metric clone extracted GDI TTC face='%S' charset=%u bytes=%lu",
+                        face.c_str(), (unsigned)charsets[i], (unsigned long)extracted.size());
+                    outData.swap(extracted);
+                    ok = true;
+                }
+            }
+        } else if (!faceOk) {
+            Utils::Trace("[TRACE] Metric clone rejected fallback face requested='%S' actual='%S' charset=%u",
+                face.c_str(), actualFace, (unsigned)charsets[i]);
+        }
+
+        SelectObject(hdc, old);
+        DeleteObject(hFont);
+        Utils::EndWatchdogStage(ok ? "ok" : "miss");
+    }
+
+    ReleaseDC(NULL, hdc);
+    return ok;
+}
+
+static std::wstring StripFaceVariantForFileSearch(std::wstring face) {
+    face = StripMetricCloneSuffix(face);
+    size_t variantPos = face.find(L'(');
+    size_t fullVariantPos = face.find(L'\xff08');
+    if (variantPos == std::wstring::npos || (fullVariantPos != std::wstring::npos && fullVariantPos < variantPos))
+        variantPos = fullVariantPos;
+    if (variantPos != std::wstring::npos)
+        face.resize(variantPos);
+    while (!face.empty() && iswspace(face.back()))
+        face.pop_back();
+    while (!face.empty() && iswspace(face.front()))
+        face.erase(face.begin());
+    return face;
+}
+
+static bool ReadWholeFileBytes(const std::wstring& path, std::vector<BYTE>& outData) {
+    outData.clear();
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 12 || size.QuadPart > 128LL * 1024LL * 1024LL) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    outData.resize((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, outData.data(), (DWORD)outData.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != outData.size()) {
+        outData.clear();
+        return false;
+    }
+    return true;
+}
+
+static bool AddUniqueCandidatePath(std::vector<std::wstring>& paths, const std::wstring& path) {
+    if (path.empty() || !PathFileExistsW(path.c_str())) return false;
+    for (const std::wstring& existing : paths) {
+        if (WideEqualsIgnoreCase(existing, path))
+            return false;
+    }
+    paths.push_back(path);
+    return true;
+}
+
+static bool ContainsPathIgnoreCase(const std::vector<std::wstring>& paths, const std::wstring& path) {
+    for (const std::wstring& existing : paths) {
+        if (WideEqualsIgnoreCase(existing, path))
+            return true;
+    }
+    return false;
+}
+
+static void AddCandidateFontFilesFromDir(std::vector<std::wstring>& paths,
+    const std::wstring& dir, const std::wstring& faceName) {
+    if (dir.empty() || faceName.empty()) return;
+
+    static const wchar_t* exts[] = { L".ttc", L".TTC", L".ttf", L".TTF", L".otf", L".OTF" };
+    for (const wchar_t* ext : exts) {
+        std::wstring path = dir;
+        if (!path.empty() && path.back() != L'\\' && path.back() != L'/')
+            path += L"\\";
+        path += faceName;
+        path += ext;
+        AddUniqueCandidatePath(paths, path);
+    }
+}
+
+static bool FontPathFileBaseMatchesFace(const std::wstring& path, const std::wstring& sourceFace) {
+    wchar_t fileName[MAX_PATH] = {};
+    wcsncpy_s(fileName, PathFindFileNameW(path.c_str()), _TRUNCATE);
+    PathRemoveExtensionW(fileName);
+    if (!fileName[0]) return false;
+
+    std::wstring faceBase = StripFaceVariantForFileSearch(sourceFace);
+    std::wstring normFile = NormalizeFaceNameForMatch(fileName);
+    std::wstring normFace = NormalizeFaceNameForMatch(faceBase);
+    if (normFile.empty() || normFace.empty()) return false;
+
+    return normFile == normFace ||
+        normFile.find(normFace) != std::wstring::npos ||
+        normFace.find(normFile) != std::wstring::npos;
+}
+
+static bool ReadFullFontFileDataByFace(const std::wstring& sourceFace,
+    std::vector<BYTE>& outData, std::wstring& outPath) {
+    outData.clear();
+    outPath.clear();
+
+    std::vector<std::wstring> candidates;
+    for (const std::wstring& localPath : g_loadedLocalFontPaths) {
+        if (FontPathFileBaseMatchesFace(localPath, sourceFace))
+            AddUniqueCandidatePath(candidates, localPath);
+    }
+
+    wchar_t moduleDir[MAX_PATH] = {};
+    GetModuleFileNameW(g_hModule, moduleDir, MAX_PATH);
+    PathRemoveFileSpecW(moduleDir);
+
+    wchar_t windowsDir[MAX_PATH] = {};
+    GetWindowsDirectoryW(windowsDir, MAX_PATH);
+    PathAppendW(windowsDir, L"Fonts");
+
+    std::wstring faceBase = StripFaceVariantForFileSearch(sourceFace);
+    AddCandidateFontFilesFromDir(candidates, moduleDir, sourceFace);
+    AddCandidateFontFilesFromDir(candidates, moduleDir, faceBase);
+    AddCandidateFontFilesFromDir(candidates, windowsDir, sourceFace);
+    AddCandidateFontFilesFromDir(candidates, windowsDir, faceBase);
+
+    for (const std::wstring& path : candidates) {
+        Utils::BeginWatchdogStage("metric-clone read full font file path='%S'",
+            path.c_str());
+        std::vector<BYTE> bytes;
+        if (!ReadWholeFileBytes(path, bytes)) {
+            Utils::EndWatchdogStage("read-failed");
+            continue;
+        }
+        if (FontPatcher::IsFontCollection(bytes.data(), bytes.size())) {
+            std::vector<BYTE> extracted;
+            if (!FontPatcher::ExtractFontFromCollectionByName(bytes, sourceFace.c_str(), extracted)) {
+                Utils::Trace("[TRACE] Metric clone TTC extract failed source='%S' path='%S'",
+                    sourceFace.c_str(), path.c_str());
+                Utils::EndWatchdogStage("ttc-extract-failed");
+                continue;
+            }
+            Utils::Trace("[TRACE] Metric clone extracted TTC source='%S' path='%S' bytes=%lu",
+                sourceFace.c_str(), path.c_str(), (unsigned long)extracted.size());
+            bytes.swap(extracted);
+        }
+
+        std::vector<BYTE> probe = bytes;
+        bool canPatch =
+            FontPatcher::PatchVerticalMetrics(probe, Config::FontAscentPermille,
+                Config::FontDescentPermille,
+                Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0) ||
+            FontPatcher::PatchOS2CodePageRangeForCharset(probe, Config::SpoofToCharset);
+        if (!canPatch) {
+            Utils::EndWatchdogStage("patch-probe-failed");
+            continue;
+        }
+
+        outData.swap(bytes);
+        outPath = path;
+        Utils::EndWatchdogStage("ok");
+        return true;
+    }
+
+    return false;
+}
+
+static void SetAppliedFontForHook(const std::wstring& face) {
+    g_appliedFont = face;
+    wcsncpy_s(Config::ForcedFontNameW, face.c_str(), LF_FACESIZE - 1);
+
+    std::string ansiName;
+    auto cachedAnsi = g_fontAnsiNameCache.find(face);
+    if (cachedAnsi != g_fontAnsiNameCache.end()) {
+        ansiName = cachedAnsi->second;
+    } else {
+        LOGFONTW lf = {};
+        wcsncpy_s(lf.lfFaceName, face.c_str(), LF_FACESIZE - 1);
+        HFONT hFont = CreateFontIndirectW(&lf);
+        if (hFont) {
+            ansiName = Utils::GetFontEnglishName(hFont);
+            DeleteObject(hFont);
+        }
+        if (ansiName.empty()) {
+            char fallbackName[LF_FACESIZE] = {};
+            WideCharToMultiByte(CP_ACP, 0, face.c_str(), -1, fallbackName, LF_FACESIZE - 1, NULL, NULL);
+            fallbackName[LF_FACESIZE - 1] = '\0';
+            ansiName = fallbackName;
+        }
+        if (g_fontAnsiNameCache.size() < 512)
+            g_fontAnsiNameCache[face] = ansiName;
+    }
+
+    strncpy_s(Config::ForcedFontNameA, LF_FACESIZE, ansiName.c_str(), _TRUNCATE);
+    Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+    Config::EnableFaceNameReplace = true;
+    Config::EnableFontHook = true;
+}
+
+static void SelectSourceFontInList(const std::wstring& sourceFace) {
+    if (g_hSearchEdit) UpdateFilter();
+    for (int i = 0; i < (int)g_filteredIndices.size(); ++i) {
+        int fontIndex = g_filteredIndices[i];
+        if (fontIndex >= 0 && fontIndex < (int)g_allFonts.size() &&
+            WideEqualsIgnoreCase(g_allFonts[fontIndex].name, sourceFace)) {
+            g_selectedIndex = i;
+            break;
+        }
+    }
+}
+
+static bool ApplyCurrentFontTablePatches(std::vector<BYTE>& fontData,
+    bool patchMetrics, bool patchCodepage, int lineGap) {
+    bool changed = false;
+    if (patchMetrics) {
+        if (!FontPatcher::PatchVerticalMetrics(fontData,
+            Config::FontAscentPermille, Config::FontDescentPermille, lineGap))
+            return false;
+        changed = true;
+    }
+
+    if (patchCodepage) {
+        bool codepagePatched = FontPatcher::PatchOS2CodePageRangeForCharset(fontData, Config::SpoofToCharset);
+        if (!codepagePatched && !patchMetrics)
+            return false;
+        changed = changed || codepagePatched;
+    }
+
+    return changed;
+}
+
+static bool TryLoadPatchedFontCloneData(const std::wstring& sourceFace,
+    const std::vector<BYTE>& patchedFontData, const std::wstring cloneFaces[2],
+    const char* sourceKind, const std::wstring& sourcePath,
+    bool patchMetrics, bool patchCodepage, int lineGap) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const std::wstring& cloneFace = cloneFaces[attempt];
+        if (cloneFace.empty()) continue;
+        if (attempt > 0 && WideEqualsIgnoreCase(cloneFace, cloneFaces[0])) continue;
+
+        std::vector<BYTE> cloneData = patchedFontData;
+        Utils::BeginWatchdogStage("metric-clone patch name source='%S' clone='%S' attempt=%d kind=%s",
+            sourceFace.c_str(), cloneFace.c_str(), attempt + 1, sourceKind ? sourceKind : "");
+        if (!FontPatcher::PatchNameTableFamily(cloneData, cloneFace.c_str())) {
+            Utils::EndWatchdogStage("patch-name-failed");
+            Utils::Trace("[TRACE] Metric clone failed to patch name source='%S' clone='%S' attempt=%d sourceKind=%s path='%S'",
+                sourceFace.c_str(), cloneFace.c_str(), attempt + 1, sourceKind ? sourceKind : "",
+                sourcePath.c_str());
+            continue;
+        }
+        Utils::EndWatchdogStage("ok");
+
+        DWORD numFonts = 0;
+        Utils::BeginWatchdogStage("metric-clone AddFontMemResourceEx source='%S' clone='%S' bytes=%lu kind=%s path='%S'",
+            sourceFace.c_str(), cloneFace.c_str(), (unsigned long)cloneData.size(),
+            sourceKind ? sourceKind : "", sourcePath.c_str());
+        HANDLE hFont = AddFontMemResourceEx(cloneData.data(), (DWORD)cloneData.size(), NULL, &numFonts);
+        if (!hFont) {
+            Utils::EndWatchdogStage("addfontmem-failed");
+            Utils::Trace("[TRACE] Metric clone AddFontMemResourceEx failed source='%S' clone='%S' attempt=%d sourceKind=%s path='%S'",
+                sourceFace.c_str(), cloneFace.c_str(), attempt + 1, sourceKind ? sourceKind : "",
+                sourcePath.c_str());
+            continue;
+        }
+        Utils::EndWatchdogStage("ok");
+
+        g_metricCloneFonts.push_back(hFont);
+        g_metricCloneFace = cloneFace;
+        g_metricCloneSourceFace = sourceFace;
+        SetAppliedFontForHook(cloneFace);
+        SelectSourceFontInList(sourceFace);
+
+        Utils::Trace("[TRACE] Patched font clone loaded source='%S' clone='%S' fonts=%lu metrics=%d asc=%d desc=%d line=%d codepage=%d targetCharset=%lu attempt=%d sourceKind=%s path='%S'",
+            sourceFace.c_str(), cloneFace.c_str(), (unsigned long)numFonts,
+            patchMetrics ? 1 : 0, Config::FontAscentPermille, Config::FontDescentPermille, lineGap,
+            patchCodepage ? 1 : 0, Config::SpoofToCharset, attempt + 1,
+            sourceKind ? sourceKind : "", sourcePath.c_str());
+        return true;
+    }
+
+    return false;
+}
+
+static bool CreatePatchedFontCloneFromCurrentTarget() {
+    bool patchMetrics = Config::EnableFontVerticalMetrics;
+    bool patchCodepage = Config::EnableCodepageSpoof;
+    if (!patchMetrics && !patchCodepage)
+        return false;
+
+    std::wstring targetFace = GetMetricTargetFont();
+    if (targetFace.empty()) return false;
+    Utils::Breadcrumb("CreatePatchedFontClone target='%S' metrics=%d codepage=%d asc=%d desc=%d line=%d",
+        targetFace.c_str(), patchMetrics ? 1 : 0, patchCodepage ? 1 : 0,
+        Config::FontAscentPermille, Config::FontDescentPermille,
+        Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0);
+
+    if (InterlockedCompareExchange(&g_metricCloneBuildActive, 1, 0) != 0) {
+        Utils::Trace("[TRACE] Metric clone build skipped because another build is active target='%S'",
+            targetFace.c_str());
+        return false;
+    }
+
+    struct MetricCloneBuildGuard {
+        ~MetricCloneBuildGuard() { InterlockedExchange(&g_metricCloneBuildActive, 0); }
+    } buildGuard;
+
+    std::wstring sourceFace = targetFace;
+    if (!g_metricCloneFace.empty() && WideEqualsIgnoreCase(targetFace, g_metricCloneFace) &&
+        !g_metricCloneSourceFace.empty()) {
+        sourceFace = g_metricCloneSourceFace;
+    }
+
+    int lineGap = Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0;
+    std::wstring cloneFaces[2] = {
+        BuildCompactMetricCloneFaceName(sourceFace),
+        L""
+    };
+
+    ClearMetricCloneFonts();
+
+    std::vector<BYTE> fontData;
+    if (ReadFontDataByFace(sourceFace, GetMetricClonePreferredCharset(), fontData) &&
+        ApplyCurrentFontTablePatches(fontData, patchMetrics, patchCodepage, lineGap) &&
+        TryLoadPatchedFontCloneData(sourceFace, fontData, cloneFaces, "gdi-face", L"",
+            patchMetrics, patchCodepage, lineGap)) {
+        return true;
+    }
+
+    std::vector<BYTE> fullFontData;
+    std::wstring fullFontPath;
+    if (ReadFullFontFileDataByFace(sourceFace, fullFontData, fullFontPath) &&
+        ApplyCurrentFontTablePatches(fullFontData, patchMetrics, patchCodepage, lineGap) &&
+        TryLoadPatchedFontCloneData(sourceFace, fullFontData, cloneFaces, "full-file", fullFontPath,
+            patchMetrics, patchCodepage, lineGap)) {
+        return true;
+    }
+
+    SetAppliedFontForHook(sourceFace);
+    Utils::Breadcrumb("CreatePatchedFontClone fallback source='%S'", sourceFace.c_str());
+    return false;
+}
+
+
+static void LoadLocalFonts() {
+    // Get DLL directory
+    wchar_t rootDir[MAX_PATH];
+    GetModuleFileNameW(g_hModule, rootDir, MAX_PATH);
+    PathRemoveFileSpecW(rootDir);
+
+    static const wchar_t* exts[] = { L"\\*.ttf", L"\\*.otf", L"\\*.ttc", L"\\*.fon" };
+    for (const wchar_t* ext : exts) {
+        wchar_t pattern[MAX_PATH];
+        wcscpy_s(pattern, rootDir);
+        wcscat_s(pattern, ext);
+
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW(pattern, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wchar_t fullPath[MAX_PATH];
+            swprintf_s(fullPath, MAX_PATH, L"%s\\%s", rootDir, fd.cFileName);
+
+            if (!ContainsPathIgnoreCase(g_loadedLocalFontPaths, fullPath)) {
+                // AddFontResourceExW makes the font enumerable by GDI. Metric/codepage
+                // repair is applied only to the selected font clone to avoid touching
+                // every local font while the game is rendering.
+                if (AddFontResourceExW(fullPath, FR_PRIVATE, NULL) > 0) {
+                    g_loadedLocalFontPaths.push_back(fullPath);
+                    Utils::LogW(L"[FontPicker] Loaded via AddFontResourceExW: %s", fd.cFileName);
+                }
+            }
+
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+}
+
+static void EnumerateFonts() {
+    g_allFonts.clear();
+    g_nameToIndex.clear();
+
+    // Load font files from game root directory first
+    LoadLocalFonts();
+
+    HDC hdc = GetDC(NULL);
+    static const BYTE charsets[] = {
+        DEFAULT_CHARSET, ANSI_CHARSET, SHIFTJIS_CHARSET, HANGUL_CHARSET,
+        GB2312_CHARSET, CHINESEBIG5_CHARSET, GREEK_CHARSET, TURKISH_CHARSET,
+        VIETNAMESE_CHARSET, HEBREW_CHARSET, ARABIC_CHARSET, BALTIC_CHARSET,
+        RUSSIAN_CHARSET, THAI_CHARSET, EASTEUROPE_CHARSET, OEM_CHARSET,
+        JOHAB_CHARSET, SYMBOL_CHARSET, MAC_CHARSET,
+    };
+    
+    Utils::Log("[Picker] Starting font enumeration...");
+    for (BYTE cs : charsets) {
+        LOGFONTW lf = {};
+        lf.lfCharSet = cs;
+        int prevCount = (int)g_allFonts.size();
+        EnumFontFamiliesExW(hdc, &lf, (FONTENUMPROCW)EnumFontProc, 0, 0);
+        int added = (int)g_allFonts.size() - prevCount;
+        if (added > 0 || cs == DEFAULT_CHARSET) {
+            Utils::Log("[Picker] Charset %u: found %d new fonts (total %d)", cs, added, (int)g_allFonts.size());
+        }
+    }
+    ReleaseDC(NULL, hdc);
+
+    // Sorting must preserve the FontInfo integrity
+    std::sort(g_allFonts.begin(), g_allFonts.end(), [](const FontInfo& a, const FontInfo& b) {
+        return a.name < b.name;
+    });
+
+    Utils::Log("[Picker] Enumeration finished. Final count: %d", (int)g_allFonts.size());
+    UpdateFilter();
+}
+
+static bool IsRecentFont(int filteredIdx) {
+    if (filteredIdx < 0 || filteredIdx >= (int)g_filteredIndices.size()) return false;
+    const auto& name = g_allFonts[g_filteredIndices[filteredIdx]].name;
+    for (const auto& r : g_recentFonts) if (r == name) return true;
+    return false;
+}
+
+static bool IsAppliedFont(int filteredIdx) {
+    if (filteredIdx < 0 || filteredIdx >= (int)g_filteredIndices.size()) return false;
+    const std::wstring& name = g_allFonts[g_filteredIndices[filteredIdx]].name;
+    if (WideEqualsIgnoreCase(name, g_appliedFont)) return true;
+    return !g_metricCloneFace.empty() &&
+        !g_metricCloneSourceFace.empty() &&
+        WideEqualsIgnoreCase(g_appliedFont, g_metricCloneFace) &&
+        WideEqualsIgnoreCase(name, g_metricCloneSourceFace);
+}
+
+// Apply selected font.
+static void ApplySelectedFont() {
+    if (g_selectedIndex < 0 || g_selectedIndex >= (int)g_filteredIndices.size()) return;
+    const std::wstring& name = g_allFonts[g_filteredIndices[g_selectedIndex]].name;
+    Utils::Breadcrumb("ApplySelectedFont start name='%S' selectedCharset=%d", name.c_str(), g_selectedCharset);
+    DWORD applyStartTick = GetTickCount();
+
+    bool desiredCharsetEnabled = g_selectedCharset != 0;
+    BYTE desiredCharset = desiredCharsetEnabled ? g_charsets[g_selectedCharset].value : DEFAULT_CHARSET;
+    bool unchanged =
+        Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        g_appliedFont == name &&
+        wcscmp(Config::ForcedFontNameW, name.c_str()) == 0 &&
+        Config::EnableCharsetReplace == desiredCharsetEnabled &&
+        (!desiredCharsetEnabled || Config::ForcedCharset == desiredCharset);
+    if (unchanged) {
+        Utils::LogW(L"[FontPicker] Reapplying unchanged font: %s", name.c_str());
+        Utils::Breadcrumb("ApplySelectedFont reapply unchanged name='%S'", name.c_str());
+    }
+
+    auto it = std::find(g_recentFonts.begin(), g_recentFonts.end(), name);
+    if (it != g_recentFonts.end()) g_recentFonts.erase(it);
+    g_recentFonts.insert(g_recentFonts.begin(), name);
+    if (g_recentFonts.size() > 5) g_recentFonts.pop_back();
+
+    g_appliedFont = name;
+    wcsncpy_s(Config::ForcedFontNameW, name.c_str(), LF_FACESIZE - 1);
+
+    DWORD nameResolveStartTick = GetTickCount();
+    std::string ansiName;
+    auto cachedAnsi = g_fontAnsiNameCache.find(name);
+    if (cachedAnsi != g_fontAnsiNameCache.end()) {
+        ansiName = cachedAnsi->second;
+    } else {
+        // Use English face name for ANSI hooks if possible to avoid encoding issues with Chinese names.
+        LOGFONTW lf = { 0 };
+        wcscpy_s(lf.lfFaceName, name.c_str());
+        HFONT hFont = CreateFontIndirectW(&lf);
+        if (hFont) {
+            ansiName = Utils::GetFontEnglishName(hFont);
+            if (!ansiName.empty()) {
+                Utils::LogW(L"[FontPicker] Using English face name for ANSI hooks: %S (was %s)", ansiName.c_str(), name.c_str());
+            }
+            DeleteObject(hFont);
+        }
+
+        if (ansiName.empty()) {
+            char fallbackName[LF_FACESIZE] = {};
+            WideCharToMultiByte(CP_ACP, 0, name.c_str(), -1, fallbackName, LF_FACESIZE - 1, NULL, NULL);
+            fallbackName[LF_FACESIZE - 1] = '\0';
+            ansiName = fallbackName;
+        }
+
+        if (g_fontAnsiNameCache.size() < 512) {
+            g_fontAnsiNameCache[name] = ansiName;
+        }
+    }
+    strncpy_s(Config::ForcedFontNameA, LF_FACESIZE, ansiName.c_str(), _TRUNCATE);
+    Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+    DWORD nameResolveElapsed = GetTickCount() - nameResolveStartTick;
+    Config::EnableFaceNameReplace = true;
+    Config::EnableFontHook = true;
+
+    // Use the charset selected in the charset bar.
+    // "All" (DEFAULT_CHARSET) = don't override charset, let the game keep its original charset.
+    // A specific charset forces GDI to use that codepage.
+    if (!desiredCharsetEnabled) {
+        // "All" selected: don't force charset, preserve the game's original charset
+        Config::EnableCharsetReplace = false;
+    } else {
+        Config::ForcedCharset = desiredCharset;
+        Config::EnableCharsetReplace = true;
+    }
+
+    if (Config::EnableCodepageSpoof || Config::EnableFontVerticalMetrics) {
+        if (!CreatePatchedFontCloneFromCurrentTarget()) {
+            Utils::Trace("[TRACE] ApplySelectedFont patched clone unavailable font='%S' codepage=%d metrics=%d",
+                name.c_str(), Config::EnableCodepageSpoof ? 1 : 0,
+                Config::EnableFontVerticalMetrics ? 1 : 0);
+        }
+    }
+
+    DWORD redrawStartTick = GetTickCount();
+    ForceGameRedraw();
+    DWORD redrawElapsed = GetTickCount() - redrawStartTick;
+    DWORD saveStartTick = GetTickCount();
+    SavePickerConfig();
+    DWORD saveElapsed = GetTickCount() - saveStartTick;
+    DWORD totalElapsed = GetTickCount() - applyStartTick;
+    if (totalElapsed >= 20 || nameResolveElapsed >= 10 || saveElapsed >= 10) {
+        Utils::Trace("[TRACE] ApplySelectedFont elapsed total=%lu ms nameResolve=%lu ms redrawQueue=%lu ms save=%lu ms font='%s'",
+            totalElapsed, nameResolveElapsed, redrawElapsed, saveElapsed,
+            PickerWideToUtf8(name.c_str()).c_str());
+    }
+    Utils::Breadcrumb("ApplySelectedFont end name='%S' total=%lums applied='%S'",
+        name.c_str(), totalElapsed, g_appliedFont.c_str());
+}
+

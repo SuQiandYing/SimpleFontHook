@@ -1,0 +1,321 @@
+struct ArtemisPfsEntry {
+    std::wstring archivePath;
+    DWORD offset;
+    DWORD size;
+    bool encrypted;
+    BYTE xorKey[20];
+};
+
+static char ArtemisPfsLowerAscii(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return (char)(ch - 'A' + 'a');
+    return ch;
+}
+
+static std::wstring ArtemisNormalizeResourceName(const std::wstring& path) {
+    std::wstring out = path;
+    for (wchar_t& ch : out) {
+        if (ch == L'/') ch = L'\\';
+        ch = (wchar_t)towlower(ch);
+    }
+    while (!out.empty() && (out[0] == L'\\' || out[0] == L'/')) {
+        out.erase(out.begin());
+    }
+    return out;
+}
+
+static std::wstring ArtemisResourceNameForKind(ArtemisResourceKind kind) {
+    switch (kind) {
+    case ARTEMIS_RESOURCE_LIST_WINDOWS:
+        return L"system\\table\\list_windows.tbl";
+    case ARTEMIS_RESOURCE_LIST_WINDOWS_JA:
+        return L"system\\table\\list_windows_ja.tbl";
+    case ARTEMIS_RESOURCE_LIST_WINDOWS_VARIANT:
+        return L"";
+    default:
+        return L"";
+    }
+}
+
+static DWORD ArtemisReadLe32(const BYTE* data) {
+    return (DWORD)data[0] |
+        ((DWORD)data[1] << 8) |
+        ((DWORD)data[2] << 16) |
+        ((DWORD)data[3] << 24);
+}
+
+static bool ArtemisSha1(const BYTE* data, DWORD size, BYTE outHash[20]) {
+    if (!data || !outHash) return false;
+
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    bool ok = false;
+
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) &&
+        CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash) &&
+        CryptHashData(hHash, data, size, 0)) {
+        DWORD hashSize = 20;
+        ok = CryptGetHashParam(hHash, HP_HASHVAL, outHash, &hashSize, 0) && hashSize == 20;
+    }
+
+    if (hHash) CryptDestroyHash(hHash);
+    if (hProv) CryptReleaseContext(hProv, 0);
+    return ok;
+}
+
+static bool ArtemisReadExact(HANDLE hFile, void* buffer, DWORD size) {
+    DWORD read = 0;
+    return ReadFile(hFile, buffer, size, &read, NULL) && read == size;
+}
+
+static bool ArtemisSetFilePos(HANDLE hFile, unsigned long long pos) {
+    LARGE_INTEGER li = {};
+    li.QuadPart = (LONGLONG)pos;
+    return SetFilePointerEx(hFile, li, NULL, FILE_BEGIN) != FALSE;
+}
+
+static bool ArtemisReadPfsHeaderAndIndex(HANDLE hFile, DWORD* fileCount, char* packVersion,
+    std::vector<BYTE>& indexBytes, BYTE xorKey[20],
+    DWORD* indexEntryStart, DWORD* trailerSize, DWORD* offsetField, DWORD* sizeField) {
+    BYTE header[19] = {};
+    if (!ArtemisSetFilePos(hFile, 0) || !ArtemisReadExact(hFile, header, sizeof(header))) return false;
+    if (header[0] != 'p' || header[1] != 'f' ||
+        (header[2] != '2' && header[2] != '6' && header[2] != '8')) {
+        return false;
+    }
+
+    DWORD indexSize = ArtemisReadLe32(header + 3);
+    DWORD count = ArtemisReadLe32(header + 7);
+    if (indexSize < 4 || indexSize > 64 * 1024 * 1024 || count > 1024 * 1024) return false;
+
+    DWORD startOffset = 7;
+    DWORD entryStart = 4;
+    DWORD entryTrailerSize = 12;
+    DWORD entryOffsetField = 4;
+    DWORD entrySizeField = 8;
+
+    indexBytes.resize(indexSize);
+    if (!ArtemisSetFilePos(hFile, startOffset) || !ArtemisReadExact(hFile, indexBytes.data(), indexSize)) {
+        indexBytes.clear();
+        return false;
+    }
+
+    if (header[2] == '8') {
+        if (!ArtemisSha1(indexBytes.data(), indexSize, xorKey)) {
+            indexBytes.clear();
+            return false;
+        }
+    } else {
+        ZeroMemory(xorKey, 20);
+    }
+
+    if (fileCount) *fileCount = count;
+    if (packVersion) *packVersion = (char)header[2];
+    if (indexEntryStart) *indexEntryStart = entryStart;
+    if (trailerSize) *trailerSize = entryTrailerSize;
+    if (offsetField) *offsetField = entryOffsetField;
+    if (sizeField) *sizeField = entrySizeField;
+    return true;
+}
+
+static void ArtemisXorPfsBytes(std::vector<BYTE>& bytes, const BYTE xorKey[20]) {
+    if (bytes.empty() || !xorKey) return;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] ^= xorKey[i % 20];
+    }
+}
+
+static bool ArtemisIsLikelyPfsNameByte(BYTE value) {
+    return (value >= '0' && value <= '9') ||
+        (value >= 'A' && value <= 'Z') ||
+        (value >= 'a' && value <= 'z') ||
+        value == '\\' || value == '/' || value == '_' ||
+        value == '-' || value == '.' || value >= 0x80;
+}
+
+static unsigned long long ArtemisDetectPfsIndexStart(HANDLE hFile) {
+    BYTE probe[128] = {};
+    if (!ArtemisSetFilePos(hFile, 0) || !ArtemisReadExact(hFile, probe, sizeof(probe))) {
+        return 12;
+    }
+
+    for (DWORD pos = 0; pos + 8 < sizeof(probe); ++pos) {
+        DWORD nameLen = ArtemisReadLe32(probe + pos);
+        if (nameLen == 0 || nameLen > 512 || pos + 4 + nameLen >= sizeof(probe)) continue;
+
+        bool hasSlash = false;
+        bool valid = true;
+        for (DWORD i = 0; i < nameLen; ++i) {
+            BYTE ch = probe[pos + 4 + i];
+            if (!ArtemisIsLikelyPfsNameByte(ch)) {
+                valid = false;
+                break;
+            }
+            if (ch == '\\' || ch == '/') hasSlash = true;
+        }
+        if (valid && hasSlash) return pos;
+    }
+
+    return 12;
+}
+
+static bool ArtemisTryFindPfsEntryInArchive(const std::wstring& archivePath, const std::wstring& resourceName, ArtemisPfsEntry* outEntry) {
+    HANDLE hFile = orgCreateFileW(archivePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart <= 32) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::string targetAnsi = ArtemisAnsiFromWide(ArtemisNormalizeResourceName(resourceName));
+    for (char& ch : targetAnsi) {
+        if (ch == '/') ch = '\\';
+        ch = ArtemisPfsLowerAscii(ch);
+    }
+
+    DWORD fileCount = 0;
+    char packVersion = 0;
+    BYTE xorKey[20] = {};
+    std::vector<BYTE> indexBytes;
+    DWORD indexEntryStart = 4;
+    DWORD trailerSize = 12;
+    DWORD offsetField = 4;
+    DWORD sizeField = 8;
+    unsigned long long pos = 4;
+    unsigned long long indexEnd = 0;
+    bool parsedHeader = ArtemisReadPfsHeaderAndIndex(hFile, &fileCount, &packVersion, indexBytes, xorKey,
+        &indexEntryStart, &trailerSize, &offsetField, &sizeField);
+    unsigned long long minDataOffset = (unsigned long long)fileSize.QuadPart;
+    bool found = false;
+    ArtemisPfsEntry entry = {};
+
+    if (parsedHeader) {
+        pos = indexEntryStart;
+        indexEnd = indexBytes.size();
+    } else {
+        pos = ArtemisDetectPfsIndexStart(hFile);
+        indexEnd = (unsigned long long)fileSize.QuadPart;
+    }
+
+    DWORD parsedCount = 0;
+    while (pos + 4 + trailerSize < indexEnd && pos + 4 + trailerSize < minDataOffset) {
+        DWORD nameLen = 0;
+        const BYTE* nameBytes = NULL;
+        BYTE trailer[20] = {};
+
+        if (parsedHeader) {
+            if (pos + 4 > indexBytes.size()) break;
+            nameLen = ArtemisReadLe32(indexBytes.data() + pos);
+            pos += 4;
+            if (nameLen == 0 || nameLen > 512 || pos + nameLen + trailerSize > indexBytes.size()) break;
+            nameBytes = indexBytes.data() + pos;
+            memcpy(trailer, indexBytes.data() + pos + nameLen, trailerSize);
+            pos += nameLen + trailerSize;
+        } else {
+            BYTE lenBytes[4] = {};
+            if (!ArtemisSetFilePos(hFile, pos) || !ArtemisReadExact(hFile, lenBytes, sizeof(lenBytes))) break;
+            nameLen = ArtemisReadLe32(lenBytes);
+            pos += 4;
+
+            if (nameLen == 0 || nameLen > 512 || pos + nameLen + 12 > (unsigned long long)fileSize.QuadPart) break;
+
+            static BYTE fallbackName[512] = {};
+            if (!ArtemisReadExact(hFile, fallbackName, nameLen) ||
+                !ArtemisReadExact(hFile, trailer, sizeof(trailer))) {
+                break;
+            }
+            nameBytes = fallbackName;
+            pos += nameLen + 12;
+        }
+
+        ++parsedCount;
+
+        DWORD offset = ArtemisReadLe32(trailer + offsetField);
+        DWORD size = ArtemisReadLe32(trailer + sizeField);
+        if (offset > 0 && offset < minDataOffset) minDataOffset = offset;
+
+        std::string normalizedName((const char*)nameBytes, nameLen);
+        for (char& ch : normalizedName) {
+            if (ch == '/') ch = '\\';
+            ch = ArtemisPfsLowerAscii(ch);
+        }
+
+        if (normalizedName == targetAnsi &&
+            (unsigned long long)offset + (unsigned long long)size <= (unsigned long long)fileSize.QuadPart) {
+            entry.archivePath = archivePath;
+            entry.offset = offset;
+            entry.size = size;
+            entry.encrypted = parsedHeader && packVersion == '8';
+            memcpy(entry.xorKey, xorKey, sizeof(entry.xorKey));
+            found = true;
+            break;
+        }
+
+        if (parsedHeader && parsedCount >= fileCount) break;
+    }
+
+    CloseHandle(hFile);
+    if (found && outEntry) *outEntry = entry;
+    return found;
+}
+
+static bool ArtemisTryFindPfsEntry(const std::wstring& resourceName, ArtemisPfsEntry* outEntry) {
+    std::wstring root = ArtemisGetGameRoot();
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, root.c_str());
+    PathAppendW(search, L"*.pfs");
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = FindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t archivePath[MAX_PATH] = {};
+        wcscpy_s(archivePath, root.c_str());
+        PathAppendW(archivePath, data.cFileName);
+        if (ArtemisTryFindPfsEntryInArchive(archivePath, resourceName, outEntry)) {
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(hFind, &data));
+
+    FindClose(hFind);
+    return found;
+}
+
+static bool ArtemisReadPfsResource(const std::wstring& resourceName, std::vector<BYTE>& bytes, std::wstring* sourceLabel) {
+    ArtemisPfsEntry entry = {};
+    if (!ArtemisTryFindPfsEntry(resourceName, &entry)) return false;
+
+    HANDLE hFile = orgCreateFileW(entry.archivePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    bytes.resize(entry.size);
+    bool ok = ArtemisSetFilePos(hFile, entry.offset) &&
+        (entry.size == 0 || ArtemisReadExact(hFile, bytes.data(), entry.size));
+    CloseHandle(hFile);
+
+    if (!ok) {
+        bytes.clear();
+        return false;
+    }
+
+    if (entry.encrypted) {
+        ArtemisXorPfsBytes(bytes, entry.xorKey);
+    }
+
+    if (sourceLabel) {
+        wchar_t label[MAX_PATH * 2] = {};
+        swprintf_s(label, L"%s!%s", entry.archivePath.c_str(), resourceName.c_str());
+        *sourceLabel = label;
+    }
+    ArtemisTraceLimited("pfs-read resource='%s' archive='%s' offset=0x%08lX size=%lu encrypted=%d",
+        ArtemisWideToUtf8(resourceName).c_str(), ArtemisWideToUtf8(entry.archivePath).c_str(),
+        entry.offset, entry.size, entry.encrypted ? 1 : 0);
+    return true;
+}

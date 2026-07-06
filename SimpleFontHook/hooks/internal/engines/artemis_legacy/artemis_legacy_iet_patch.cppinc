@@ -1,0 +1,590 @@
+static char ArtemisLegacyLowerAscii(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return (char)(ch - 'A' + 'a');
+    return ch;
+}
+
+static bool ArtemisLegacyIsAsciiIdent(char ch) {
+    unsigned char c = (unsigned char)ch;
+    return std::isalnum(c) != 0 || ch == '_';
+}
+
+static bool ArtemisLegacyIsAsciiDigit(char ch) {
+    return ch >= '0' && ch <= '9';
+}
+
+static bool ArtemisLegacyIsQuote(char ch) {
+    return ch == '"' || ch == '\'';
+}
+
+static bool ArtemisLegacyEqualsAsciiAt(const std::string& text, size_t pos, const char* needle) {
+    for (size_t i = 0; needle[i]; ++i) {
+        if (pos + i >= text.size()) return false;
+        if (ArtemisLegacyLowerAscii(text[pos + i]) != ArtemisLegacyLowerAscii(needle[i])) return false;
+    }
+    return true;
+}
+
+static bool ArtemisLegacyLooksBinary(const std::string& text) {
+    if (text.empty()) return false;
+    size_t nulCount = 0;
+    for (char ch : text) {
+        if (ch == '\0') ++nulCount;
+    }
+    return nulCount > text.size() / 16;
+}
+
+static std::string ArtemisLegacyLowerPathValue(std::string value) {
+    for (char& ch : value) {
+        if (ch == '\\') ch = '/';
+        ch = ArtemisLegacyLowerAscii(ch);
+    }
+    return value;
+}
+
+static bool ArtemisLegacyEndsWithAscii(const std::string& text, const char* suffix) {
+    size_t textLen = text.size();
+    size_t suffixLen = strlen(suffix);
+    return textLen >= suffixLen &&
+        text.compare(textLen - suffixLen, suffixLen, suffix) == 0;
+}
+
+static bool ArtemisLegacyLooksLikePatchableFontValue(const std::string& value, bool allowBareFamilyName) {
+    if (value.empty()) return false;
+    if (value.find('$') != std::string::npos ||
+        value.find('+') != std::string::npos ||
+        value.find('(') != std::string::npos ||
+        value.find(')') != std::string::npos) {
+        return false;
+    }
+
+    std::string lower = ArtemisLegacyLowerPathValue(value);
+    if (lower.find("/font/") != std::string::npos ||
+        ArtemisLegacyEndsWithAscii(lower, ".ttf") ||
+        ArtemisLegacyEndsWithAscii(lower, ".ttc") ||
+        ArtemisLegacyEndsWithAscii(lower, ".otf") ||
+        ArtemisLegacyEndsWithAscii(lower, ".rft")) {
+        return true;
+    }
+
+    if (!allowBareFamilyName) return false;
+
+    bool hasAlpha = false;
+    for (char ch : lower) {
+        unsigned char c = (unsigned char)ch;
+        if (std::isalpha(c)) {
+            hasAlpha = true;
+            continue;
+        }
+        if (std::isdigit(c) || ch == '-' || ch == '_' || ch == '.' || ch == ' ')
+            continue;
+        return false;
+    }
+    return hasAlpha;
+}
+
+static bool ArtemisLegacyFindAssignmentValue(std::string& text, size_t keyPos, const char* key,
+    size_t* valueStartOut, size_t* valueEndOut, bool* quotedOut, char* quoteOut) {
+    const size_t keyLen = strlen(key);
+    if (!ArtemisLegacyEqualsAsciiAt(text, keyPos, key)) return false;
+    if (keyPos > 0 && ArtemisLegacyIsAsciiIdent(text[keyPos - 1])) return false;
+
+    size_t p = keyPos + keyLen;
+    if (p < text.size() && ArtemisLegacyIsAsciiIdent(text[p])) return false;
+    while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+    if (p >= text.size() || (text[p] != '=' && text[p] != ':')) return false;
+    ++p;
+    while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+    if (p >= text.size()) return false;
+
+    bool quoted = false;
+    char quote = '\0';
+    if (ArtemisLegacyIsQuote(text[p])) {
+        quoted = true;
+        quote = text[p++];
+    }
+
+    size_t valueStart = p;
+    if (quoted) {
+        while (p < text.size() && text[p] != quote && text[p] != '\r' && text[p] != '\n') ++p;
+        if (p >= text.size() || text[p] != quote) return false;
+    } else {
+        while (p < text.size() &&
+            text[p] != ' ' && text[p] != '\t' &&
+            text[p] != '\r' && text[p] != '\n' &&
+            text[p] != ']') {
+            ++p;
+        }
+        if (p <= valueStart) return false;
+    }
+
+    if (valueStartOut) *valueStartOut = valueStart;
+    if (valueEndOut) *valueEndOut = p;
+    if (quotedOut) *quotedOut = quoted;
+    if (quoteOut) *quoteOut = quote;
+    return true;
+}
+
+static bool ArtemisLegacyFindAssignmentValueInRange(std::string& text, size_t begin, size_t end,
+    const char* key, size_t* valueStartOut, size_t* valueEndOut, bool* quotedOut, char* quoteOut) {
+    if (!key || begin >= text.size() || begin >= end) return false;
+    end = std::min(end, text.size());
+
+    const size_t keyLen = strlen(key);
+    for (size_t pos = begin; pos + keyLen < end; ++pos) {
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        bool quoted = false;
+        char quote = '\0';
+        if (!ArtemisLegacyFindAssignmentValue(text, pos, key, &valueStart, &valueEnd, &quoted, &quote))
+            continue;
+        size_t actualEnd = valueEnd + (quoted ? 1 : 0);
+        if (actualEnd > end) continue;
+
+        if (valueStartOut) *valueStartOut = valueStart;
+        if (valueEndOut) *valueEndOut = valueEnd;
+        if (quotedOut) *quotedOut = quoted;
+        if (quoteOut) *quoteOut = quote;
+        return true;
+    }
+    return false;
+}
+
+static bool ArtemisLegacyIsFontVariableName(std::string value) {
+    value = ArtemisLegacyLowerPathValue(value);
+    return value == "g.font_face" ||
+        value == "font_face" ||
+        value == "g.msg.font_face" ||
+        value == "g.backlog.font_face";
+}
+
+static bool ArtemisLegacyAsciiTagHasNameId(std::string tag) {
+    for (char& ch : tag) ch = ArtemisLegacyLowerAscii(ch);
+
+    const char* needles[] = {
+        "id=\"name\"",
+        "id='name'",
+        "id=name",
+        "id=\"disp_name\"",
+        "id='disp_name'",
+        "id=disp_name",
+    };
+    for (const char* needle : needles) {
+        if (tag.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool ArtemisLegacyIsNameMessageContext(const std::string& text, size_t fieldPos) {
+    size_t chgmsgPos = text.rfind("[chgmsg", fieldPos);
+    if (chgmsgPos == std::string::npos) return false;
+
+    size_t closePos = text.rfind("[/chgmsg]", fieldPos);
+    if (closePos != std::string::npos && closePos > chgmsgPos) return false;
+
+    size_t tagEnd = text.find(']', chgmsgPos);
+    if (tagEnd == std::string::npos || tagEnd > fieldPos) return false;
+    return ArtemisLegacyAsciiTagHasNameId(text.substr(chgmsgPos, tagEnd - chgmsgPos + 1));
+}
+
+static bool ArtemisLegacyPatchQuotedFontField(std::string& text, const char* key,
+    const std::string& virtualFontPath, bool allowBareFamilyName) {
+    if (virtualFontPath.empty()) return false;
+
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        bool quoted = false;
+        char quote = '\0';
+        if (!ArtemisLegacyFindAssignmentValue(text, pos, key, &valueStart, &valueEnd, &quoted, &quote) || !quoted) {
+            ++pos;
+            continue;
+        }
+        if (ArtemisLegacyIsNameMessageContext(text, pos)) {
+            pos = valueEnd + 1;
+            continue;
+        }
+
+        std::string oldValue = text.substr(valueStart, valueEnd - valueStart);
+        if (!ArtemisLegacyLooksLikePatchableFontValue(oldValue, allowBareFamilyName)) {
+            pos = valueEnd + 1;
+            continue;
+        }
+
+        text.replace(valueStart, valueEnd - valueStart, virtualFontPath);
+        pos = valueStart + virtualFontPath.size() + 1;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisLegacyPatchFontAssignments(std::string& text, const std::string& virtualFontPath) {
+    bool changed = false;
+    changed = ArtemisLegacyPatchQuotedFontField(text, "rubyface", virtualFontPath, true) || changed;
+    changed = ArtemisLegacyPatchQuotedFontField(text, "ruby", virtualFontPath, false) || changed;
+    changed = ArtemisLegacyPatchQuotedFontField(text, "face", virtualFontPath, false) || changed;
+    return changed;
+}
+
+static bool ArtemisLegacyPatchFontVariableAssignments(std::string& text, const std::string& virtualFontPath) {
+    if (virtualFontPath.empty()) return false;
+
+    bool changed = false;
+    for (size_t pos = 0; pos < text.size();) {
+        size_t tagStart = text.find("[var", pos);
+        if (tagStart == std::string::npos) break;
+        if (tagStart + 4 < text.size() && ArtemisLegacyIsAsciiIdent(text[tagStart + 4])) {
+            pos = tagStart + 1;
+            continue;
+        }
+
+        size_t tagEnd = text.find(']', tagStart);
+        if (tagEnd == std::string::npos) break;
+
+        size_t nameStart = 0;
+        size_t nameEnd = 0;
+        bool nameQuoted = false;
+        char nameQuote = '\0';
+        if (!ArtemisLegacyFindAssignmentValueInRange(text, tagStart, tagEnd, "name",
+            &nameStart, &nameEnd, &nameQuoted, &nameQuote)) {
+            pos = tagEnd + 1;
+            continue;
+        }
+
+        std::string nameValue = text.substr(nameStart, nameEnd - nameStart);
+        if (!ArtemisLegacyIsFontVariableName(nameValue)) {
+            pos = tagEnd + 1;
+            continue;
+        }
+
+        size_t dataStart = 0;
+        size_t dataEnd = 0;
+        bool dataQuoted = false;
+        char dataQuote = '\0';
+        if (!ArtemisLegacyFindAssignmentValueInRange(text, tagStart, tagEnd, "data",
+            &dataStart, &dataEnd, &dataQuoted, &dataQuote) || !dataQuoted) {
+            pos = tagEnd + 1;
+            continue;
+        }
+
+        std::string oldValue = text.substr(dataStart, dataEnd - dataStart);
+        if (!ArtemisLegacyLooksLikePatchableFontValue(oldValue, true)) {
+            pos = tagEnd + 1;
+            continue;
+        }
+
+        text.replace(dataStart, dataEnd - dataStart, virtualFontPath);
+        pos = dataStart + virtualFontPath.size() + 1;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisLegacyPatchRenderedFlag(std::string& text) {
+    const char* key = "rendered";
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        bool quoted = false;
+        char quote = '\0';
+        if (!ArtemisLegacyFindAssignmentValue(text, pos, key, &valueStart, &valueEnd, &quoted, &quote)) {
+            ++pos;
+            continue;
+        }
+        if (ArtemisLegacyIsNameMessageContext(text, pos)) {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        std::string value = text.substr(valueStart, valueEnd - valueStart);
+        std::string lower = ArtemisLegacyLowerPathValue(value);
+        while (!lower.empty() && (lower.back() == ' ' || lower.back() == '\t')) lower.pop_back();
+        if (lower == "0" || lower == "false" || lower == "no") {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        text.replace(valueStart, valueEnd - valueStart, "0");
+        pos = valueStart + 1 + (quoted ? 1 : 0);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisLegacyPatchNumericField(std::string& text, const char* key, int value) {
+    char replacement[32] = {};
+    sprintf_s(replacement, "%d", value);
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        bool quoted = false;
+        char quote = '\0';
+        if (!ArtemisLegacyFindAssignmentValue(text, pos, key, &valueStart, &valueEnd, &quoted, &quote)) {
+            ++pos;
+            continue;
+        }
+        if (ArtemisLegacyIsNameMessageContext(text, pos)) {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        size_t p = valueStart;
+        if (p < valueEnd && (text[p] == '-' || text[p] == '+')) ++p;
+        size_t digitStart = p;
+        while (p < valueEnd && ArtemisLegacyIsAsciiDigit(text[p])) ++p;
+        if (p == digitStart || p != valueEnd) {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        text.replace(valueStart, valueEnd - valueStart, replacement);
+        pos = valueStart + strlen(replacement) + (quoted ? 1 : 0);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisLegacyFindNumericFieldInRange(const std::string& text, size_t begin, size_t end,
+    const char* key, int* valueOut) {
+    if (!key || begin >= text.size() || begin >= end) return false;
+    end = std::min(end, text.size());
+
+    const size_t keyLen = strlen(key);
+    for (size_t pos = begin; pos + keyLen < end;) {
+        if (!ArtemisLegacyEqualsAsciiAt(text, pos, key) ||
+            (pos > begin && ArtemisLegacyIsAsciiIdent(text[pos - 1]))) {
+            ++pos;
+            continue;
+        }
+
+        size_t p = pos + keyLen;
+        if (p < end && ArtemisLegacyIsAsciiIdent(text[p])) {
+            pos = p;
+            continue;
+        }
+        while (p < end && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= end || (text[p] != '=' && text[p] != ':')) {
+            ++pos;
+            continue;
+        }
+        ++p;
+        while (p < end && (text[p] == ' ' || text[p] == '\t')) ++p;
+
+        bool quoted = false;
+        char quote = '\0';
+        if (p < end && ArtemisLegacyIsQuote(text[p])) {
+            quoted = true;
+            quote = text[p++];
+        }
+
+        int sign = 1;
+        if (p < end && (text[p] == '-' || text[p] == '+')) {
+            sign = text[p] == '-' ? -1 : 1;
+            ++p;
+        }
+
+        size_t digitStart = p;
+        int value = 0;
+        while (p < end && ArtemisLegacyIsAsciiDigit(text[p])) {
+            value = value * 10 + (text[p] - '0');
+            ++p;
+        }
+        if (p == digitStart) {
+            ++pos;
+            continue;
+        }
+        if (quoted && (p >= end || text[p] != quote)) {
+            ++pos;
+            continue;
+        }
+
+        if (valueOut) *valueOut = value * sign;
+        return true;
+    }
+
+    return false;
+}
+
+static int ArtemisLegacyScalePermilleToInt(int base, int permille) {
+    long long value = (long long)base * (long long)permille;
+    if (value >= 0) return (int)((value + 500) / 1000);
+    return (int)((value - 500) / 1000);
+}
+
+static int ArtemisLegacyResolveLineSpacing(const std::string& text, size_t fieldPos) {
+    if (!Config::EnableFontVerticalMetrics) return Config::FontLineSpacing;
+
+    size_t blockStart = text.rfind("[font", fieldPos);
+    size_t blockEnd = text.find(']', fieldPos);
+    int fontSize = Config::ArtemisFontSize;
+    if (fontSize <= 0 && blockStart != std::string::npos && blockEnd != std::string::npos &&
+        blockStart < fieldPos && fieldPos < blockEnd) {
+        ArtemisLegacyFindNumericFieldInRange(text, blockStart + 1, blockEnd, "size", &fontSize);
+    }
+    if (fontSize <= 0) fontSize = 34;
+    return ArtemisLegacyScalePermilleToInt(fontSize, Config::FontLineSpacing);
+}
+
+static bool ArtemisLegacyPatchLineSpacingField(std::string& text) {
+    const char* key = "spacemiddle";
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        size_t valueStart = 0;
+        size_t valueEnd = 0;
+        bool quoted = false;
+        char quote = '\0';
+        if (!ArtemisLegacyFindAssignmentValue(text, pos, key, &valueStart, &valueEnd, &quoted, &quote)) {
+            ++pos;
+            continue;
+        }
+        if (ArtemisLegacyIsNameMessageContext(text, pos)) {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        size_t p = valueStart;
+        if (p < valueEnd && (text[p] == '-' || text[p] == '+')) ++p;
+        size_t digitStart = p;
+        while (p < valueEnd && ArtemisLegacyIsAsciiDigit(text[p])) ++p;
+        if (p == digitStart || p != valueEnd) {
+            pos = valueEnd + (quoted ? 1 : 0);
+            continue;
+        }
+
+        char replacement[32] = {};
+        sprintf_s(replacement, "%d", ArtemisLegacyResolveLineSpacing(text, pos));
+        text.replace(valueStart, valueEnd - valueStart, replacement);
+        pos = valueStart + strlen(replacement) + (quoted ? 1 : 0);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisLegacyPatchTextSubstitutionBytes(const ArtemisLegacyPathInfo& info,
+    std::vector<BYTE>& bytes) {
+    if (!IsTextSubstitutionActive() || bytes.empty() || bytes.size() > INT_MAX) return false;
+
+    std::string source((const char*)bytes.data(), bytes.size());
+    if (ArtemisLegacyLooksBinary(source)) return false;
+
+    UINT codepage = TextSubstitutionAnsiCodepage();
+    int sourceLen = (int)source.size();
+    int wideLen = orgMultiByteToWideChar(codepage, 0, source.data(), sourceLen, NULL, 0);
+    if (wideLen <= 0) return false;
+
+    std::wstring wideInput(wideLen, L'\0');
+    if (orgMultiByteToWideChar(codepage, 0, source.data(), sourceLen, &wideInput[0], wideLen) != wideLen) {
+        return false;
+    }
+
+    std::wstring wideOutput;
+    int wideOutputCount = wideLen;
+    if (!SubstituteTextW(wideInput.c_str(), wideLen, wideOutput, &wideOutputCount)) return false;
+    if (wideOutputCount <= 0) return false;
+
+    DWORD flags = CodepageRedirectIsUtfFamily(codepage) ? 0 : WC_NO_BEST_FIT_CHARS;
+    BOOL usedDefault = FALSE;
+    LPCCH defaultChar = CodepageRedirectIsUtfFamily(codepage) ? NULL : "?";
+    LPBOOL usedDefaultPtr = CodepageRedirectIsUtfFamily(codepage) ? NULL : &usedDefault;
+
+    int outLen = orgWideCharToMultiByte(codepage, flags, wideOutput.c_str(), wideOutputCount,
+        NULL, 0, defaultChar, usedDefaultPtr);
+    if (outLen <= 0 || usedDefault) {
+        ArtemisLegacyTraceLimited("text-sub-skip path='%s' reason=encode-size codepage=%u usedDefault=%d",
+            ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), codepage, usedDefault ? 1 : 0);
+        return false;
+    }
+
+    std::vector<BYTE> outBytes((size_t)outLen);
+    usedDefault = FALSE;
+    int written = orgWideCharToMultiByte(codepage, flags, wideOutput.c_str(), wideOutputCount,
+        (LPSTR)outBytes.data(), outLen, defaultChar, usedDefaultPtr);
+    if (written != outLen || usedDefault) {
+        ArtemisLegacyTraceLimited("text-sub-skip path='%s' reason=encode-write codepage=%u usedDefault=%d",
+            ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), codepage, usedDefault ? 1 : 0);
+        return false;
+    }
+
+    bytes.swap(outBytes);
+    ArtemisLegacyTraceLimited("text-substituted source='%s' bytes=%u codepage=%u",
+        ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size(), codepage);
+    return true;
+}
+
+static bool ArtemisLegacyPatchIetContent(const ArtemisLegacyPathInfo& info, std::vector<BYTE>& bytes) {
+    if (bytes.empty()) return false;
+    std::string text((const char*)bytes.data(), bytes.size());
+    if (ArtemisLegacyLooksBinary(text)) {
+        ArtemisLegacyTraceLimited("iet-skip-binary path='%s' size=%u",
+            ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size());
+        return false;
+    }
+
+    bool changed = false;
+    bool fontSynced = false;
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        fontSynced = ArtemisLegacySyncVirtualFontFile(Config::ConfigVersion);
+        std::string virtualFontPath = ArtemisLegacyVirtualFontPathUtf8();
+        if (fontSynced && !virtualFontPath.empty()) {
+            changed = ArtemisLegacyPatchFontVariableAssignments(text, virtualFontPath) || changed;
+            changed = ArtemisLegacyPatchFontAssignments(text, virtualFontPath) || changed;
+            changed = ArtemisLegacyPatchRenderedFlag(text) || changed;
+        } else {
+            ArtemisLegacyTraceLimited("iet-font-skip reason=no-font-file path='%s'",
+                ArtemisLegacyWideToUtf8(info.sourcePath).c_str());
+        }
+    }
+
+    if (Config::EnableFontCharSpacing) {
+        changed = ArtemisLegacyPatchNumericField(text, "kerning", Config::FontCharSpacing) || changed;
+    }
+    if (Config::EnableFontLineSpacing) {
+        changed = ArtemisLegacyPatchLineSpacingField(text) || changed;
+    }
+    if (Config::ArtemisFontSize > 0) {
+        changed = ArtemisLegacyPatchNumericField(text, "size", Config::ArtemisFontSize) || changed;
+    }
+    if (Config::ArtemisRubySize >= 0) {
+        changed = ArtemisLegacyPatchNumericField(text, "rubysize", Config::ArtemisRubySize) || changed;
+    }
+
+    if (changed) bytes.assign(text.begin(), text.end());
+    changed = ArtemisLegacyPatchTextSubstitutionBytes(info, bytes) || changed;
+
+    if (!changed) return false;
+    InterlockedExchange(&g_artemisLegacyLastScriptPatchVersion, Config::ConfigVersion);
+    ArtemisLegacyTraceLimited("iet-patched source='%s' bytes=%u fontPath='%s' fontSynced=%d kerning=%d spacemiddle=%d spacemiddleMode='%s' size=%d ruby=%d",
+        ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size(),
+        ArtemisLegacyWideToUtf8(ArtemisLegacyBuildVirtualFontPath()).c_str(),
+        fontSynced ? 1 : 0,
+        Config::EnableFontCharSpacing ? Config::FontCharSpacing : 0,
+        Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0,
+        Config::EnableFontVerticalMetrics ? "per-em" : "pixel",
+        Config::ArtemisFontSize,
+        Config::ArtemisRubySize);
+    return true;
+}
+
+static bool ArtemisLegacyPatchTextScriptContent(const ArtemisLegacyPathInfo& info, std::vector<BYTE>& bytes) {
+    bool changed = ArtemisLegacyPatchTextSubstitutionBytes(info, bytes);
+    if (!changed) return false;
+
+    InterlockedExchange(&g_artemisLegacyLastScriptPatchVersion, Config::ConfigVersion);
+    ArtemisLegacyTraceLimited("text-script-patched source='%s' bytes=%u",
+        ArtemisLegacyWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size());
+    return true;
+}

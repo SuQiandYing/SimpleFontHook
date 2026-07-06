@@ -1,0 +1,352 @@
+// Mirai font data / FreeType compatibility.
+//
+// Mirai titles may create a Windows HFONT first, then hand the raw sfnt data to
+// FreeType/D3D. For that path, TextOut-time HDC replacement is too late, so we
+// redirect the font data/file source itself. We intentionally do not hot-switch
+// Mirai's internal FreeType objects here; mixing an old FT_Face with new sfnt
+// bytes can produce blank text.
+
+static int g_miraiEngineProbe = -1;
+static volatile LONG g_miraiTraceCount = 0;
+
+static std::mutex g_miraiFontSourceMutex;
+static LONG g_miraiFontSourceVersion = LONG_MIN;
+static std::wstring g_miraiFontSourceFace;
+static std::wstring g_miraiFontSourcePath;
+
+struct MiraiStableFontDataSource {
+    HDC hdc;
+    HFONT originalFont;
+    LOGFONTW sourceLogfont;
+    HFONT replacementFont;
+    LONG configVersion;
+    std::wstring face;
+};
+
+static std::mutex g_miraiStableFontDataMutex;
+static std::vector<MiraiStableFontDataSource> g_miraiStableFontDataSources;
+
+static void MiraiTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_miraiTraceCount);
+    if (hit > 512) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][Mirai] %s", message);
+}
+
+static bool MiraiFindFirstFileInRoot(const wchar_t* pattern) {
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, ArtemisGetGameRoot().c_str());
+    PathAppendW(search, pattern);
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = FindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    FindClose(hFind);
+    return true;
+}
+
+static bool MiraiBufferContainsAscii(const std::vector<BYTE>& bytes, const char* needle) {
+    if (!needle || !needle[0]) return false;
+    size_t needleLen = strlen(needle);
+    if (bytes.size() < needleLen) return false;
+
+    for (size_t i = 0; i <= bytes.size() - needleLen; ++i) {
+        if (memcmp(bytes.data() + i, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
+
+static bool MiraiMainModuleHasFontEngineMarkers() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (!exePath[0]) return false;
+
+    HANDLE hFile = orgCreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 16 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<BYTE> bytes((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size()) return false;
+
+    bool hasFreetype = MiraiBufferContainsAscii(bytes, "FT_Init_FreeType") ||
+        MiraiBufferContainsAscii(bytes, "FT_New_Face");
+    bool hasMiraiFontConfig = MiraiBufferContainsAscii(bytes, "DEVICE_FONT_NAME") ||
+        MiraiBufferContainsAscii(bytes, "getFontFile") ||
+        MiraiBufferContainsAscii(bytes, "FontFile =");
+    return hasFreetype && hasMiraiFontConfig;
+}
+
+static bool MiraiLooksLikeEngineRoot() {
+    if (g_miraiEngineProbe != -1) return g_miraiEngineProbe != 0;
+
+    bool hasArchives = MiraiFindFirstFileInRoot(L"arc0.dat") && MiraiFindFirstFileInRoot(L"script.dat");
+    bool hasSetting = MiraiFindFirstFileInRoot(L"Setting.exe");
+    bool hasMarkers = MiraiMainModuleHasFontEngineMarkers();
+    bool isMirai = hasArchives && hasSetting && hasMarkers;
+    g_miraiEngineProbe = isMirai ? 1 : 0;
+
+    MiraiTraceLimited("engine-probe result=%d archives=%d setting=%d markers=%d",
+        isMirai ? 1 : 0, hasArchives ? 1 : 0, hasSetting ? 1 : 0, hasMarkers ? 1 : 0);
+    return isMirai;
+}
+
+static bool MiraiShouldReplaceFontDataQueries() {
+    return Config::EnableMiraiHook &&
+        Config::MiraiReplaceFontDataQueries &&
+        Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        MiraiLooksLikeEngineRoot();
+}
+
+static bool MiraiResolveCurrentFontDataSource(HDC hdc, HFONT* originalFontOut, LOGFONTW* sourceLogfontOut) {
+    if (!hdc || !originalFontOut || !sourceLogfontOut) return false;
+
+    HFONT hCurFont = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    if (!hCurFont || IsStockFontHandle(hCurFont)) return false;
+
+    ReplacementFontInfo info = {};
+    LOGFONTW sourceLogfont = {};
+    HFONT originalFont = hCurFont;
+    if (TryGetReplacementInfo(hCurFont, &info)) {
+        sourceLogfont = info.sourceLogfont;
+        originalFont = info.originalFont ? info.originalFont : hCurFont;
+    } else if (orgGetObjectW(hCurFont, sizeof(sourceLogfont), &sourceLogfont) == 0) {
+        return false;
+    }
+
+    StripEpochSuffixFromLogFont(sourceLogfont);
+    *originalFontOut = originalFont;
+    *sourceLogfontOut = sourceLogfont;
+    return true;
+}
+
+static HFONT MiraiFindPinnedFontDataSource(HDC hdc, HFONT originalFont, const LOGFONTW& sourceLogfont) {
+    std::lock_guard<std::mutex> lock(g_miraiStableFontDataMutex);
+    for (const auto& item : g_miraiStableFontDataSources) {
+        if (item.hdc == hdc &&
+            item.originalFont == originalFont &&
+            SameSourceLogFont(item.sourceLogfont, sourceLogfont)) {
+            if (!item.replacementFont || GetObjectType(item.replacementFont) != OBJ_FONT)
+                return NULL;
+            return item.replacementFont;
+        }
+    }
+    return NULL;
+}
+
+static void MiraiRememberPinnedFontDataSource(HDC hdc, HFONT originalFont, const LOGFONTW& sourceLogfont,
+    HFONT replacementFont) {
+    if (!replacementFont) return;
+
+    std::wstring face = Config::ForcedFontNameW;
+    LONG version = Config::ConfigVersion;
+    {
+        std::lock_guard<std::mutex> lock(g_miraiStableFontDataMutex);
+        for (auto& item : g_miraiStableFontDataSources) {
+            if (item.hdc == hdc &&
+                item.originalFont == originalFont &&
+                SameSourceLogFont(item.sourceLogfont, sourceLogfont)) {
+                return;
+            }
+        }
+
+        if (g_miraiStableFontDataSources.size() >= 64) {
+            g_miraiStableFontDataSources.erase(g_miraiStableFontDataSources.begin());
+        }
+        g_miraiStableFontDataSources.push_back({
+            hdc,
+            originalFont,
+            sourceLogfont,
+            replacementFont,
+            version,
+            face
+            });
+    }
+
+    MiraiTraceLimited("pin-font-data-source hdc=%p original=%p replacement=%p version=%ld face='%s'",
+        hdc, originalFont, replacementFont, version, ArtemisWideToUtf8(face).c_str());
+}
+
+static HFONT MiraiGetPinnedOrCreateFontDataSource(HDC hdc, HFONT originalFont, const LOGFONTW& sourceLogfont) {
+    HFONT pinned = MiraiFindPinnedFontDataSource(hdc, originalFont, sourceLogfont);
+    if (pinned) return pinned;
+
+    HFONT replacementFont = GetOrCreateReplacementFont(originalFont, sourceLogfont);
+    if (!replacementFont) return NULL;
+
+    MiraiRememberPinnedFontDataSource(hdc, originalFont, sourceLogfont, replacementFont);
+    return replacementFont;
+}
+
+static bool MiraiTryGetPinnedFontData(HDC hdc, DWORD dwTable, DWORD dwOffset, PVOID pvBuffer,
+    DWORD cjBuffer, DWORD* result) {
+    if (!result || !Config::MiraiPinFontDataSource || !MiraiShouldReplaceFontDataQueries()) return false;
+
+    HFONT originalFont = NULL;
+    LOGFONTW sourceLogfont = {};
+    if (!MiraiResolveCurrentFontDataSource(hdc, &originalFont, &sourceLogfont)) return false;
+
+    HFONT replacementFont = MiraiGetPinnedOrCreateFontDataSource(hdc, originalFont, sourceLogfont);
+    if (!replacementFont) return false;
+
+    HFONT currentFont = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    HGDIOBJ oldFont = NULL;
+    if (currentFont != replacementFont) {
+        oldFont = orgSelectObject(hdc, replacementFont);
+    }
+
+    DWORD ret = orgGetFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer);
+    if (ret != GDI_ERROR && pvBuffer && cjBuffer > 0) {
+        DWORD bytesCopied = std::min<DWORD>(ret, cjBuffer);
+        if (dwTable == 0 && dwOffset == 0) {
+            if (Config::EnableCodepageSpoof) {
+                FontPatcher::PatchOS2CodePageRangeForCharset((BYTE*)pvBuffer, bytesCopied, Config::SpoofToCharset);
+            }
+            if (Config::EnableFontVerticalMetrics) {
+                int lineGap = Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0;
+                FontPatcher::PatchVerticalMetrics((BYTE*)pvBuffer, bytesCopied,
+                    Config::FontAscentPermille, Config::FontDescentPermille, lineGap);
+            }
+        } else {
+            PatchReturnedFontCodepageTable(dwTable, dwOffset, pvBuffer, bytesCopied);
+            PatchReturnedFontMetricTable(hdc, dwTable, dwOffset, pvBuffer, bytesCopied);
+        }
+    }
+
+    if (oldFont) {
+        orgSelectObject(hdc, oldFont);
+    }
+
+    *result = ret;
+    return true;
+}
+
+static void MiraiNotifyConfigChanged(LONG version) {
+    if (!Config::EnableMiraiHook || !MiraiLooksLikeEngineRoot()) return;
+
+    DWORD pinnedCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_miraiStableFontDataMutex);
+        pinnedCount = (DWORD)g_miraiStableFontDataSources.size();
+    }
+
+    Utils::Trace("[TRACE][Mirai] stable-font-data version=%ld font='%s' ansiFont='%s' pinnedSources=%lu",
+        version, ArtemisWideToUtf8(Config::ForcedFontNameW).c_str(), Config::ForcedFontNameA,
+        pinnedCount);
+}
+
+static std::wstring MiraiFindReplacementFontFile() {
+    if (!Config::EnableFontHook || !Config::EnableFaceNameReplace || !Config::ForcedFontNameW[0])
+        return L"";
+
+    LONG version = Config::ConfigVersion;
+    std::wstring face = Config::ForcedFontNameW;
+    {
+        std::lock_guard<std::mutex> lock(g_miraiFontSourceMutex);
+        if (g_miraiFontSourceVersion == version && g_miraiFontSourceFace == face)
+            return g_miraiFontSourcePath;
+    }
+
+    std::wstring source = ArtemisFindSystemFontFileByFace(Config::ForcedFontNameW);
+    if (source.empty()) source = ArtemisFindConfiguredLocalFontFile();
+
+    {
+        std::lock_guard<std::mutex> lock(g_miraiFontSourceMutex);
+        g_miraiFontSourceVersion = version;
+        g_miraiFontSourceFace = face;
+        g_miraiFontSourcePath = source;
+    }
+
+    if (!source.empty()) {
+        MiraiTraceLimited("replacement-font-file face='%s' source='%s'",
+            ArtemisWideToUtf8(face).c_str(), ArtemisWideToUtf8(source).c_str());
+    } else {
+        MiraiTraceLimited("replacement-font-file-missing face='%s'",
+            ArtemisWideToUtf8(face).c_str());
+    }
+    return source;
+}
+
+static bool MiraiIsFontExtension(const std::wstring& normalizedPath) {
+    return ArtemisHasExtension(normalizedPath, L".ttf") ||
+        ArtemisHasExtension(normalizedPath, L".ttc") ||
+        ArtemisHasExtension(normalizedPath, L".otf");
+}
+
+static bool MiraiIsWindowsFontPath(const std::wstring& fullPath) {
+    std::wstring fontsDir = ArtemisNormalizePath(ArtemisWindowsFontsDir());
+    std::wstring normalized = ArtemisNormalizePath(fullPath);
+    if (fontsDir.empty() || normalized.size() <= fontsDir.size()) return false;
+    if (normalized.compare(0, fontsDir.size(), fontsDir) != 0) return false;
+    if (normalized[fontsDir.size()] != L'\\') return false;
+    return MiraiIsFontExtension(normalized);
+}
+
+static bool MiraiIsReadOnlyOpen(DWORD desiredAccess, DWORD creationDisposition) {
+    if (creationDisposition != OPEN_EXISTING && creationDisposition != OPEN_ALWAYS) return false;
+    if ((desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0) return false;
+    return true;
+}
+
+static bool MiraiShouldRedirectFontFileW(const wchar_t* fileName, std::wstring* fullPathOut, std::wstring* sourceOut) {
+    if (!Config::EnableMiraiHook || !Config::MiraiRedirectFontFiles ||
+        !Config::EnableFontHook || !Config::EnableFaceNameReplace ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+    if (!MiraiLooksLikeEngineRoot()) return false;
+
+    std::wstring fullPath = ArtemisFullPath(fileName);
+    if (!MiraiIsWindowsFontPath(fullPath)) return false;
+
+    std::wstring source = MiraiFindReplacementFontFile();
+    if (source.empty()) return false;
+    if (ArtemisSameNormalizedPath(fullPath, source)) return false;
+
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (sourceOut) *sourceOut = source;
+    return true;
+}
+
+static HANDLE MiraiTryOpenRedirectedFontFileW(const wchar_t* fileName, DWORD desiredAccess, DWORD shareMode,
+    DWORD creationDisposition, DWORD flagsAndAttributes) {
+    if (!MiraiIsReadOnlyOpen(desiredAccess, creationDisposition)) return INVALID_HANDLE_VALUE;
+
+    std::wstring fullPath;
+    std::wstring source;
+    if (!MiraiShouldRedirectFontFileW(fileName, &fullPath, &source)) return INVALID_HANDLE_VALUE;
+
+    MiraiTraceLimited("font-file-redirect request='%s' source='%s'",
+        ArtemisWideToUtf8(fullPath).c_str(), ArtemisWideToUtf8(source).c_str());
+    return orgCreateFileW(source.c_str(), desiredAccess, shareMode, NULL, OPEN_EXISTING, flagsAndAttributes, NULL);
+}
+
+static bool MiraiTryGetRedirectedFontAttributesW(const wchar_t* fileName, WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    std::wstring fullPath;
+    std::wstring source;
+    if (!MiraiShouldRedirectFontFileW(fileName, &fullPath, &source)) return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA localData = {};
+    if (!orgGetFileAttributesExW(source.c_str(), GetFileExInfoStandard, &localData)) return false;
+    if (data) *data = localData;
+    if (attrs) *attrs = localData.dwFileAttributes;
+
+    MiraiTraceLimited("font-attrs-redirect request='%s' source='%s'",
+        ArtemisWideToUtf8(fullPath).c_str(), ArtemisWideToUtf8(source).c_str());
+    return true;
+}

@@ -1,0 +1,323 @@
+static BYTE GetGameCharset() {
+    if (Config::DetectedCharset != DEFAULT_CHARSET)
+        return (BYTE)Config::DetectedCharset;
+    return DEFAULT_CHARSET;
+}
+
+static int GetTextSubTop() { return TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT + SPOOF_HEIGHT; }
+static int GetListTop() { return GetTextSubTop() + TEXTSUB_HEIGHT; }
+static int GetMetricsTop() { return WINDOW_HEIGHT - PREVIEW_HEIGHT - METRICS_HEIGHT; }
+static int GetPreviewTop() { return WINDOW_HEIGHT - PREVIEW_HEIGHT; }
+static int GetListBottom() { return GetMetricsTop(); }
+
+static RECT MakeUiRect(int left, int top, int right, int bottom) {
+    RECT rc = { left, top, right, bottom };
+    return rc;
+}
+
+static RECT GetTitleAreaRect() { return MakeUiRect(0, 0, WINDOW_WIDTH, TITLE_HEIGHT); }
+static RECT GetCharsetAreaRect() {
+    return MakeUiRect(0, TITLE_HEIGHT + SEARCH_HEIGHT, WINDOW_WIDTH, TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT);
+}
+static RECT GetSpoofAreaRect() {
+    int top = TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT;
+    return MakeUiRect(0, top, WINDOW_WIDTH, top + SPOOF_HEIGHT);
+}
+static RECT GetTextSubAreaRect() {
+    int top = GetTextSubTop();
+    return MakeUiRect(0, top, WINDOW_WIDTH, top + TEXTSUB_HEIGHT);
+}
+static RECT GetListAreaRect() { return MakeUiRect(0, GetListTop(), WINDOW_WIDTH, GetListBottom()); }
+static RECT GetMetricsAreaRect() { return MakeUiRect(0, GetMetricsTop(), WINDOW_WIDTH, GetPreviewTop()); }
+static RECT GetPreviewAreaRect() { return MakeUiRect(0, GetPreviewTop(), WINDOW_WIDTH, WINDOW_HEIGHT); }
+static RECT GetScrollbarAreaRect() {
+    return MakeUiRect(WINDOW_WIDTH - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN - 4,
+        GetListTop(), WINDOW_WIDTH, GetListBottom());
+}
+
+static void InvalidateUiRect(HWND hWnd, RECT rc, int pad = 0) {
+    if (!hWnd) return;
+    if (pad > 0) InflateRect(&rc, pad, pad);
+    if (rc.left < 0) rc.left = 0;
+    if (rc.top < 0) rc.top = 0;
+    if (rc.right > WINDOW_WIDTH) rc.right = WINDOW_WIDTH;
+    if (rc.bottom > WINDOW_HEIGHT) rc.bottom = WINDOW_HEIGHT;
+    if (rc.left < rc.right && rc.top < rc.bottom)
+        InvalidateRect(hWnd, &rc, FALSE);
+}
+
+static void InvalidateListItem(HWND hWnd, int filteredIndex, int pad = 3) {
+    if (filteredIndex < 0) return;
+    int visibleRow = filteredIndex - g_scrollOffset;
+    if (visibleRow < -1 || visibleRow > VISIBLE_ITEMS) return;
+    int top = GetListTop() + visibleRow * ITEM_HEIGHT;
+    InvalidateUiRect(hWnd, MakeUiRect(0, top, WINDOW_WIDTH, top + ITEM_HEIGHT), pad);
+}
+
+static void InvalidateListRows(HWND hWnd, int a, int b) {
+    InvalidateListItem(hWnd, a);
+    if (b != a) InvalidateListItem(hWnd, b);
+}
+
+static void InvalidateListAndScrollbar(HWND hWnd) {
+    InvalidateUiRect(hWnd, GetListAreaRect(), 1);
+}
+
+static void InvalidateSelectionChange(HWND hWnd, int oldSelected, int oldScrollOffset) {
+    if (oldScrollOffset != g_scrollOffset) {
+        InvalidateListAndScrollbar(hWnd);
+    } else {
+        InvalidateListRows(hWnd, oldSelected, g_selectedIndex);
+    }
+    InvalidateUiRect(hWnd, GetPreviewAreaRect(), 1);
+}
+
+static void RecalcLayout() {
+    ITEM_HEIGHT = SF(56);
+    LIST_HEIGHT = GetListBottom() - GetListTop();
+    if (LIST_HEIGHT < 0) LIST_HEIGHT = 0;
+    VISIBLE_ITEMS = LIST_HEIGHT / ITEM_HEIGHT;
+    if (VISIBLE_ITEMS < 1) VISIBLE_ITEMS = 1;
+    // Reposition search edit and update its font
+    if (g_hSearchEdit) {
+        int editH = SF(20);
+        int editY = TITLE_HEIGHT + (SEARCH_HEIGHT - editH) / 2;
+        MoveWindow(g_hSearchEdit, 22, editY, WINDOW_WIDTH - 62, editH, TRUE);
+        if (g_editFont) DeleteObject(g_editFont);
+        g_editFont = CreateFontW(-SF(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        SendMessage(g_hSearchEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    }
+}
+
+static void FillRoundRect(HDC hdc, const RECT& rc, int r, COLORREF col) {
+    HBRUSH br = CreateSolidBrush(col);
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
+    SelectObject(hdc, oldBr);
+    SelectObject(hdc, oldPen);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+static void DrawRoundRectOutline(HDC hdc, const RECT& rc, int r, COLORREF col) {
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    HGDIOBJ oldBr = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
+    SelectObject(hdc, oldBr);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+static void GradientV(HDC hdc, const RECT& rc, COLORREF top, COLORREF bottom) {
+    TRIVERTEX v[2];
+    v[0].x = rc.left;  v[0].y = rc.top;
+    v[0].Red   = (COLOR16)(GetRValue(top) << 8);
+    v[0].Green = (COLOR16)(GetGValue(top) << 8);
+    v[0].Blue  = (COLOR16)(GetBValue(top) << 8);
+    v[0].Alpha = 0;
+    v[1].x = rc.right; v[1].y = rc.bottom;
+    v[1].Red   = (COLOR16)(GetRValue(bottom) << 8);
+    v[1].Green = (COLOR16)(GetGValue(bottom) << 8);
+    v[1].Blue  = (COLOR16)(GetBValue(bottom) << 8);
+    v[1].Alpha = 0;
+    GRADIENT_RECT gr = { 0, 1 };
+    GradientFill(hdc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V);
+}
+
+static bool PointInRect(int x, int y, const RECT& rc) {
+    return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom;
+}
+
+// Mix two colors: ratio 0.0 = a, 1.0 = b
+static COLORREF MixColor(COLORREF a, COLORREF b, float ratio) {
+    int r = (int)(GetRValue(a) * (1.f - ratio) + GetRValue(b) * ratio);
+    int g = (int)(GetGValue(a) * (1.f - ratio) + GetGValue(b) * ratio);
+    int bl = (int)(GetBValue(a) * (1.f - ratio) + GetBValue(b) * ratio);
+    return RGB(min(255, max(0, r)), min(255, max(0, g)), min(255, max(0, bl)));
+}
+
+// Scrollbar geometry.
+static void GetScrollbarRect(RECT* thumbRc, RECT* trackRc) {
+    int itemCount = (int)g_filteredIndices.size();
+    int listTop = GetListTop();
+    int listBot = GetListBottom();
+    int trackH = listBot - listTop;
+
+    int sbLeft = WINDOW_WIDTH - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN;
+    int sbRight = WINDOW_WIDTH - SCROLLBAR_MARGIN;
+
+    if (trackRc) {
+        trackRc->left = sbLeft;  trackRc->right = sbRight;
+        trackRc->top = listTop + 4; trackRc->bottom = listBot - 4;
+    }
+    if (thumbRc) {
+        if (itemCount <= VISIBLE_ITEMS) {
+            *thumbRc = { 0, 0, 0, 0 };
+            return;
+        }
+        int effTrackH = (listBot - 4) - (listTop + 4);
+        int calcH = effTrackH * VISIBLE_ITEMS / itemCount;
+        int thumbH = max(28, calcH);
+        int maxScroll = max(1, itemCount - VISIBLE_ITEMS);
+        int scrollRange = effTrackH - thumbH;
+        int thumbY = (listTop + 4) + scrollRange * g_scrollOffset / maxScroll;
+        thumbRc->left = sbLeft;  thumbRc->right = sbRight;
+        thumbRc->top = thumbY;   thumbRc->bottom = thumbY + thumbH;
+    }
+}
+
+// Charset bar geometry helper.
+// Returns the charset pill index at (x,y), or -1 if none.
+// Also computes total content width for scroll clamping.
+static int CharsetHitTest(int x, int y, int* outTotalWidth = nullptr) {
+    int csTop = TITLE_HEIGHT + SEARCH_HEIGHT;
+    int pillY = csTop + 6;
+    int pillH = CHARSET_HEIGHT - 12;
+    bool yInRange = (y >= pillY && y < pillY + pillH);
+
+    // We need an HDC to measure text
+    HDC hdc = GetDC(NULL);
+    HFONT csFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+    HGDIOBJ old = SelectObject(hdc, csFont);
+
+    int pillX = 8 - g_charsetScrollX;
+    int result = -1;
+    for (int i = 0; i < g_charsetCount; i++) {
+        SIZE sz;
+        GetTextExtentPoint32W(hdc, g_charsets[i].label, (int)wcslen(g_charsets[i].label), &sz);
+        int pillW = sz.cx + SF(16);
+        if (yInRange && x >= pillX && x < pillX + pillW) result = i;
+        pillX += pillW + 5;
+    }
+
+    if (outTotalWidth) *outTotalWidth = pillX + g_charsetScrollX;
+
+    SelectObject(hdc, old);
+    ReleaseDC(NULL, hdc);
+    return result;
+}
+
+// Spoof bar hit test: returns 0=toggle, 1=target charset, 2=mode, -1=none.
+static int SpoofBarHitTest(int x, int y) {
+    int spTop = TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT;
+    int py = spTop + (SPOOF_HEIGHT - 24) / 2;
+    if (y < py || y >= py + 24) return -1;
+
+    HDC hdc = GetDC(NULL);
+    HFONT spFontBold = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_BOLD, DEFAULT_CHARSET);
+    HFONT spFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+
+    int px = 10;
+    int result = -1;
+
+    // Toggle
+    {
+        HGDIOBJ old = SelectObject(hdc, spFontBold);
+        const wchar_t* label = g_spoofEnabled ? L"伪装: 开" : L"伪装: 关";  // 伪装: 开/关
+        SIZE sz; GetTextExtentPoint32W(hdc, label, (int)wcslen(label), &sz);
+        int bw = sz.cx + 16;
+        RECT r = { px, py, px + bw, py + 24 };
+        if (x >= r.left && x < r.right) result = 0;
+        px += bw + 8;
+        SelectObject(hdc, old);
+    }
+
+    // Target charset
+    {
+        HGDIOBJ old = SelectObject(hdc, spFont);
+        const wchar_t* charsetLabel = g_spoofCharsets[g_spoofCharsetIdx].shortLabel;
+        SIZE sz; GetTextExtentPoint32W(hdc, charsetLabel, (int)wcslen(charsetLabel), &sz);
+        int bw = sz.cx + 16;
+        RECT r = { px, py, px + bw, py + 24 };
+        if (result < 0 && x >= r.left && x < r.right) result = 1;
+        px += bw + 8;
+        SelectObject(hdc, old);
+    }
+
+    // Mode
+    {
+        HGDIOBJ old = SelectObject(hdc, spFont);
+        const wchar_t* modeLabel = g_spoofRuntimeReplaceEnabled ? L"\x66FF\x6362" : L"\x4EC5\x6807\x8BC6";
+        SIZE sz; GetTextExtentPoint32W(hdc, modeLabel, (int)wcslen(modeLabel), &sz);
+        int bw = sz.cx + 16;
+        RECT r = { px, py, px + bw, py + 24 };
+        if (result < 0 && x >= r.left && x < r.right) result = 2;
+        SelectObject(hdc, old);
+    }
+
+    ReleaseDC(NULL, hdc);
+    return result;
+}
+
+static int TextSubstitutionHitTest(int x, int y) {
+    int top = GetTextSubTop();
+    int py = top + (TEXTSUB_HEIGHT - 24) / 2;
+    if (y < py || y >= py + 24) return -1;
+
+    HDC hdc = GetDC(NULL);
+    HFONT fontBold = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_BOLD, DEFAULT_CHARSET);
+    HFONT font = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+    HGDIOBJ old = SelectObject(hdc, fontBold);
+
+    int px = 10;
+    int result = -1;
+    const wchar_t* toggleLabel = g_textSubstitutionEnabled ? L"\x6620\x5C04: \x5F00" : L"\x6620\x5C04: \x5173";
+    SIZE sz; GetTextExtentPoint32W(hdc, toggleLabel, (int)wcslen(toggleLabel), &sz);
+    RECT r = { px, py, px + sz.cx + 16, py + 24 };
+    if (x >= r.left && x < r.right) result = 0;
+    px = r.right + 8;
+
+    SelectObject(hdc, font);
+    const wchar_t* modeLabel = g_textSubstitutionModes[g_textSubstitutionModeIdx].label;
+    GetTextExtentPoint32W(hdc, modeLabel, (int)wcslen(modeLabel), &sz);
+    r = { px, py, px + sz.cx + 16, py + 24 };
+    if (result < 0 && x >= r.left && x < r.right) result = 1;
+    px = r.right + 8;
+
+    px = r.right + 10;
+
+    SelectObject(hdc, fontBold);
+    const wchar_t* redirectLabel = g_codepageRedirectEnabled ? L"\x8F6C\x7801: \x5F00" : L"\x8F6C\x7801: \x5173";
+    GetTextExtentPoint32W(hdc, redirectLabel, (int)wcslen(redirectLabel), &sz);
+    r = { px, py, px + sz.cx + 16, py + 24 };
+    if (result < 0 && x >= r.left && x < r.right) result = 2;
+    px = r.right + 8;
+
+    SelectObject(hdc, font);
+    const wchar_t* redirectPreset = g_codepageRedirectPresets[g_codepageRedirectPresetIdx].label;
+    GetTextExtentPoint32W(hdc, redirectPreset, (int)wcslen(redirectPreset), &sz);
+    r = { px, py, px + sz.cx + 16, py + 24 };
+    if (result < 0 && x >= r.left && x < r.right) result = 3;
+
+    SelectObject(hdc, old);
+    ReleaseDC(NULL, hdc);
+    return result;
+}
+
+struct MetricStepperRects {
+    RECT label;
+    RECT down;
+    RECT value;
+    RECT up;
+    int hitDown;
+    int hitUp;
+};
+
+struct MetricsRects {
+    MetricStepperRects width;
+    MetricStepperRects height;
+    MetricStepperRects spacing;
+    MetricStepperRects ascent;
+    MetricStepperRects descent;
+    MetricStepperRects line;
+    MetricStepperRects weight;
+    RECT referenceBtn;
+    RECT autoBtn;
+    RECT resetBtn;
+    RECT referenceInfo;
+};
+

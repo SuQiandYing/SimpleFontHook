@@ -1,0 +1,99 @@
+// GetTextFace hooks.
+// Some engines call GetTextFace to verify the current font. If the returned
+// name doesn't match what the engine expects, it may recreate the font or
+// skip rendering. We intercept and return our forced font name.
+int WINAPI newGetTextFaceA(HDC hdc, int c, LPSTR lpName) {
+    TraceApiHit(TRACE_GET_TEXT_FACE, "GetTextFaceA hdc=%p c=%d", hdc, c);
+    if (IsPickerThread() || !Config::EnableFontHook)
+        return orgGetTextFaceA(hdc, c, lpName);
+
+    char baseName[LF_FACESIZE] = {};
+    if (Config::EnableFaceNameReplace) {
+        strncpy_s(baseName, Config::ForcedFontNameA, _TRUNCATE);
+    } else {
+        int ret = orgGetTextFaceA(hdc, LF_FACESIZE, baseName);
+        if (ret <= 0) return ret;
+    }
+
+    char versionedName[LF_FACESIZE] = {};
+    AppendEpochSuffixA(baseName, versionedName, _countof(versionedName));
+
+    int needed = (int)strlen(versionedName) + 1;
+    if (lpName == NULL || c == 0) return needed;
+    strncpy_s(lpName, c, versionedName, _TRUNCATE);
+    return std::min(needed, c);
+}
+
+int WINAPI newGetTextFaceW(HDC hdc, int c, LPWSTR lpName) {
+    TraceApiHit(TRACE_GET_TEXT_FACE, "GetTextFaceW hdc=%p c=%d", hdc, c);
+    if (IsPickerThread() || !Config::EnableFontHook)
+        return orgGetTextFaceW(hdc, c, lpName);
+
+    wchar_t baseName[LF_FACESIZE] = {};
+    if (Config::EnableFaceNameReplace) {
+        wcsncpy_s(baseName, Config::ForcedFontNameW, _TRUNCATE);
+    } else {
+        int ret = orgGetTextFaceW(hdc, LF_FACESIZE, baseName);
+        if (ret <= 0) return ret;
+    }
+
+    wchar_t versionedName[LF_FACESIZE] = {};
+    AppendEpochSuffixW(baseName, versionedName, _countof(versionedName));
+
+    int needed = (int)wcslen(versionedName) + 1;
+    if (lpName == NULL || c == 0) return needed;
+    wcsncpy_s(lpName, c, versionedName, _TRUNCATE);
+    return std::min(needed, c);
+}
+
+// GetObject hooks.
+int WINAPI newGetObjectA(HANDLE h, int c, LPVOID pv) {
+    TraceApiHit(TRACE_GET_OBJECT, "GetObjectA handle=%p size=%d", h, c);
+    return orgGetObjectA(h, c, pv);
+}
+
+int WINAPI newGetObjectW(HANDLE h, int c, LPVOID pv) {
+    TraceApiHit(TRACE_GET_OBJECT, "GetObjectW handle=%p size=%d", h, c);
+    return orgGetObjectW(h, c, pv);
+}
+
+// GetTextMetrics hooks.
+// Some engines call GetTextMetrics to verify charset or measure text.
+// We replace the font in the DC before querying metrics, ensuring
+// the engine gets metrics for our replacement font.
+BOOL WINAPI newGetTextMetricsA(HDC hdc, LPTEXTMETRICA lptm) {
+    DEBUG_API_CONTEXT("GetTextMetricsA");
+    if (IsPickerThread()) return orgGetTextMetricsA(hdc, lptm);
+    TraceApiHit(TRACE_METRICS, "GetTextMetricsA hdc=%p", hdc);
+    DEBUG_GDI_ENTER("GetTextMetricsA", hdc, NULL);
+    BOOL ret = orgGetTextMetricsA(hdc, lptm);
+    DEBUG_GDI_EXIT("GetTextMetricsA", hdc, ret, NULL);
+    if (ret) PatchTextMetric(lptm);
+    return ret;
+}
+
+BOOL WINAPI newGetTextMetricsW(HDC hdc, LPTEXTMETRICW lptm) {
+    DEBUG_API_CONTEXT("GetTextMetricsW");
+    if (IsPickerThread()) return orgGetTextMetricsW(hdc, lptm);
+    TraceApiHit(TRACE_METRICS, "GetTextMetricsW hdc=%p", hdc);
+    DEBUG_GDI_ENTER("GetTextMetricsW", hdc, NULL);
+    BOOL ret = orgGetTextMetricsW(hdc, lptm);
+    DEBUG_GDI_EXIT("GetTextMetricsW", hdc, ret, NULL);
+    if (ret) PatchTextMetric(lptm);
+    return ret;
+}
+
+int WINAPI newGetTextCharset(HDC hdc) {
+    DEBUG_API_CONTEXT("GetTextCharset");
+    if (IsPickerThread()) return orgGetTextCharset(hdc);
+    int ret = orgGetTextCharset(hdc);
+    return (int)SpoofReportedCharsetB((BYTE)ret);
+}
+
+int WINAPI newGetTextCharsetInfo(HDC hdc, LPFONTSIGNATURE lpSig, DWORD dwFlags) {
+    DEBUG_API_CONTEXT("GetTextCharsetInfo");
+    if (IsPickerThread()) return orgGetTextCharsetInfo(hdc, lpSig, dwFlags);
+    int ret = orgGetTextCharsetInfo(hdc, lpSig, dwFlags);
+    PatchFontSignatureCodepage(lpSig);
+    return (int)SpoofReportedCharsetB((BYTE)ret);
+}

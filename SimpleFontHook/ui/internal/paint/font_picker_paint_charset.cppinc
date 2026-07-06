@@ -1,0 +1,63 @@
+static void PaintCharsetBar(HDC mem, const RECT& rc)
+{
+    // Charset selector bar.
+    {
+        int csTop = TITLE_HEIGHT + SEARCH_HEIGHT;
+        RECT csBg = { 0, csTop, rc.right, csTop + CHARSET_HEIGHT };
+        HBRUSH csBgBr = CreateSolidBrush(RGB(24, 18, 40));
+        FillRect(mem, &csBg, csBgBr);
+        DeleteObject(csBgBr);
+
+        // Bottom separator line
+        HPEN csSep = CreatePen(PS_SOLID, 1, COL_SEPARATOR);
+        HGDIOBJ oldCsSep = SelectObject(mem, csSep);
+        MoveToEx(mem, 0, csTop + CHARSET_HEIGHT - 1, NULL);
+        LineTo(mem, rc.right, csTop + CHARSET_HEIGHT - 1);
+        SelectObject(mem, oldCsSep);
+        DeleteObject(csSep);
+
+        int savedDc = SaveDC(mem);
+        HFONT csFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+        SelectObject(mem, csFont);
+
+        // Clip to charset bar area
+        HRGN clipRgn = CreateRectRgn(4, csTop, rc.right - 4, csTop + CHARSET_HEIGHT);
+        SelectClipRgn(mem, clipRgn);
+
+        int pillX = 8 - g_charsetScrollX;
+        int pillY = csTop + 6;
+        int pillH = CHARSET_HEIGHT - 12;
+
+        for (int i = 0; i < g_charsetCount; i++) {
+            SIZE sz;
+            GetTextExtentPoint32W(mem, g_charsets[i].label, (int)wcslen(g_charsets[i].label), &sz);
+            int pillW = sz.cx + SF(16);
+
+            if (pillX + pillW > 0 && pillX < rc.right) {
+                RECT pillRc = { pillX, pillY, pillX + pillW, pillY + pillH };
+                bool isSel = (i == g_selectedCharset);
+                bool isHov = (i == g_hoveredCharset);
+
+                if (isSel) {
+                    FillRoundRect(mem, pillRc, 10, COL_SELECTED_BG);
+                    DrawRoundRectOutline(mem, pillRc, 10, COL_ACCENT);
+                    SetTextColor(mem, COL_ACCENT);
+                } else if (isHov) {
+                    FillRoundRect(mem, pillRc, 10, COL_HOVER_BG);
+                    SetTextColor(mem, COL_TEXT);
+                } else {
+                    FillRoundRect(mem, pillRc, 10, RGB(32, 26, 50));
+                    SetTextColor(mem, COL_TEXT_DIM);
+                }
+                DrawTextW(mem, g_charsets[i].label, -1, &pillRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            pillX += pillW + 5;
+        }
+
+        // Restore clip region
+        DeleteObject(clipRgn);
+        RestoreDC(mem, savedDc);
+    }
+
+}

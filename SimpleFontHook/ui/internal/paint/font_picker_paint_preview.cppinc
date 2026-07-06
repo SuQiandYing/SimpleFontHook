@@ -1,0 +1,103 @@
+static void PaintPreviewPanel(HDC mem, const RECT& rc)
+{
+    // Preview panel.
+    int prevTop = GetPreviewTop();
+    RECT prevBg = { 0, prevTop, rc.right, rc.bottom };
+    GradientV(mem, prevBg, COL_PREVIEW_TOP, COL_PREVIEW_BOT);
+
+    // Dialogue box style border
+    {
+        RECT boxRc = { 10, prevTop + 10, rc.right - 10, rc.bottom - 10 };
+        DrawRoundRectOutline(mem, boxRc, 12, COL_BORDER);
+        // Inner thin line for dialogue box feel
+        RECT innerRc = { 12, prevTop + 12, rc.right - 12, rc.bottom - 12 };
+        DrawRoundRectOutline(mem, innerRc, 10, MixColor(COL_BORDER, COL_ACCENT, 0.2f));
+    }
+
+    // Top border + accent line
+    {
+        HPEN bp = CreatePen(PS_SOLID, 1, COL_BORDER);
+        HGDIOBJ op = SelectObject(mem, bp);
+        MoveToEx(mem, 0, prevTop, NULL); LineTo(mem, rc.right, prevTop);
+        SelectObject(mem, op); DeleteObject(bp);
+    }
+    {
+        HPEN ap = CreatePen(PS_SOLID, 1, MixColor(COL_ACCENT, COL_PREVIEW_TOP, 0.6f));
+        HGDIOBJ op = SelectObject(mem, ap);
+        MoveToEx(mem, 0, prevTop + 1, NULL); LineTo(mem, rc.right, prevTop + 1);
+        SelectObject(mem, op); DeleteObject(ap);
+    }
+
+    // Decorative sparkle in preview corner
+    DrawSparkle(mem, rc.right - 24, prevTop + 14, 3, MixColor(COL_ACCENT2, COL_PREVIEW_TOP, 0.5f));
+    DrawPetal(mem, rc.right - 42, prevTop + 20, 3, 4, MixColor(COL_ACCENT, COL_PREVIEW_TOP, 0.6f));
+    DrawPetal(mem, 24, rc.bottom - 20, 4, 5, COL_ACCENT3);
+
+    BYTE gameCs = GetGameCharset();
+    int itemCount = (int)g_filteredIndices.size();
+    if (g_selectedIndex >= 0 && g_selectedIndex < itemCount) {
+        const std::wstring& fontName = g_allFonts[g_filteredIndices[g_selectedIndex]].name;
+
+        // Full preview text
+        int previewHeight = SF(28);
+        if (Config::EnableFontHeightScale)
+            previewHeight = max(SF(12), (int)(previewHeight * Config::FontHeightScale + 0.5f));
+        int previewWidth = 0;
+        if (Config::EnableFontWidthScale)
+            previewWidth = max(1, (int)((previewHeight / 2.0f) * Config::FontWidthScale + 0.5f));
+        int previewWeight = Config::EnableFontWeight ? Config::FontWeight : FW_NORMAL;
+        HFONT prevFont = GetCachedPickerFont(fontName, previewHeight, previewWidth, previewWeight, gameCs);
+        HGDIOBJ oldPreviewFont = SelectObject(mem, prevFont);
+        int oldCharExtra = 0x80000000;
+        if (Config::EnableFontCharSpacing && Config::FontCharSpacing != 0)
+            oldCharExtra = SetTextCharacterExtra(mem, Config::FontCharSpacing);
+        SetTextColor(mem, COL_TEXT);
+        RECT contentRc = { 24, prevTop + 24, rc.right - 24, rc.bottom - 32 };
+        TEXTMETRICW previewTm = {};
+        GetTextMetricsW(mem, &previewTm);
+        int previewLineStep = max(1, (int)(previewTm.tmHeight + previewTm.tmExternalLeading));
+        if (Config::EnableFontLineSpacing && Config::FontLineSpacing != 0)
+            previewLineStep = max(1, (int)previewTm.tmHeight + Config::FontLineSpacing);
+        const wchar_t* previewLines[] = {
+            L"\x300c\x6d4b\x8bd5\x6587\x5b57 Sample Text\x300d",
+            L"\x3042\x3044\x3046\x3048\x304a 0123456789"
+        };
+        int lineY = contentRc.top;
+        for (int i = 0; i < 2 && lineY < contentRc.bottom; ++i) {
+            TextOutW(mem, contentRc.left, lineY, previewLines[i], lstrlenW(previewLines[i]));
+            lineY += previewLineStep;
+        }
+        if (oldCharExtra != 0x80000000 && oldCharExtra != 0x7FFFFFFF)
+            SetTextCharacterExtra(mem, oldCharExtra);
+        SelectObject(mem, oldPreviewFont);
+
+        // Bottom info line
+        HFONT infoFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+        HGDIOBJ oldInfoFont = SelectObject(mem, infoFont);
+
+        SetTextColor(mem, COL_TEXT_HINT);
+        RECT infoRc = { 18, rc.bottom - 22, rc.right / 2 + 60, rc.bottom - 4 };
+        wchar_t infoBuf[256];
+        
+        // Map detected charset to name
+        const wchar_t* detName = L"未知"; // 未知
+        for(int i=0; i<g_charsetCount; i++) {
+            if(g_charsets[i].value == Config::DetectedCharset) {
+                detName = g_charsets[i].label;
+                break;
+            }
+        }
+
+        wsprintfW(infoBuf, L"游戏: %s (%d)  |  选择: %s (%d)  |  %d/%d", 
+            detName, (int)Config::DetectedCharset,
+            g_charsets[g_selectedCharset].label, (int)g_charsets[g_selectedCharset].value,
+            g_selectedIndex + 1, itemCount); // 游戏: ... | 选择: ...
+        DrawTextW(mem, infoBuf, -1, &infoRc, DT_LEFT | DT_SINGLELINE);
+
+        SetTextColor(mem, RGB(80, 62, 110));
+        RECT hintRc = { rc.right / 2 + 60, rc.bottom - 22, rc.right - 14, rc.bottom - 4 };
+        DrawTextW(mem, L"Enter=应用  Esc=隐藏", -1, &hintRc, DT_RIGHT | DT_SINGLELINE);
+        SelectObject(mem, oldInfoFont);
+    }
+
+}

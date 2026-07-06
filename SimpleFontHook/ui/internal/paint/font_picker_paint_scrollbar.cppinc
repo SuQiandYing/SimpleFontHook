@@ -1,0 +1,19 @@
+static void PaintScrollbar(HDC mem)
+{
+    int itemCount = (int)g_filteredIndices.size();
+    // Scrollbar.
+    if (itemCount > VISIBLE_ITEMS) {
+        RECT thumbRc, trackRc;
+        GetScrollbarRect(&thumbRc, &trackRc);
+
+        // Track
+        FillRoundRect(mem, trackRc, 4, COL_SB_TRACK);
+
+        // Thumb
+        COLORREF thumbCol = COL_SB_THUMB;
+        if (g_scrollbarDragging) thumbCol = COL_SB_THUMB_DRG;
+        else if (g_scrollbarHovered) thumbCol = COL_SB_THUMB_HOV;
+        FillRoundRect(mem, thumbRc, 4, thumbCol);
+    }
+
+}

@@ -1,0 +1,316 @@
+// Glyph and width supplement hooks.
+BOOL WINAPI newGetCharWidthFloatA(HDC hdc, UINT iFirst, UINT iLast, PFLOAT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidthFloatA");
+    TraceApiHit(TRACE_METRICS, "GetCharWidthFloatA hdc=%p range=%u-%u", hdc, iFirst, iLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidthFloatA", hdc, hNew);
+    BOOL ret = orgGetCharWidthFloatA(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidthFloatA", hdc, ret, hNew);
+    if (ret && lpBuffer && HasFontCharSpacing() && iLast >= iFirst) {
+        for (UINT i = 0; i <= iLast - iFirst; ++i) lpBuffer[i] += (FLOAT)Config::FontCharSpacing;
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidthFloatW(HDC hdc, UINT iFirst, UINT iLast, PFLOAT lpBuffer) {
+    DEBUG_API_CONTEXT("GetCharWidthFloatW");
+    TraceApiHit(TRACE_METRICS, "GetCharWidthFloatW hdc=%p range=%u-%u", hdc, iFirst, iLast);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharWidthFloatW", hdc, hNew);
+    BOOL ret = orgGetCharWidthFloatW(hdc, iFirst, iLast, lpBuffer);
+    DEBUG_GDI_EXIT("GetCharWidthFloatW", hdc, ret, hNew);
+    if (ret && lpBuffer && HasFontCharSpacing() && iLast >= iFirst) {
+        for (UINT i = 0; i <= iLast - iFirst; ++i) lpBuffer[i] += (FLOAT)Config::FontCharSpacing;
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharWidthI(HDC hdc, UINT giFirst, UINT cgi, LPWORD pgi, LPINT piWidths) {
+    DEBUG_API_CONTEXT("GetCharWidthI");
+    TraceApiHit(TRACE_METRICS, "GetCharWidthI hdc=%p first=%u count=%u glyphArray=%d", hdc, giFirst, cgi, pgi ? 1 : 0);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<WORD> translated;
+    LPWORD queryGlyphs = pgi;
+    UINT queryFirst = giFirst;
+    if (pgi && cgi > 0) {
+        TranslateGlyphIndexArray(hdc, pgi, (int)cgi, translated);
+        queryGlyphs = translated.empty() ? pgi : translated.data();
+    } else if (giFirst <= 0xFFFF) {
+        HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+        queryFirst = TranslateVirtualGlyphIndex(font, (WORD)giFirst);
+    }
+    DEBUG_GDI_ENTER("GetCharWidthI", hdc, hNew);
+    BOOL ret = orgGetCharWidthI(hdc, queryFirst, cgi, queryGlyphs, piWidths);
+    DEBUG_GDI_EXIT("GetCharWidthI", hdc, ret, hNew);
+    if (ret) AdjustWidthArray(piWidths, cgi);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetCharABCWidthsI(HDC hdc, UINT giFirst, UINT cgi, LPWORD pgi, LPABC lpabc) {
+    DEBUG_API_CONTEXT("GetCharABCWidthsI");
+    TraceApiHit(TRACE_METRICS, "GetCharABCWidthsI hdc=%p first=%u count=%u glyphArray=%d", hdc, giFirst, cgi, pgi ? 1 : 0);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<WORD> translated;
+    LPWORD queryGlyphs = pgi;
+    UINT queryFirst = giFirst;
+    if (pgi && cgi > 0) {
+        TranslateGlyphIndexArray(hdc, pgi, (int)cgi, translated);
+        queryGlyphs = translated.empty() ? pgi : translated.data();
+    } else if (giFirst <= 0xFFFF) {
+        HFONT font = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+        queryFirst = TranslateVirtualGlyphIndex(font, (WORD)giFirst);
+    }
+    DEBUG_GDI_ENTER("GetCharABCWidthsI", hdc, hNew);
+    BOOL ret = orgGetCharABCWidthsI(hdc, queryFirst, cgi, queryGlyphs, lpabc);
+    DEBUG_GDI_EXIT("GetCharABCWidthsI", hdc, ret, hNew);
+    if (ret) AdjustAbcArray(lpabc, cgi);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetCharacterPlacementA(HDC hdc, LPCSTR lpString, int nCount, int nMexExtent, LPGCP_RESULTSA lpResults, DWORD dwFlags) {
+    DEBUG_API_CONTEXT("GetCharacterPlacementA");
+    TraceApiHit(TRACE_GLYPH_INDICES, "GetCharacterPlacementA hdc=%p count=%d flags=0x%lX", hdc, nCount, dwFlags);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharacterPlacementA", hdc, hNew);
+    DWORD ret = orgGetCharacterPlacementA(hdc, lpString, nCount, nMexExtent, lpResults, dwFlags);
+    DEBUG_GDI_EXIT("GetCharacterPlacementA", hdc, ret, hNew);
+    if (ret != GDI_ERROR && lpResults && lpResults->lpGlyphs && (dwFlags & GCP_GLYPHSHAPE)) {
+        int count = lpResults->nGlyphs > 0 ? (int)lpResults->nGlyphs : nCount;
+        VirtualizeGlyphIndices(hdc, (LPWORD)lpResults->lpGlyphs, count);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetCharacterPlacementW(HDC hdc, LPCWSTR lpString, int nCount, int nMexExtent, LPGCP_RESULTSW lpResults, DWORD dwFlags) {
+    DEBUG_API_CONTEXT("GetCharacterPlacementW");
+    TraceApiHit(TRACE_GLYPH_INDICES, "GetCharacterPlacementW hdc=%p count=%d flags=0x%lX", hdc, nCount, dwFlags);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetCharacterPlacementW", hdc, hNew);
+    DWORD ret = orgGetCharacterPlacementW(hdc, lpString, nCount, nMexExtent, lpResults, dwFlags);
+    DEBUG_GDI_EXIT("GetCharacterPlacementW", hdc, ret, hNew);
+    if (ret != GDI_ERROR && lpResults && lpResults->lpGlyphs && (dwFlags & GCP_GLYPHSHAPE)) {
+        int count = lpResults->nGlyphs > 0 ? (int)lpResults->nGlyphs : nCount;
+        VirtualizeGlyphIndices(hdc, (LPWORD)lpResults->lpGlyphs, count);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetKerningPairsA(HDC hdc, DWORD nPairs, LPKERNINGPAIR lpKernPair) {
+    DEBUG_API_CONTEXT("GetKerningPairsA");
+    TraceApiHit(TRACE_METRICS, "GetKerningPairsA hdc=%p pairs=%lu", hdc, nPairs);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetKerningPairsA", hdc, hNew);
+    DWORD ret = orgGetKerningPairsA(hdc, nPairs, lpKernPair);
+    DEBUG_GDI_EXIT("GetKerningPairsA", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetKerningPairsW(HDC hdc, DWORD nPairs, LPKERNINGPAIR lpKernPair) {
+    DEBUG_API_CONTEXT("GetKerningPairsW");
+    TraceApiHit(TRACE_METRICS, "GetKerningPairsW hdc=%p pairs=%lu", hdc, nPairs);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetKerningPairsW", hdc, hNew);
+    DWORD ret = orgGetKerningPairsW(hdc, nPairs, lpKernPair);
+    DEBUG_GDI_EXIT("GetKerningPairsW", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetGlyphIndicesA(HDC hdc, LPCSTR lpstr, int c, LPWORD pgi, DWORD fl) {
+    DEBUG_API_CONTEXT("GetGlyphIndicesA");
+    TraceApiHit(TRACE_GLYPH_INDICES, "GetGlyphIndicesA hdc=%p count=%d flags=0x%lX", hdc, c, fl);
+    std::wstring subTextW;
+    int useCount = c;
+    bool useWide = SubstituteTextAToWide(lpstr, c, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetGlyphIndicesA", hdc, hNew);
+    DWORD ret = useWide
+        ? orgGetGlyphIndicesW(hdc, subTextW.c_str(), useCount, pgi, fl)
+        : orgGetGlyphIndicesA(hdc, lpstr, c, pgi, fl);
+    DEBUG_GDI_EXIT("GetGlyphIndicesA", hdc, ret, hNew);
+    if (ret != GDI_ERROR && pgi && useCount > 0) {
+        VirtualizeGlyphIndices(hdc, pgi, useCount);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetGlyphIndicesW(HDC hdc, LPCWSTR lpstr, int c, LPWORD pgi, DWORD fl) {
+    DEBUG_API_CONTEXT("GetGlyphIndicesW");
+    TraceApiHit(TRACE_GLYPH_INDICES, "GetGlyphIndicesW hdc=%p count=%d flags=0x%lX", hdc, c, fl);
+    std::wstring subText;
+    int useCount = c;
+    LPCWSTR useText = lpstr;
+    if (SubstituteTextW(lpstr, c, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetGlyphIndicesW", hdc, hNew);
+    DWORD ret = orgGetGlyphIndicesW(hdc, useText, useCount, pgi, fl);
+    DEBUG_GDI_EXIT("GetGlyphIndicesW", hdc, ret, hNew);
+    if (ret != GDI_ERROR && pgi && useCount > 0) {
+        VirtualizeGlyphIndices(hdc, pgi, useCount);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+// Font info supplement hooks.
+UINT WINAPI newGetOutlineTextMetricsA(HDC hdc, UINT cbData, LPOUTLINETEXTMETRICA lpOTM) {
+    DEBUG_API_CONTEXT("GetOutlineTextMetricsA");
+    if (IsPickerThread()) return orgGetOutlineTextMetricsA(hdc, cbData, lpOTM);
+    TraceApiHit(TRACE_METRICS, "GetOutlineTextMetricsA hdc=%p size=%u", hdc, cbData);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetOutlineTextMetricsA", hdc, hNew);
+    UINT ret = orgGetOutlineTextMetricsA(hdc, cbData, lpOTM);
+    DEBUG_GDI_EXIT("GetOutlineTextMetricsA", hdc, ret, hNew);
+    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICA)) PatchOutlineTextMetric(lpOTM);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+UINT WINAPI newGetOutlineTextMetricsW(HDC hdc, UINT cbData, LPOUTLINETEXTMETRICW lpOTM) {
+    DEBUG_API_CONTEXT("GetOutlineTextMetricsW");
+    if (IsPickerThread()) return orgGetOutlineTextMetricsW(hdc, cbData, lpOTM);
+    TraceApiHit(TRACE_METRICS, "GetOutlineTextMetricsW hdc=%p size=%u", hdc, cbData);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetOutlineTextMetricsW", hdc, hNew);
+    UINT ret = orgGetOutlineTextMetricsW(hdc, cbData, lpOTM);
+    DEBUG_GDI_EXIT("GetOutlineTextMetricsW", hdc, ret, hNew);
+    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICW)) PatchOutlineTextMetric(lpOTM);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentPointA(HDC hdc, LPCSTR lpString, int c, LPSIZE lpsz) {
+    DEBUG_API_CONTEXT("GetTextExtentPointA");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentPointA hdc=%p count=%d", hdc, c);
+    std::wstring subTextW;
+    int useCount = c;
+    bool useWide = SubstituteTextAToWide(lpString, c, subTextW, &useCount);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentPointA", hdc, hNew);
+    BOOL ret = useWide
+        ? orgGetTextExtentPointW(hdc, subTextW.c_str(), useCount, lpsz)
+        : orgGetTextExtentPointA(hdc, lpString, c, lpsz);
+    DEBUG_GDI_EXIT("GetTextExtentPointA", hdc, ret, hNew);
+    if (ret) AdjustTextExtentSize(hdc, lpsz, useCount);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentPointW(HDC hdc, LPCWSTR lpString, int c, LPSIZE lpsz) {
+    DEBUG_API_CONTEXT("GetTextExtentPointW");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentPointW hdc=%p count=%d", hdc, c);
+    std::wstring subText;
+    int useCount = c;
+    LPCWSTR useText = lpString;
+    if (SubstituteTextW(lpString, c, subText, &useCount)) useText = subText.c_str();
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetTextExtentPointW", hdc, hNew);
+    BOOL ret = orgGetTextExtentPointW(hdc, useText, useCount, lpsz);
+    DEBUG_GDI_EXIT("GetTextExtentPointW", hdc, ret, hNew);
+    if (ret) AdjustTextExtentSize(hdc, lpsz, useCount);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentPointI(HDC hdc, LPWORD pgiIn, int cgi, LPSIZE pSize) {
+    DEBUG_API_CONTEXT("GetTextExtentPointI");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentPointI hdc=%p count=%d", hdc, cgi);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<WORD> translated;
+    LPWORD queryGlyphs = pgiIn;
+    if (pgiIn && cgi > 0) {
+        TranslateGlyphIndexArray(hdc, pgiIn, cgi, translated);
+        queryGlyphs = translated.empty() ? pgiIn : translated.data();
+    }
+    DEBUG_GDI_ENTER("GetTextExtentPointI", hdc, hNew);
+    BOOL ret = orgGetTextExtentPointI(hdc, queryGlyphs, cgi, pSize);
+    DEBUG_GDI_EXIT("GetTextExtentPointI", hdc, ret, hNew);
+    if (ret) AdjustTextExtentSize(hdc, pSize, cgi);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+BOOL WINAPI newGetTextExtentExPointI(HDC hdc, LPWORD lpwszString, int cwchString, int nMaxExtent, LPINT lpnFit, LPINT lpnDx, LPSIZE lpSize) {
+    DEBUG_API_CONTEXT("GetTextExtentExPointI");
+    TraceApiHit(TRACE_METRICS, "GetTextExtentExPointI hdc=%p count=%d max=%d", hdc, cwchString, nMaxExtent);
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    std::vector<WORD> translated;
+    LPWORD queryGlyphs = lpwszString;
+    if (lpwszString && cwchString > 0) {
+        TranslateGlyphIndexArray(hdc, lpwszString, cwchString, translated);
+        queryGlyphs = translated.empty() ? lpwszString : translated.data();
+    }
+    DEBUG_GDI_ENTER("GetTextExtentExPointI", hdc, hNew);
+    BOOL ret = orgGetTextExtentExPointI(hdc, queryGlyphs, cwchString, nMaxExtent, lpnFit, lpnDx, lpSize);
+    DEBUG_GDI_EXIT("GetTextExtentExPointI", hdc, ret, hNew);
+    if (ret) {
+        AdjustTextExtentSize(hdc, lpSize, cwchString);
+        AdjustPartialExtents(lpnDx, cwchString);
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetFontData(HDC hdc, DWORD dwTable, DWORD dwOffset, PVOID pvBuffer, DWORD cjBuffer) {
+    DEBUG_API_CONTEXT("GetFontData");
+    if (IsPickerThread()) return orgGetFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer);
+    TraceApiHit(TRACE_METRICS, "GetFontData hdc=%p table=0x%08lX offset=%lu bytes=%lu",
+        hdc, dwTable, dwOffset, cjBuffer);
+    DWORD miraiRet = GDI_ERROR;
+    if (MiraiTryGetPinnedFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer, &miraiRet)) {
+        return miraiRet;
+    }
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetFontData", hdc, hNew);
+    DWORD ret = orgGetFontData(hdc, dwTable, dwOffset, pvBuffer, cjBuffer);
+    DEBUG_GDI_EXIT("GetFontData", hdc, ret, hNew);
+    if (ret != GDI_ERROR && pvBuffer && cjBuffer > 0) {
+        DWORD bytesCopied = std::min<DWORD>(ret, cjBuffer);
+        if (dwTable == 0 && dwOffset == 0) {
+            if (Config::EnableCodepageSpoof) {
+                FontPatcher::PatchOS2CodePageRangeForCharset((BYTE*)pvBuffer, bytesCopied, Config::SpoofToCharset);
+            }
+            if (Config::EnableFontVerticalMetrics) {
+                int lineGap = Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0;
+                FontPatcher::PatchVerticalMetrics((BYTE*)pvBuffer, bytesCopied,
+                    Config::FontAscentPermille, Config::FontDescentPermille, lineGap);
+            }
+        } else {
+            PatchReturnedFontCodepageTable(dwTable, dwOffset, pvBuffer, bytesCopied);
+            PatchReturnedFontMetricTable(hdc, dwTable, dwOffset, pvBuffer, bytesCopied);
+        }
+    }
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetFontLanguageInfo(HDC hdc) {
+    DEBUG_API_CONTEXT("GetFontLanguageInfo");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetFontLanguageInfo", hdc, hNew);
+    DWORD ret = orgGetFontLanguageInfo(hdc);
+    DEBUG_GDI_EXIT("GetFontLanguageInfo", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+DWORD WINAPI newGetFontUnicodeRanges(HDC hdc, LPGLYPHSET lpgs) {
+    DEBUG_API_CONTEXT("GetFontUnicodeRanges");
+    HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
+    DEBUG_GDI_ENTER("GetFontUnicodeRanges", hdc, hNew);
+    DWORD ret = orgGetFontUnicodeRanges(hdc, lpgs);
+    DEBUG_GDI_EXIT("GetFontUnicodeRanges", hdc, ret, hNew);
+    RestoreHdcFont(hdc, hOld, hNew);
+    return ret;
+}
+
+
+

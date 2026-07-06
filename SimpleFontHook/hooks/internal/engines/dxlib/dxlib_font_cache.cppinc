@@ -1,0 +1,278 @@
+// DxLib font hook support.
+//
+// Do not create SFH MED variants here.
+//
+// injuugiga uses _FONTSET.MED as a prerendered bitmap font cache. Hiding it or
+// redirecting writes can make DxLib rebuild a large MED file and may also leave
+// extra cache files in the game directory. The user explicitly does not want
+// SFH-created MED variants, so this module only lets the game rebuild the
+// original root _FONTSET.MED when the selected font no longer matches the cache.
+//
+// The remaining DxLib-specific behavior is limited to:
+//   - engine detection, so generic GetFontData/GDI hooks know this is DxLib;
+//   - one-shot root _FONTSET.MED rebuild when DxLibDisableFontCache=1 and the
+//     cached face differs from the selected face;
+//   - optional debug logging of config changes.
+//
+// This deliberately persists the rebuilt cache as the original _FONTSET.MED, so
+// the next launch can be fast without generating _FONTSET.SFH.*.MED files.
+
+static int g_dxlibEngineProbe = -1;
+static volatile LONG g_dxlibTraceCount = 0;
+static volatile LONG g_dxlibLastNotifyVersion = LONG_MIN;
+
+static bool DxLibLooksLikeEngineRoot();
+
+static std::wstring DxLibGetGameRoot() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    PathRemoveFileSpecW(path);
+    return path;
+}
+
+static std::string DxLibWideToUtf8(const std::wstring& text) {
+    if (text.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::vector<char> buffer(len);
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, buffer.data(), len, NULL, NULL);
+    return std::string(buffer.data());
+}
+
+static std::wstring DxLibFullPath(const wchar_t* fileName) {
+    if (!fileName || !fileName[0]) return L"";
+
+    wchar_t combined[MAX_PATH] = {};
+    if (PathIsRelativeW(fileName)) {
+        wcscpy_s(combined, DxLibGetGameRoot().c_str());
+        PathAppendW(combined, fileName);
+        fileName = combined;
+    }
+
+    wchar_t full[MAX_PATH] = {};
+    DWORD len = GetFullPathNameW(fileName, MAX_PATH, full, NULL);
+    if (len == 0 || len >= MAX_PATH) return L"";
+
+    wchar_t canonical[MAX_PATH] = {};
+    if (PathCanonicalizeW(canonical, full)) return canonical;
+    return full;
+}
+
+static bool DxLibSamePath(const std::wstring& a, const std::wstring& b) {
+    if (a.empty() || b.empty()) return false;
+    return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+static bool DxLibSameFace(const wchar_t* a, const wchar_t* b) {
+    if (!a || !b || !a[0] || !b[0]) return false;
+    return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
+}
+
+static bool DxLibFontCacheMatchesCurrentFace() {
+    return DxLibSameFace(Config::DxLibCachedFontNameW, Config::ForcedFontNameW);
+}
+
+static bool DxLibIsReadOnlyOpen(DWORD desiredAccess, DWORD creationDisposition) {
+    if (creationDisposition != OPEN_EXISTING && creationDisposition != OPEN_ALWAYS) return false;
+    if ((desiredAccess & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+        FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA)) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool DxLibIsFontCachePathW(const wchar_t* fileName, bool allowWildcard, std::wstring* fullPathOut = NULL) {
+    std::wstring fullPath = DxLibFullPath(fileName);
+    if (fullPath.empty()) return false;
+
+    std::wstring rootFontCache = DxLibGetGameRoot();
+    wchar_t rootFile[MAX_PATH] = {};
+    wcscpy_s(rootFile, rootFontCache.c_str());
+    PathAppendW(rootFile, L"_FONTSET.MED");
+    rootFontCache = DxLibFullPath(rootFile);
+
+    bool match = DxLibSamePath(fullPath, rootFontCache);
+    if (!match && allowWildcard) {
+        const wchar_t* leaf = PathFindFileNameW(fileName ? fileName : L"");
+        match = leaf &&
+            (CompareStringOrdinal(leaf, -1, L"_FONTSET.MED", -1, TRUE) == CSTR_EQUAL ||
+                CompareStringOrdinal(leaf, -1, L"_FONTSET.*", -1, TRUE) == CSTR_EQUAL);
+    }
+
+    if (!match) return false;
+    if (fullPathOut) *fullPathOut = fullPath;
+    return true;
+}
+
+static bool DxLibShouldBypassFontCacheW(const wchar_t* fileName, bool allowWildcard,
+    std::wstring* fullPathOut = NULL) {
+    if (!Config::EnableDxLibHook || !Config::DxLibDisableFontCache ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+    if (DxLibFontCacheMatchesCurrentFace()) return false;
+    if (!DxLibIsFontCachePathW(fileName, allowWildcard, fullPathOut)) return false;
+    return DxLibLooksLikeEngineRoot();
+}
+
+static void DxLibTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_dxlibTraceCount);
+    if (hit > 128) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][DxLib] %s", message);
+}
+
+static bool DxLibFindFirstFileInRoot(const wchar_t* pattern) {
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, DxLibGetGameRoot().c_str());
+    PathAppendW(search, pattern);
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = orgFindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+    FindClose(hFind);
+    return true;
+}
+
+static bool DxLibBufferContainsAscii(const std::vector<BYTE>& bytes, const char* needle) {
+    if (!needle || !needle[0]) return false;
+    size_t needleLen = strlen(needle);
+    if (bytes.size() < needleLen) return false;
+
+    for (size_t i = 0; i <= bytes.size() - needleLen; ++i) {
+        if (memcmp(bytes.data() + i, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
+
+static bool DxLibMainModuleHasMarkers() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (!exePath[0]) return false;
+
+    HANDLE hFile = orgCreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 64 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    std::vector<BYTE> bytes((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size()) return false;
+
+    bool hasDxLib = DxLibBufferContainsAscii(bytes, "DxLib");
+    bool hasFontPath =
+        DxLibBufferContainsAscii(bytes, "_FONTSET") ||
+        DxLibBufferContainsAscii(bytes, "FONTSET") ||
+        DxLibBufferContainsAscii(bytes, "GetGlyphOutlineA") ||
+        DxLibBufferContainsAscii(bytes, "CreateFontToHandle");
+    return hasDxLib && hasFontPath;
+}
+
+static bool DxLibLooksLikeEngineRoot() {
+    if (g_dxlibEngineProbe != -1) return g_dxlibEngineProbe != 0;
+
+    bool hasFontSet = DxLibFindFirstFileInRoot(L"_FONTSET.MED");
+    bool hasConfig = DxLibFindFirstFileInRoot(L"_CONFIG.MED");
+    bool hasMedArchives = DxLibFindFirstFileInRoot(L"*.med") || DxLibFindFirstFileInRoot(L"*.MED");
+    bool hasMarkers = DxLibMainModuleHasMarkers();
+    bool isDxLib = hasMarkers && (hasFontSet || (hasConfig && hasMedArchives));
+    g_dxlibEngineProbe = isDxLib ? 1 : 0;
+
+    DxLibTraceLimited("engine-probe result=%d fontset=%d config=%d med=%d markers=%d",
+        isDxLib ? 1 : 0, hasFontSet ? 1 : 0, hasConfig ? 1 : 0,
+        hasMedArchives ? 1 : 0, hasMarkers ? 1 : 0);
+    return isDxLib;
+}
+
+static bool DxLibShouldReplaceFontDataQueries() {
+    return Config::EnableDxLibHook &&
+        Config::DxLibReplaceFontDataQueries &&
+        Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        !IsPickerThread() &&
+        DxLibLooksLikeEngineRoot();
+}
+
+static bool DxLibTryOpenFontCacheW(const wchar_t* fileName, DWORD desiredAccess,
+    DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile,
+    HANDLE* outHandle) {
+    if (outHandle) *outHandle = INVALID_HANDLE_VALUE;
+
+    std::wstring fullPath;
+    if (!DxLibShouldBypassFontCacheW(fileName, false, &fullPath)) return false;
+
+    if (DxLibIsReadOnlyOpen(desiredAccess, creationDisposition)) {
+        DxLibTraceLimited("hide-font-cache-read request='%s' access=0x%08lX disposition=%lu",
+            DxLibWideToUtf8(fullPath).c_str(), desiredAccess, creationDisposition);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return true;
+    }
+
+    HANDLE hCache = orgCreateFileW(fullPath.c_str(), desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes, templateFile);
+    DWORD openError = GetLastError();
+    if (hCache != INVALID_HANDLE_VALUE) {
+        wcsncpy_s(Config::DxLibCachedFontNameW, Config::ForcedFontNameW, LF_FACESIZE - 1);
+        DxLibTraceLimited("allow-font-cache-write-original request='%s' access=0x%08lX disposition=%lu cachedFace='%s'",
+            DxLibWideToUtf8(fullPath).c_str(), desiredAccess, creationDisposition,
+            DxLibWideToUtf8(Config::DxLibCachedFontNameW).c_str());
+        Utils::SaveConfig(g_hModule);
+        if (outHandle) *outHandle = hCache;
+        return true;
+    }
+
+    DxLibTraceLimited("font-cache-write-original-failed request='%s' access=0x%08lX disposition=%lu err=%lu",
+        DxLibWideToUtf8(fullPath).c_str(), desiredAccess, creationDisposition, openError);
+    SetLastError(openError);
+    return true;
+}
+
+static bool DxLibTryGetFontCacheAttributesW(const wchar_t* fileName,
+    WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    std::wstring fullPath;
+    if (!DxLibShouldBypassFontCacheW(fileName, false, &fullPath)) return false;
+
+    DxLibTraceLimited("hide-font-cache-attrs request='%s'",
+        DxLibWideToUtf8(fullPath).c_str());
+    if (data) ZeroMemory(data, sizeof(*data));
+    if (attrs) *attrs = INVALID_FILE_ATTRIBUTES;
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    return true;
+}
+
+static bool DxLibShouldHideFontCacheSearchW(const wchar_t* fileName) {
+    std::wstring fullPath;
+    bool hide = DxLibShouldBypassFontCacheW(fileName, true, &fullPath);
+    if (hide) {
+        DxLibTraceLimited("hide-font-cache-search request='%s'",
+            DxLibWideToUtf8(fullPath).c_str());
+    }
+    return hide;
+}
+
+static void DxLibNotifyConfigChanged(LONG version) {
+    if (!Config::EnableDxLibHook || !DxLibLooksLikeEngineRoot() || IsPickerThread())
+        return;
+
+    InterlockedExchange(&g_dxlibLastNotifyVersion, version);
+    InterlockedExchange(&g_dxlibTraceCount, 0);
+    DxLibTraceLimited("notify-config-changed version=%ld face='%s' cachedFace='%s' rebuildNeeded=%d",
+        version,
+        DxLibWideToUtf8(Config::ForcedFontNameW).c_str(),
+        DxLibWideToUtf8(Config::DxLibCachedFontNameW).c_str(),
+        DxLibFontCacheMatchesCurrentFace() ? 0 : 1);
+}

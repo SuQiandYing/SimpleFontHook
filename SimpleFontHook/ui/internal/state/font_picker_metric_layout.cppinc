@@ -1,0 +1,168 @@
+static const int FONT_SCALE_MIN_PERCENT = 50;
+static const int FONT_SCALE_MAX_PERCENT = 200;
+static const int FONT_SCALE_STEP_PERCENT = 1;
+static const int FONT_SPACING_MIN = -20;
+static const int FONT_SPACING_MAX = 60;
+static const int FONT_ASCENT_MIN = 100;
+static const int FONT_ASCENT_MAX = 2000;
+static const int FONT_DESCENT_MIN = -2000;
+static const int FONT_DESCENT_MAX = -1;
+static const int FONT_LINE_MIN = -80;
+static const int FONT_LINE_MAX = 200;
+static const int FONT_WEIGHT_MIN = 100;
+static const int FONT_WEIGHT_MAX = 900;
+static const int FONT_WEIGHT_STEP = 100;
+
+static int ClampInt(int value, int lo, int hi) {
+    return max(lo, min(hi, value));
+}
+
+static int GetFontHeightPercent() {
+    int pct = Config::EnableFontHeightScale ? (int)(Config::FontHeightScale * 100.0f + 0.5f) : 100;
+    return ClampInt(pct, FONT_SCALE_MIN_PERCENT, FONT_SCALE_MAX_PERCENT);
+}
+
+static int GetFontWidthPercent() {
+    int pct = Config::EnableFontWidthScale ? (int)(Config::FontWidthScale * 100.0f + 0.5f) : 100;
+    return ClampInt(pct, FONT_SCALE_MIN_PERCENT, FONT_SCALE_MAX_PERCENT);
+}
+
+static int GetFontWeightValue() {
+    int weight = Config::EnableFontWeight ? Config::FontWeight : FW_NORMAL;
+    return ClampInt(weight, FONT_WEIGHT_MIN, FONT_WEIGHT_MAX);
+}
+
+static int GetFontSpacingValue() { return ClampInt(Config::FontCharSpacing, FONT_SPACING_MIN, FONT_SPACING_MAX); }
+static int GetFontAscentValue() { return ClampInt(Config::FontAscentPermille, FONT_ASCENT_MIN, FONT_ASCENT_MAX); }
+static int GetFontDescentValue() { return ClampInt(Config::FontDescentPermille, FONT_DESCENT_MIN, FONT_DESCENT_MAX); }
+static int GetFontLineValue() { return ClampInt(Config::FontLineSpacing, FONT_LINE_MIN, FONT_LINE_MAX); }
+
+static bool CreatePatchedFontCloneFromCurrentTarget();
+static void ClearMetricCloneFonts();
+
+static void GetMetricsRects(MetricsRects& r) {
+    int top = GetMetricsTop() + 8;
+    int margin = 10;
+    int gap = 8;
+    int rowGap = 7;
+    int rowH = 24;
+    int colW = max(120, (WINDOW_WIDTH - margin * 2 - gap * 2) / 3);
+
+    auto makeStepper = [&](int col, int row, const wchar_t*, int hitDown, int hitUp) -> MetricStepperRects {
+        int x = margin + col * (colW + gap);
+        int y = top + row * (rowH + rowGap);
+        int labelW = 34;
+        int btn = 22;
+        int valueW = max(46, colW - labelW - btn * 2 - gap * 3);
+        MetricStepperRects s = {};
+        s.label = { x, y, x + labelW, y + rowH };
+        x += labelW + gap;
+        s.down = { x, y, x + btn, y + rowH };
+        x += btn + gap;
+        s.value = { x, y, x + valueW, y + rowH };
+        x += valueW + gap;
+        s.up = { x, y, x + btn, y + rowH };
+        s.hitDown = hitDown;
+        s.hitUp = hitUp;
+        return s;
+    };
+
+    r.width = makeStepper(0, 0, L"W", METRIC_WIDTH_DOWN, METRIC_WIDTH_UP);
+    r.height = makeStepper(1, 0, L"H", METRIC_HEIGHT_DOWN, METRIC_HEIGHT_UP);
+    r.spacing = makeStepper(2, 0, L"Gap", METRIC_SPACING_DOWN, METRIC_SPACING_UP);
+    r.ascent = makeStepper(0, 1, L"Asc", METRIC_ASCENT_DOWN, METRIC_ASCENT_UP);
+    r.descent = makeStepper(1, 1, L"Desc", METRIC_DESCENT_DOWN, METRIC_DESCENT_UP);
+    r.line = makeStepper(2, 1, L"Line", METRIC_LINE_DOWN, METRIC_LINE_UP);
+    r.weight = makeStepper(0, 2, L"Wgt", METRIC_WEIGHT_DOWN, METRIC_WEIGHT_UP);
+    int row2 = top + 2 * (rowH + rowGap);
+    int row3 = top + 3 * (rowH + rowGap);
+    r.referenceBtn = { margin + colW + gap, row2, margin + colW * 2 + gap, row2 + rowH };
+    r.autoBtn = { margin + colW * 2 + gap * 2, row2, WINDOW_WIDTH - margin, row2 + rowH };
+    r.referenceInfo = { margin, row3, margin + colW * 2 + gap, row3 + rowH };
+    r.resetBtn = { margin + colW * 2 + gap * 2, row3, WINDOW_WIDTH - margin, row3 + rowH };
+}
+
+static int MetricsHitTest(int x, int y) {
+    if (y < GetMetricsTop() || y >= GetPreviewTop()) return METRIC_NONE;
+
+    MetricsRects r;
+    GetMetricsRects(r);
+    MetricStepperRects* steppers[] = { &r.width, &r.height, &r.spacing, &r.ascent, &r.descent, &r.line, &r.weight };
+    for (MetricStepperRects* s : steppers) {
+        if (PointInRect(x, y, s->down)) return s->hitDown;
+        if (PointInRect(x, y, s->up)) return s->hitUp;
+    }
+    if (PointInRect(x, y, r.referenceBtn)) return METRIC_SET_REFERENCE;
+    if (PointInRect(x, y, r.autoBtn)) return METRIC_AUTO_VERTICAL;
+    if (PointInRect(x, y, r.resetBtn)) return METRIC_RESET_METRICS;
+    return METRIC_NONE;
+}
+
+static MetricValueKind MetricValueHitTest(int x, int y) {
+    if (y < GetMetricsTop() || y >= GetPreviewTop()) return METRIC_VALUE_NONE;
+
+    MetricsRects r;
+    GetMetricsRects(r);
+    if (PointInRect(x, y, r.width.value)) return METRIC_VALUE_WIDTH;
+    if (PointInRect(x, y, r.height.value)) return METRIC_VALUE_HEIGHT;
+    if (PointInRect(x, y, r.spacing.value)) return METRIC_VALUE_SPACING;
+    if (PointInRect(x, y, r.ascent.value)) return METRIC_VALUE_ASCENT;
+    if (PointInRect(x, y, r.descent.value)) return METRIC_VALUE_DESCENT;
+    if (PointInRect(x, y, r.line.value)) return METRIC_VALUE_LINE;
+    if (PointInRect(x, y, r.weight.value)) return METRIC_VALUE_WEIGHT;
+    return METRIC_VALUE_NONE;
+}
+
+static std::wstring GetSelectedFontName() {
+    if (g_selectedIndex >= 0 && g_selectedIndex < (int)g_filteredIndices.size()) {
+        int fontIndex = g_filteredIndices[g_selectedIndex];
+        if (fontIndex >= 0 && fontIndex < (int)g_allFonts.size())
+            return g_allFonts[fontIndex].name;
+    }
+    return L"";
+}
+
+static std::wstring GetMetricReferenceFont() {
+    if (!g_metricReferenceFont.empty())
+        return g_metricReferenceFont;
+
+    std::wstring selected = GetSelectedFontName();
+    if (!selected.empty())
+        return selected;
+
+    if (Config::ForcedFontNameW[0] != L'\0')
+        return Config::ForcedFontNameW;
+
+    return L"MS Gothic";
+}
+
+static std::wstring GetMetricTargetFont() {
+    if (!g_appliedFont.empty())
+        return g_appliedFont;
+
+    if (Config::ForcedFontNameW[0] != L'\0')
+        return Config::ForcedFontNameW;
+
+    std::wstring selected = GetSelectedFontName();
+    if (!selected.empty())
+        return selected;
+
+    return L"";
+}
+
+static std::wstring GetUserVisibleFontName(const std::wstring& face) {
+    if (!face.empty() &&
+        !g_metricCloneFace.empty() &&
+        !g_metricCloneSourceFace.empty() &&
+        _wcsicmp(face.c_str(), g_metricCloneFace.c_str()) == 0) {
+        return g_metricCloneSourceFace;
+    }
+    return face;
+}
+
+static void SetMetricReferenceToSelected() {
+    std::wstring selected = GetSelectedFontName();
+    if (!selected.empty())
+        g_metricReferenceFont = selected;
+}
+

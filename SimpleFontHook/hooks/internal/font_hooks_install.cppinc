@@ -1,0 +1,205 @@
+// Main hook installation.
+namespace FontHooks {
+
+static void AttachFontCreationHooks() {
+    DetourAttach(&(PVOID&)orgCreateFontA, newCreateFontA);
+    DetourAttach(&(PVOID&)orgCreateFontIndirectA, newCreateFontIndirectA);
+    if (HookPolicy::ShouldInstallHook(HookPolicy::HookInstallPoint::CreateFontW)) {
+        DetourAttach(&(PVOID&)orgCreateFontW, newCreateFontW);
+    }
+    if (HookPolicy::ShouldInstallHook(HookPolicy::HookInstallPoint::CreateFontIndirectW)) {
+        DetourAttach(&(PVOID&)orgCreateFontIndirectW, newCreateFontIndirectW);
+    }
+    DetourAttach(&(PVOID&)orgCreateFontIndirectExA, newCreateFontIndirectExA);
+    DetourAttach(&(PVOID&)orgCreateFontIndirectExW, newCreateFontIndirectExW);
+
+    Utils::Trace("[DEBUG][HookInstall] FontCreation CreateFontA=on CreateFontIndirectA=on CreateFontW=%s CreateFontIndirectW=%s CreateFontIndirectExA=on CreateFontIndirectExW=on",
+        HookPolicy::OnOff(HookPolicy::ShouldInstallHook(HookPolicy::HookInstallPoint::CreateFontW)),
+        HookPolicy::OnOff(HookPolicy::ShouldInstallHook(HookPolicy::HookInstallPoint::CreateFontIndirectW)));
+}
+
+static void AttachRuntimeLibraryHooks() {
+    DetourAttach(&(PVOID&)orgLoadLibraryW, newLoadLibraryW);
+    DetourAttach(&(PVOID&)orgLoadLibraryExW, newLoadLibraryExW);
+}
+
+static void AttachCodepageConversionHooks() {
+    DetourAttach(&(PVOID&)orgMultiByteToWideChar, newMultiByteToWideChar);
+    DetourAttach(&(PVOID&)orgWideCharToMultiByte, newWideCharToMultiByte);
+
+    Utils::Trace("[DEBUG][HookInstall] CodepageConversion MultiByteToWideChar=on WideCharToMultiByte=on");
+}
+
+static void AttachProfileHooks() {
+    DetourAttach(&(PVOID&)orgGetPrivateProfileStringA, newGetPrivateProfileStringA);
+    DetourAttach(&(PVOID&)orgGetPrivateProfileStringW, newGetPrivateProfileStringW);
+    DetourAttach(&(PVOID&)orgGetPrivateProfileIntA, newGetPrivateProfileIntA);
+    DetourAttach(&(PVOID&)orgGetPrivateProfileIntW, newGetPrivateProfileIntW);
+
+    Utils::Trace("[DEBUG][HookInstall] ProfileHooks GetPrivateProfileStringA/W=on GetPrivateProfileIntA/W=on");
+}
+
+static void AttachEngineFileHooks() {
+    DetourAttach(&(PVOID&)orgCreateFileA, newCreateFileA);
+    DetourAttach(&(PVOID&)orgCreateFileW, newCreateFileW);
+    DetourAttach(&(PVOID&)orgGetFileAttributesA, newGetFileAttributesA);
+    DetourAttach(&(PVOID&)orgGetFileAttributesW, newGetFileAttributesW);
+    DetourAttach(&(PVOID&)orgGetFileAttributesExA, newGetFileAttributesExA);
+    DetourAttach(&(PVOID&)orgGetFileAttributesExW, newGetFileAttributesExW);
+    DetourAttach(&(PVOID&)orgFindFirstFileA, newFindFirstFileA);
+    DetourAttach(&(PVOID&)orgFindFirstFileW, newFindFirstFileW);
+
+    Utils::Trace("[DEBUG][HookInstall] EngineFileHooks CreateFileA/W=on GetFileAttributesA/W=on GetFileAttributesExA/W=on FindFirstFileA/W=on");
+}
+
+static void AttachTextDrawingHooks() {
+    DetourAttach(&(PVOID&)orgTextOutA, newTextOutA);
+    DetourAttach(&(PVOID&)orgTextOutW, newTextOutW);
+    DetourAttach(&(PVOID&)orgExtTextOutA, newExtTextOutA);
+    DetourAttach(&(PVOID&)orgExtTextOutW, newExtTextOutW);
+    DetourAttach(&(PVOID&)orgDrawTextA, newDrawTextA);
+    DetourAttach(&(PVOID&)orgDrawTextW, newDrawTextW);
+    DetourAttach(&(PVOID&)orgDrawTextExA, newDrawTextExA);
+    DetourAttach(&(PVOID&)orgDrawTextExW, newDrawTextExW);
+}
+
+static void AttachDcFontSelectionHooks() {
+    DetourAttach(&(PVOID&)orgSelectObject, newSelectObject);
+    DetourAttach(&(PVOID&)orgGetCurrentObject, newGetCurrentObject);
+}
+
+static void AttachGlyphOutlineHooks() {
+    DetourAttach(&(PVOID&)orgGetGlyphOutlineA, newGetGlyphOutlineA);
+    DetourAttach(&(PVOID&)orgGetGlyphOutlineW, newGetGlyphOutlineW);
+}
+
+static void AttachTextLayoutMetricHooks() {
+    DetourAttach(&(PVOID&)orgGetCharABCWidthsA, newGetCharABCWidthsA);
+    DetourAttach(&(PVOID&)orgGetCharABCWidthsW, newGetCharABCWidthsW);
+    DetourAttach(&(PVOID&)orgGetCharABCWidthsFloatA, newGetCharABCWidthsFloatA);
+    DetourAttach(&(PVOID&)orgGetCharABCWidthsFloatW, newGetCharABCWidthsFloatW);
+    DetourAttach(&(PVOID&)orgGetCharWidthA, newGetCharWidthA);
+    DetourAttach(&(PVOID&)orgGetCharWidthW, newGetCharWidthW);
+    DetourAttach(&(PVOID&)orgGetCharWidth32A, newGetCharWidth32A);
+    DetourAttach(&(PVOID&)orgGetCharWidth32W, newGetCharWidth32W);
+    DetourAttach(&(PVOID&)orgGetTextExtentPoint32A, newGetTextExtentPoint32A);
+    DetourAttach(&(PVOID&)orgGetTextExtentPoint32W, newGetTextExtentPoint32W);
+    DetourAttach(&(PVOID&)orgGetTextExtentExPointA, newGetTextExtentExPointA);
+    DetourAttach(&(PVOID&)orgGetTextExtentExPointW, newGetTextExtentExPointW);
+}
+
+static void AttachFontIdentityQueryHooks() {
+    DetourAttach(&(PVOID&)orgGetObjectA, newGetObjectA);
+    DetourAttach(&(PVOID&)orgGetObjectW, newGetObjectW);
+    DetourAttach(&(PVOID&)orgGetTextMetricsA, newGetTextMetricsA);
+    DetourAttach(&(PVOID&)orgGetTextMetricsW, newGetTextMetricsW);
+    DetourAttach(&(PVOID&)orgGetTextCharset, newGetTextCharset);
+    DetourAttach(&(PVOID&)orgGetTextCharsetInfo, newGetTextCharsetInfo);
+
+    bool installGetTextFace =
+        HookPolicy::ShouldInstallHook(HookPolicy::HookInstallPoint::GetTextFaceA);
+
+    if (installGetTextFace) {
+        DetourAttach(&(PVOID&)orgGetTextFaceA, newGetTextFaceA);
+    }
+    if (installGetTextFace) {
+        DetourAttach(&(PVOID&)orgGetTextFaceW, newGetTextFaceW);
+    }
+
+    Utils::Trace("[DEBUG][HookInstall] FontIdentityQuery GetTextFaceA=%s GetTextFaceW=%s",
+        HookPolicy::OnOff(installGetTextFace),
+        HookPolicy::OnOff(installGetTextFace));
+}
+
+static void AttachFontEnumerationHooks() {
+    DetourAttach(&(PVOID&)orgEnumFontFamiliesExA, newEnumFontFamiliesExA);
+    DetourAttach(&(PVOID&)orgEnumFontFamiliesExW, newEnumFontFamiliesExW);
+    DetourAttach(&(PVOID&)orgEnumFontsA, newEnumFontsA);
+    DetourAttach(&(PVOID&)orgEnumFontsW, newEnumFontsW);
+    DetourAttach(&(PVOID&)orgEnumFontFamiliesA, newEnumFontFamiliesA);
+    DetourAttach(&(PVOID&)orgEnumFontFamiliesW, newEnumFontFamiliesW);
+}
+
+static void AttachGlyphMetricSupplementHooks() {
+    DetourAttach(&(PVOID&)orgGetCharWidthFloatA, newGetCharWidthFloatA);
+    DetourAttach(&(PVOID&)orgGetCharWidthFloatW, newGetCharWidthFloatW);
+    DetourAttach(&(PVOID&)orgGetCharWidthI, newGetCharWidthI);
+    DetourAttach(&(PVOID&)orgGetCharABCWidthsI, newGetCharABCWidthsI);
+    DetourAttach(&(PVOID&)orgGetCharacterPlacementA, newGetCharacterPlacementA);
+    DetourAttach(&(PVOID&)orgGetCharacterPlacementW, newGetCharacterPlacementW);
+    DetourAttach(&(PVOID&)orgGetKerningPairsA, newGetKerningPairsA);
+    DetourAttach(&(PVOID&)orgGetKerningPairsW, newGetKerningPairsW);
+    DetourAttach(&(PVOID&)orgGetGlyphIndicesA, newGetGlyphIndicesA);
+    DetourAttach(&(PVOID&)orgGetGlyphIndicesW, newGetGlyphIndicesW);
+}
+
+static void AttachFontDataQueryHooks() {
+    DetourAttach(&(PVOID&)orgGetOutlineTextMetricsA, newGetOutlineTextMetricsA);
+    DetourAttach(&(PVOID&)orgGetOutlineTextMetricsW, newGetOutlineTextMetricsW);
+    DetourAttach(&(PVOID&)orgGetTextExtentPointA, newGetTextExtentPointA);
+    DetourAttach(&(PVOID&)orgGetTextExtentPointW, newGetTextExtentPointW);
+    DetourAttach(&(PVOID&)orgGetTextExtentPointI, newGetTextExtentPointI);
+    DetourAttach(&(PVOID&)orgGetTextExtentExPointI, newGetTextExtentExPointI);
+    DetourAttach(&(PVOID&)orgGetFontData, newGetFontData);
+    DetourAttach(&(PVOID&)orgGetFontLanguageInfo, newGetFontLanguageInfo);
+    DetourAttach(&(PVOID&)orgGetFontUnicodeRanges, newGetFontUnicodeRanges);
+}
+
+static void AttachDirectWriteHooks() {
+    HMODULE hDWrite = GetModuleHandleW(L"dwrite.dll");
+    if (!hDWrite) {
+        Utils::Trace("[DEBUG][DWrite] initial attach skipped: dwrite.dll not loaded yet");
+        return;
+    }
+
+    AttachDWriteCreateFactoryInOpenTransaction(hDWrite, "initial");
+}
+
+static void AttachHooksByCategory() {
+    AttachFontCreationHooks();
+    AttachRuntimeLibraryHooks();
+    AttachCodepageConversionHooks();
+    AttachProfileHooks();
+    AttachEngineFileHooks();
+    AttachTextDrawingHooks();
+    AttachDcFontSelectionHooks();
+    AttachGlyphOutlineHooks();
+    AttachTextLayoutMetricHooks();
+    AttachFontIdentityQueryHooks();
+    AttachFontEnumerationHooks();
+    AttachGlyphMetricSupplementHooks();
+    AttachFontDataQueryHooks();
+    AttachDirectWriteHooks();
+}
+
+void Install(HMODULE hModule) {
+    g_hModule = hModule;
+    Utils::LoadConfig(hModule);
+    Utils::Trace("[TRACE] process attach module=%p exe pid=%lu", hModule, GetCurrentProcessId());
+    KrkrPatchMapPrerenderedFontName();
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    AttachHooksByCategory();
+    DetourTransactionCommit();
+    StartDirectWriteDelayedHookThread();
+    SoftpalInstallPalFontHooks();
+
+    // GDI+
+    InstallGdiPlusHooks();
+
+    // Launch font picker UI on a separate thread. With a saved config the picker
+    // starts hidden, but the hotkey/window still exists.
+    _beginthreadex(NULL, 0, FontPickerThread, hModule, 0, NULL);
+}
+
+void NotifyConfigChanged(LONG version) {
+    MiraiNotifyConfigChanged(version);
+    bool handledByLegacyArtemis = ArtemisLegacyNotifyConfigChanged(version);
+    if (!handledByLegacyArtemis) {
+        ArtemisNotifyConfigChanged(version);
+    }
+    MajiroNotifyConfigChanged(version);
+    DxLibNotifyConfigChanged(version);
+}
+
+} // namespace FontHooks

@@ -1,0 +1,290 @@
+// GDI+ hooks.
+GpStatus WINAPI newGdipCreateFontFamilyFromName(const WCHAR* name, GpFontCollection* fontCollection, GpFontFamily** FontFamily) {
+    EnsureInitialized();
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace && g_PrivateFontCollection) {
+        GpStatus result = orgGdipCreateFontFamilyFromName(Config::ForcedFontNameW, g_PrivateFontCollection, FontFamily);
+        if (result == 0) return result;
+    }
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        return orgGdipCreateFontFamilyFromName(Config::ForcedFontNameW, fontCollection, FontFamily);
+    }
+    wchar_t faceName[LF_FACESIZE] = {};
+    if (name) {
+        wcsncpy_s(faceName, name, _TRUNCATE);
+        StripEpochSuffixW(faceName);
+        return orgGdipCreateFontFamilyFromName(faceName, fontCollection, FontFamily);
+    }
+    return orgGdipCreateFontFamilyFromName(name, fontCollection, FontFamily);
+}
+
+GpStatus WINAPI newGdipCreateFontFromLogfontW(HDC hdc, const LOGFONTW* logfont, GpFont** font) {
+    EnsureInitialized();
+    if ((Config::EnableFontHook || Config::EnableCodepageSpoof) && logfont) {
+        LOGFONTW lf = *logfont;
+        StripEpochSuffixFromLogFont(lf);
+        if (Config::EnableFaceNameReplace) wcscpy_s(lf.lfFaceName, Config::ForcedFontNameW);
+        if (Config::EnableCharsetReplace) lf.lfCharSet = (BYTE)Config::ForcedCharset;
+        lf.lfCharSet = SpoofCharsetB(lf.lfCharSet);
+        if (Config::EnableFontHeightScale) lf.lfHeight = ScaleLogFontValue(lf.lfHeight, Config::FontHeightScale);
+        if (Config::EnableFontWidthScale) lf.lfWidth = ScaleLogFontWidth(lf.lfWidth, lf.lfHeight);
+        if (Config::EnableFontWeight && Config::FontWeight > 0) lf.lfWeight = Config::FontWeight;
+        return orgGdipCreateFontFromLogfontW(hdc, &lf, font);
+    }
+    return orgGdipCreateFontFromLogfontW(hdc, logfont, font);
+}
+
+GpStatus WINAPI newGdipCreateFontFromLogfontA(HDC hdc, const LOGFONTA* logfont, GpFont** font) {
+    EnsureInitialized();
+    if ((Config::EnableFontHook || Config::EnableCodepageSpoof) && logfont) {
+        LOGFONTA lf = *logfont;
+        StripEpochSuffixFromLogFont(lf);
+        if (Config::EnableFaceNameReplace) strcpy_s(lf.lfFaceName, Config::ForcedFontNameA);
+        if (Config::EnableCharsetReplace) lf.lfCharSet = (BYTE)Config::ForcedCharset;
+        lf.lfCharSet = SpoofCharsetB(lf.lfCharSet);
+        if (Config::EnableFontHeightScale) lf.lfHeight = ScaleLogFontValue(lf.lfHeight, Config::FontHeightScale);
+        if (Config::EnableFontWidthScale) lf.lfWidth = ScaleLogFontWidth(lf.lfWidth, lf.lfHeight);
+        if (Config::EnableFontWeight && Config::FontWeight > 0) lf.lfWeight = Config::FontWeight;
+        return orgGdipCreateFontFromLogfontA(hdc, &lf, font);
+    }
+    return orgGdipCreateFontFromLogfontA(hdc, logfont, font);
+}
+
+
+
+// DirectWrite hooks.
+
+static HRESULT WINAPI newDWriteCreateFactory(DWRITE_FACTORY_TYPE factoryType, REFIID iid, IUnknown** factory);
+
+static bool AttachDWriteCreateFactoryInOpenTransaction(HMODULE hDWrite, const char* reason) {
+    if (!hDWrite) return false;
+    if (InterlockedCompareExchange(&g_DWriteCreateFactoryHookState, 1, 0) != 0)
+        return true;
+
+    FARPROC proc = GetProcAddress(hDWrite, "DWriteCreateFactory");
+    if (!proc) {
+        InterlockedExchange(&g_DWriteCreateFactoryHookState, 0);
+        return false;
+    }
+
+    orgDWriteCreateFactory = (pDWriteCreateFactory)proc;
+    LONG status = DetourAttach(&(PVOID&)orgDWriteCreateFactory, newDWriteCreateFactory);
+    if (status != NO_ERROR) {
+        orgDWriteCreateFactory = NULL;
+        InterlockedExchange(&g_DWriteCreateFactoryHookState, 0);
+        Utils::Trace("[DEBUG][DWrite] attach queued failed reason=%s status=%ld",
+            reason ? reason : "unknown", status);
+        return false;
+    }
+
+    Utils::Trace("[DEBUG][DWrite] DWriteCreateFactory attach queued reason=%s module=%p proc=%p",
+        reason ? reason : "unknown", hDWrite, proc);
+    return true;
+}
+
+static bool AttachDWriteCreateFactoryNow(HMODULE hDWrite, const char* reason) {
+    if (!hDWrite) return false;
+    if (InterlockedCompareExchange(&g_DWriteCreateFactoryHookState, 1, 0) != 0)
+        return true;
+
+    FARPROC proc = GetProcAddress(hDWrite, "DWriteCreateFactory");
+    if (!proc) {
+        InterlockedExchange(&g_DWriteCreateFactoryHookState, 0);
+        return false;
+    }
+
+    orgDWriteCreateFactory = (pDWriteCreateFactory)proc;
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    LONG attachStatus = DetourAttach(&(PVOID&)orgDWriteCreateFactory, newDWriteCreateFactory);
+    LONG commitStatus = attachStatus == NO_ERROR ? DetourTransactionCommit() : DetourTransactionAbort();
+    if (attachStatus != NO_ERROR || commitStatus != NO_ERROR) {
+        Utils::Trace("[DEBUG][DWrite] DWriteCreateFactory attach failed reason=%s attach=%ld commit=%ld",
+            reason ? reason : "unknown", attachStatus, commitStatus);
+        orgDWriteCreateFactory = NULL;
+        InterlockedExchange(&g_DWriteCreateFactoryHookState, 0);
+        return false;
+    }
+
+    Utils::Trace("[DEBUG][DWrite] DWriteCreateFactory hooked reason=%s module=%p proc=%p",
+        reason ? reason : "unknown", hDWrite, proc);
+    return true;
+}
+
+static unsigned __stdcall DirectWriteDelayedHookThread(void*) {
+    for (int i = 0; i < 200; ++i) {
+        HMODULE hDWrite = GetModuleHandleW(L"dwrite.dll");
+        if (!hDWrite) hDWrite = GetModuleHandleW(L"DWrite.dll");
+        if (hDWrite) {
+            AttachDWriteCreateFactoryNow(hDWrite, "delayed-static-import");
+            return 0;
+        }
+        Sleep(i < 40 ? 10 : 50);
+    }
+
+    Utils::Trace("[DEBUG][DWrite] delayed hook timed out waiting for dwrite.dll");
+    return 0;
+}
+
+static void StartDirectWriteDelayedHookThread() {
+    uintptr_t thread = _beginthreadex(NULL, 0, DirectWriteDelayedHookThread, NULL, 0, NULL);
+    if (thread) CloseHandle((HANDLE)thread);
+}
+
+// 核心：拦截字体创建，强制修改字体名称
+HRESULT STDMETHODCALLTYPE newCreateTextFormat(
+    IDWriteFactory* This,
+    const WCHAR* fontFamilyName,
+    IDWriteFontCollection* fontCollection,
+    DWRITE_FONT_WEIGHT fontWeight,
+    DWRITE_FONT_STYLE fontStyle,
+    DWRITE_FONT_STRETCH fontStretch,
+    FLOAT fontSize,
+    const WCHAR* localeName,
+    IDWriteTextFormat** textFormat
+) {
+    WCHAR strippedFontName[LF_FACESIZE] = {};
+    const WCHAR* targetFont = fontFamilyName;
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        targetFont = Config::ForcedFontNameW;
+    } else if (fontFamilyName) {
+        wcsncpy_s(strippedFontName, fontFamilyName, _TRUNCATE);
+        StripEpochSuffixW(strippedFontName);
+        targetFont = strippedFontName;
+    }
+
+    DWRITE_FONT_WEIGHT targetWeight = fontWeight;
+    if (Config::EnableFontHook && Config::EnableFontWeight && Config::FontWeight > 0) {
+        targetWeight = (DWRITE_FONT_WEIGHT)Config::FontWeight;
+    }
+
+    FLOAT targetSize = fontSize;
+    if (Config::EnableFontHook && Config::EnableFontHeightScale) {
+        targetSize = fontSize * Config::FontHeightScale;
+    }
+
+    LONG hit = InterlockedIncrement(&g_DWriteCreateTextFormatTraceCount);
+    if (hit <= 64) {
+        char sourceName[256] = {};
+        char forcedName[256] = {};
+        DebugWideToUtf8(fontFamilyName, sourceName, sizeof(sourceName));
+        DebugWideToUtf8(targetFont, forcedName, sizeof(forcedName));
+        Utils::Trace("[DEBUG][DWrite] CreateTextFormat #%ld source='%s' target='%s' size=%.2f->%.2f weight=%d->%d",
+            hit, sourceName, forcedName, fontSize, targetSize, (int)fontWeight, (int)targetWeight);
+    }
+
+    return orgCreateTextFormat(This, targetFont, fontCollection, targetWeight, fontStyle, fontStretch, targetSize, localeName, textFormat);
+}
+
+
+
+HRESULT STDMETHODCALLTYPE newCreateTextLayout(IDWriteFactory* This, const WCHAR* string, UINT32 stringLength, IDWriteTextFormat* textFormat, FLOAT maxWidth, FLOAT maxHeight, IDWriteTextLayout** textLayout) {
+    std::wstring subText;
+    int subCount = (int)stringLength;
+    const WCHAR* useText = string;
+    UINT32 useLength = stringLength;
+    if (SubstituteTextW(string, (int)stringLength, subText, &subCount)) {
+        useText = subText.c_str();
+        useLength = (UINT32)subCount;
+    }
+    LONG hit = InterlockedIncrement(&g_DWriteCreateTextLayoutTraceCount);
+    if (hit <= 64) {
+        Utils::Trace("[DEBUG][DWrite] CreateTextLayout #%ld length=%u->%u max=%.1fx%.1f",
+            hit, stringLength, useLength, maxWidth, maxHeight);
+    }
+    HRESULT hr = orgCreateTextLayout(This, useText, useLength, textFormat, maxWidth, maxHeight, textLayout);
+    if (SUCCEEDED(hr) && textLayout && *textLayout) {
+        static std::mutex dwriteMutex;
+        std::lock_guard<std::mutex> lock(dwriteMutex);
+        // 如果需要进一步拦截文本渲染，在这里 hook IDWriteTextLayout 的 vtable
+        if (orgIDWriteTextLayout_Draw == NULL) {
+            void** vtable = *(void***)(*textLayout);
+            orgIDWriteTextLayout_Draw = (pIDWriteTextLayout_Draw)vtable[18]; // Draw Index is usually 18
+        }
+    }
+    return hr;
+}
+
+// DWrite 工厂创建时的拦截入口
+static HRESULT WINAPI newDWriteCreateFactory(DWRITE_FACTORY_TYPE factoryType, REFIID iid, IUnknown** factory) {
+    HRESULT hr = orgDWriteCreateFactory(factoryType, iid, factory);
+    Utils::Trace("[DEBUG][DWrite] DWriteCreateFactory hit type=%d hr=0x%08lX factory=%p",
+        (int)factoryType, (unsigned long)hr, factory ? *factory : NULL);
+    if (SUCCEEDED(hr) && factory && *factory) {
+        void** vtable = *(void***)(*factory);
+        
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        // Hook CreateTextLayout (Index 18)
+        if (orgCreateTextLayout == NULL) {
+            orgCreateTextLayout = (pCreateTextLayout)vtable[18];
+            DetourAttach(&(PVOID&)orgCreateTextLayout, newCreateTextLayout);
+        }
+
+        // Hook CreateTextFormat (Index 15) - 替换字体的关键点
+        if (orgCreateTextFormat == NULL) {
+            orgCreateTextFormat = (pCreateTextFormat)vtable[15];
+            DetourAttach(&(PVOID&)orgCreateTextFormat, newCreateTextFormat);
+        }
+
+        LONG status = DetourTransactionCommit();
+        Utils::Trace("[DEBUG][DWrite] factory vtable hook status=%ld CreateTextFormat=%p CreateTextLayout=%p",
+            status, vtable[15], vtable[18]);
+    }
+    return hr;
+}
+
+// Library load hooks.
+HMODULE WINAPI newLoadLibraryW(LPCWSTR name) {
+    HMODULE h = orgLoadLibraryW(name);
+    if (!h || !name) return h;
+
+    SoftpalInstallPalFontHooks();
+    
+    if (wcsstr(name, L"gdiplus") || wcsstr(name, L"GDIPLUS")) {
+        InstallGdiPlusHooks();
+    }
+    else if (wcsstr(name, L"dwrite") || wcsstr(name, L"DWRITE")) {
+        AttachDWriteCreateFactoryNow(h, "LoadLibraryW");
+    }
+    return h;
+}
+
+HMODULE WINAPI newLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD fl) {
+    HMODULE h = orgLoadLibraryExW(name, f, fl);
+    if (!h || !name || (fl & LOAD_LIBRARY_AS_DATAFILE) || (fl & LOAD_LIBRARY_AS_IMAGE_RESOURCE)) return h;
+
+    SoftpalInstallPalFontHooks();
+
+    if (wcsstr(name, L"gdiplus") || wcsstr(name, L"GDIPLUS")) {
+        InstallGdiPlusHooks();
+    }
+    else if (wcsstr(name, L"dwrite") || wcsstr(name, L"DWRITE")) {
+        AttachDWriteCreateFactoryNow(h, "LoadLibraryExW");
+    }
+    return h;
+}
+
+// GDI+ hook installation.
+void InstallGdiPlusHooks() {
+    if (g_GdiPlusHooksInstalled) return;
+
+    HMODULE hGdiPlus = GetModuleHandleW(L"gdiplus.dll");
+    if (!hGdiPlus) return;
+
+    orgGdipCreateFontFamilyFromName = (pGdipCreateFontFamilyFromName)GetProcAddress(hGdiPlus, "GdipCreateFontFamilyFromName");
+    orgGdipCreateFontFromLogfontW = (pGdipCreateFontFromLogfontW)GetProcAddress(hGdiPlus, "GdipCreateFontFromLogfontW");
+    orgGdipCreateFontFromLogfontA = (pGdipCreateFontFromLogfontA)GetProcAddress(hGdiPlus, "GdipCreateFontFromLogfontA");
+
+    LoadGdiPlusPrivateFont();
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    if (orgGdipCreateFontFamilyFromName) DetourAttach(&(PVOID&)orgGdipCreateFontFamilyFromName, newGdipCreateFontFamilyFromName);
+    if (orgGdipCreateFontFromLogfontW) DetourAttach(&(PVOID&)orgGdipCreateFontFromLogfontW, newGdipCreateFontFromLogfontW);
+    if (orgGdipCreateFontFromLogfontA) DetourAttach(&(PVOID&)orgGdipCreateFontFromLogfontA, newGdipCreateFontFromLogfontA);
+    DetourTransactionCommit();
+
+    g_GdiPlusHooksInstalled = true;
+}
+

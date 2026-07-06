@@ -1,0 +1,710 @@
+// Legacy Artemis resource support.
+//
+// Older Artemis builds drive UI/message fonts through loose .iet scripts and
+// optional pre-rendered .rft font atlases. Keep this separate from the modern
+// Artemis table/cache hook because the runtime object layouts are different.
+
+enum ArtemisLegacyResourceKind {
+    ARTEMIS_LEGACY_RESOURCE_NONE = 0,
+    ARTEMIS_LEGACY_RESOURCE_IET_SCRIPT,
+    ARTEMIS_LEGACY_RESOURCE_TEXT_SCRIPT,
+    ARTEMIS_LEGACY_RESOURCE_FONT_FILE,
+};
+
+struct ArtemisLegacyPathInfo {
+    ArtemisLegacyResourceKind kind;
+    std::wstring requestedPath;
+    std::wstring fullPath;
+    std::wstring sourcePath;
+    bool memoryFont;
+};
+
+static volatile LONG g_artemisLegacyTraceCount = 0;
+static volatile LONG g_artemisLegacyLastScriptOpenVersion = LONG_MIN;
+static volatile LONG g_artemisLegacyLastScriptPatchVersion = LONG_MIN;
+static volatile LONG g_artemisLegacyLastFontRedirectVersion = LONG_MIN;
+static volatile LONG g_artemisLegacyLastVirtualFontReadyVersion = LONG_MIN;
+static volatile LONG g_artemisLegacyConfigNotifyVersion = LONG_MIN;
+static LONG g_artemisLegacyExportedFontVersion = LONG_MIN;
+static std::vector<BYTE> g_artemisLegacyExportedFontBytes;
+static std::mutex g_artemisLegacyVirtualFontMutex;
+static std::mutex g_artemisLegacySystemFontCacheMutex;
+static std::wstring g_artemisLegacySystemFontCacheFace;
+static std::wstring g_artemisLegacySystemFontCachePath;
+static bool g_artemisLegacySystemFontCacheHit = false;
+static int g_artemisLegacyEngineProbe = -1;
+
+static void ArtemisLegacyTraceLimited(const char* format, ...);
+static bool ArtemisLegacyMatchesVirtualFontPath(const std::wstring& fullPath);
+
+static std::wstring ArtemisLegacyWideFromAnsi(const char* text) {
+    if (!text || !text[0]) return L"";
+    int len = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+    if (len <= 0) return L"";
+    std::vector<wchar_t> buffer(len);
+    MultiByteToWideChar(CP_ACP, 0, text, -1, buffer.data(), len);
+    return std::wstring(buffer.data());
+}
+
+static std::string ArtemisLegacyWideToUtf8(const std::wstring& text) {
+    if (text.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::vector<char> buffer(len);
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, buffer.data(), len, NULL, NULL);
+    return std::string(buffer.data());
+}
+
+static std::wstring ArtemisLegacyGetGameRoot() {
+    wchar_t root[MAX_PATH] = {};
+    GetModuleFileNameW(NULL, root, MAX_PATH);
+    PathRemoveFileSpecW(root);
+    return root;
+}
+
+static std::wstring ArtemisLegacyNormalizePath(std::wstring path) {
+    for (wchar_t& ch : path) {
+        if (ch == L'/') ch = L'\\';
+        ch = (wchar_t)towlower(ch);
+    }
+    return path;
+}
+
+static std::wstring ArtemisLegacyFullPath(const wchar_t* path) {
+    if (!path || !path[0]) return L"";
+    wchar_t full[MAX_PATH] = {};
+    DWORD len = GetFullPathNameW(path, MAX_PATH, full, NULL);
+    if (len == 0 || len >= MAX_PATH) return path;
+    return full;
+}
+
+static bool ArtemisLegacyIsUnderRoot(const std::wstring& fullPath) {
+    std::wstring root = ArtemisLegacyNormalizePath(ArtemisLegacyGetGameRoot());
+    std::wstring full = ArtemisLegacyNormalizePath(fullPath);
+    if (root.empty() || full.size() < root.size()) return false;
+    if (full.compare(0, root.size(), root) != 0) return false;
+    return full.size() == root.size() || full[root.size()] == L'\\';
+}
+
+static bool ArtemisLegacyHasExtension(const std::wstring& path, const wchar_t* ext) {
+    size_t pathLen = path.size();
+    size_t extLen = wcslen(ext);
+    if (pathLen < extLen) return false;
+    return _wcsicmp(path.c_str() + pathLen - extLen, ext) == 0;
+}
+
+static bool ArtemisLegacyPathExists(const std::wstring& path) {
+    return !path.empty() && orgGetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static bool ArtemisLegacyFindRelativeFile(const wchar_t* relativePattern) {
+    if (!relativePattern || !relativePattern[0]) return false;
+
+    std::wstring root = ArtemisLegacyGetGameRoot();
+    wchar_t search[MAX_PATH] = {};
+    wcscpy_s(search, root.c_str());
+    PathAppendW(search, relativePattern);
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE hFind = orgFindFirstFileW(search, &data);
+    if (hFind == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    do {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(hFind, &data));
+
+    FindClose(hFind);
+    return found;
+}
+
+static bool ArtemisLegacyLooksLikeEngineRoot() {
+    if (g_artemisLegacyEngineProbe != -1) return g_artemisLegacyEngineProbe != 0;
+
+    bool hasIet = ArtemisLegacyFindRelativeFile(L"system\\*.iet");
+    bool hasMsgIet = ArtemisLegacyFindRelativeFile(L"system\\msg.iet");
+    bool hasPfs = ArtemisLegacyFindRelativeFile(L"*.pfs");
+    bool hasBaseFont =
+        ArtemisLegacyFindRelativeFile(L"_base\\font\\*.ttf") ||
+        ArtemisLegacyFindRelativeFile(L"_base\\font\\*.otf") ||
+        ArtemisLegacyFindRelativeFile(L"_base\\font\\*.ttc") ||
+        ArtemisLegacyFindRelativeFile(L"_base\\font\\*.rft");
+
+    g_artemisLegacyEngineProbe = ((hasIet || hasMsgIet) && (hasPfs || hasBaseFont)) ? 1 : 0;
+    if (g_artemisLegacyEngineProbe) {
+        ArtemisLegacyTraceLimited("legacy-root-detected iet=%d msg=%d pfs=%d baseFont=%d",
+            hasIet ? 1 : 0, hasMsgIet ? 1 : 0, hasPfs ? 1 : 0, hasBaseFont ? 1 : 0);
+    }
+    return g_artemisLegacyEngineProbe != 0;
+}
+
+static std::wstring ArtemisLegacyWindowsFontsDir() {
+    wchar_t windowsDir[MAX_PATH] = {};
+    if (GetWindowsDirectoryW(windowsDir, MAX_PATH) == 0) return L"C:\\Windows\\Fonts";
+    std::wstring fontsDir = windowsDir;
+    if (!fontsDir.empty() && fontsDir.back() != L'\\') fontsDir += L"\\";
+    fontsDir += L"Fonts";
+    return fontsDir;
+}
+
+static std::wstring ArtemisLegacyBuildFontPathFromRegistryValue(const wchar_t* value) {
+    if (!value || !value[0]) return L"";
+
+    wchar_t expanded[MAX_PATH] = {};
+    if (wcschr(value, L'%') &&
+        ExpandEnvironmentStringsW(value, expanded, _countof(expanded)) > 0 &&
+        expanded[0]) {
+        value = expanded;
+    }
+
+    std::wstring path = value;
+    if (PathIsRelativeW(path.c_str())) {
+        std::wstring full = ArtemisLegacyWindowsFontsDir();
+        if (!full.empty() && full.back() != L'\\') full += L"\\";
+        full += path;
+        path = full;
+    }
+    return ArtemisLegacyPathExists(path) ? path : L"";
+}
+
+static void ArtemisLegacySearchSystemFontRegistry(HKEY rootKey, REGSAM wow64Flags,
+    const std::wstring& target, std::wstring& bestPath, DWORD& bestScore) {
+    HKEY hKey = NULL;
+    LONG openStatus = RegOpenKeyExW(rootKey,
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+        0, KEY_READ | wow64Flags, &hKey);
+    if (openStatus != ERROR_SUCCESS) return;
+
+    for (DWORD index = 0;; ++index) {
+        wchar_t valueName[512] = {};
+        BYTE valueData[MAX_PATH * sizeof(wchar_t)] = {};
+        DWORD nameLen = _countof(valueName);
+        DWORD dataLen = sizeof(valueData);
+        DWORD type = 0;
+        LONG status = RegEnumValueW(hKey, index, valueName, &nameLen, NULL, &type, valueData, &dataLen);
+        if (status == ERROR_NO_MORE_ITEMS) break;
+        if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) continue;
+
+        std::wstring nameLower = ArtemisLegacyNormalizePath(valueName);
+        std::wstring filePath = ArtemisLegacyBuildFontPathFromRegistryValue((const wchar_t*)valueData);
+        if (filePath.empty()) continue;
+
+        DWORD score = 0;
+        if (nameLower == target) score = 300;
+        else if (nameLower.find(target + L" ") == 0) score = 240;
+        else if (nameLower.find(target) != std::wstring::npos) score = 180;
+
+        std::wstring fileLower = ArtemisLegacyNormalizePath(PathFindFileNameW(filePath.c_str()));
+        if (fileLower.find(target) != std::wstring::npos) score += 40;
+        if (fileLower.find(L"bold") != std::wstring::npos || fileLower.find(L"italic") != std::wstring::npos) {
+            if (score > 10) score -= 10;
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestPath = filePath;
+        }
+    }
+
+    RegCloseKey(hKey);
+}
+
+static std::wstring ArtemisLegacyFindSystemFontFileByFace(const wchar_t* faceName) {
+    if (!faceName || !faceName[0]) return L"";
+    std::wstring face(faceName);
+
+    {
+        std::lock_guard<std::mutex> lock(g_artemisLegacySystemFontCacheMutex);
+        if (g_artemisLegacySystemFontCacheFace == face) {
+            return g_artemisLegacySystemFontCacheHit ? g_artemisLegacySystemFontCachePath : L"";
+        }
+    }
+
+    std::wstring target = ArtemisLegacyNormalizePath(face);
+    std::wstring bestPath;
+    DWORD bestScore = 0;
+
+    ArtemisLegacySearchSystemFontRegistry(HKEY_CURRENT_USER, 0, target, bestPath, bestScore);
+    ArtemisLegacySearchSystemFontRegistry(HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, target, bestPath, bestScore);
+    ArtemisLegacySearchSystemFontRegistry(HKEY_LOCAL_MACHINE, 0, target, bestPath, bestScore);
+
+    if (!bestPath.empty()) {
+        ArtemisLegacyTraceLimited("system-font-resolved face='%s' file='%s' score=%lu",
+            ArtemisLegacyWideToUtf8(face).c_str(), ArtemisLegacyWideToUtf8(bestPath).c_str(), bestScore);
+    } else {
+        ArtemisLegacyTraceLimited("system-font-not-found face='%s'", ArtemisLegacyWideToUtf8(face).c_str());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_artemisLegacySystemFontCacheMutex);
+        g_artemisLegacySystemFontCacheFace = face;
+        g_artemisLegacySystemFontCachePath = bestPath;
+        g_artemisLegacySystemFontCacheHit = !bestPath.empty();
+    }
+    return bestPath;
+}
+
+static std::wstring ArtemisLegacyFindConfiguredSystemFontFile() {
+    std::wstring ansiFace = ArtemisLegacyWideFromAnsi(Config::ForcedFontNameA);
+    if (!ansiFace.empty() &&
+        (!Config::ForcedFontNameW[0] || _wcsicmp(ansiFace.c_str(), Config::ForcedFontNameW) != 0)) {
+        std::wstring source = ArtemisLegacyFindSystemFontFileByFace(ansiFace.c_str());
+        if (!source.empty()) return source;
+    }
+
+    return ArtemisLegacyFindSystemFontFileByFace(Config::ForcedFontNameW);
+}
+
+static std::wstring ArtemisLegacyFindConfiguredLocalFontFile() {
+    std::wstring root = ArtemisLegacyGetGameRoot();
+    if (Config::FontFileName[0]) {
+        wchar_t configured[MAX_PATH] = {};
+        wcscpy_s(configured, root.c_str());
+        PathAppendW(configured, Config::FontFileName);
+        if (!ArtemisLegacyMatchesVirtualFontPath(configured) && ArtemisLegacyPathExists(configured)) {
+            return configured;
+        }
+    }
+
+    const wchar_t* patterns[] = { L"galgame*.ttf", L"*.ttf", L"*.otf", L"*.ttc" };
+    for (const wchar_t* pattern : patterns) {
+        wchar_t search[MAX_PATH] = {};
+        wcscpy_s(search, root.c_str());
+        PathAppendW(search, pattern);
+        WIN32_FIND_DATAW data = {};
+        HANDLE hFind = orgFindFirstFileW(search, &data);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                wchar_t full[MAX_PATH] = {};
+                wcscpy_s(full, root.c_str());
+                PathAppendW(full, data.cFileName);
+                if (ArtemisLegacyMatchesVirtualFontPath(full)) continue;
+                FindClose(hFind);
+                return full;
+            }
+        } while (FindNextFileW(hFind, &data));
+        FindClose(hFind);
+    }
+
+    return L"";
+}
+
+static std::wstring ArtemisLegacyAppendVersionSuffixToFontPath(const std::wstring& path, LONG version) {
+    if (path.empty() || version <= 0) return path;
+
+    wchar_t suffix[16] = {};
+    swprintf_s(suffix, L"_%04lX", version & 0xFFFF);
+
+    size_t slash = path.find_last_of(L"\\/");
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) {
+        return path + suffix;
+    }
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+static std::wstring ArtemisLegacyBuildVirtualFontPathForVersion(LONG version) {
+    std::wstring basePath;
+    if (Config::ArtemisFontPath[0]) {
+        basePath = Config::ArtemisFontPath;
+    } else {
+        basePath = L"_base/font/FontHook.ttf";
+    }
+    return ArtemisLegacyAppendVersionSuffixToFontPath(basePath, version);
+}
+
+static std::wstring ArtemisLegacyBuildVirtualFontPath() {
+    return ArtemisLegacyBuildVirtualFontPathForVersion(Config::ConfigVersion);
+}
+
+static std::string ArtemisLegacyVirtualFontPathUtf8() {
+    std::wstring wide = ArtemisLegacyBuildVirtualFontPath();
+    if (wide.empty()) return "";
+    for (wchar_t& ch : wide) {
+        if (ch == L'\\') ch = L'/';
+    }
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::vector<char> buffer(len);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, buffer.data(), len, NULL, NULL);
+    return std::string(buffer.data());
+}
+
+static std::wstring ArtemisLegacyVirtualFontFullPathForVersion(LONG version) {
+    std::wstring virtualPath = ArtemisLegacyBuildVirtualFontPathForVersion(version);
+    if (virtualPath.empty()) return L"";
+    for (wchar_t& ch : virtualPath) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    wchar_t full[MAX_PATH] = {};
+    if (PathIsRelativeW(virtualPath.c_str())) {
+        wcscpy_s(full, ArtemisLegacyGetGameRoot().c_str());
+        PathAppendW(full, virtualPath.c_str());
+    } else {
+        wcscpy_s(full, virtualPath.c_str());
+    }
+    return ArtemisLegacyIsUnderRoot(full) ? full : L"";
+}
+
+static bool ArtemisLegacySameNormalizedPath(const std::wstring& a, const std::wstring& b) {
+    return ArtemisLegacyNormalizePath(a) == ArtemisLegacyNormalizePath(b);
+}
+
+static bool ArtemisLegacySplitDirectoryStemExtension(const std::wstring& path,
+    std::wstring* dir, std::wstring* stem, std::wstring* ext) {
+    size_t slash = path.find_last_of(L"\\/");
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) return false;
+
+    if (dir) *dir = slash == std::wstring::npos ? L"" : path.substr(0, slash);
+    if (stem) *stem = path.substr(slash == std::wstring::npos ? 0 : slash + 1,
+        dot - (slash == std::wstring::npos ? 0 : slash + 1));
+    if (ext) *ext = path.substr(dot);
+    return true;
+}
+
+static bool ArtemisLegacyMatchesVirtualFontPath(const std::wstring& fullPath) {
+    std::wstring baseFull = ArtemisLegacyVirtualFontFullPathForVersion(0);
+    if (baseFull.empty()) return false;
+    if (ArtemisLegacySameNormalizedPath(fullPath, baseFull)) return true;
+
+    std::wstring fullDir, fullStem, fullExt;
+    std::wstring baseDir, baseStem, baseExt;
+    if (!ArtemisLegacySplitDirectoryStemExtension(ArtemisLegacyNormalizePath(fullPath), &fullDir, &fullStem, &fullExt) ||
+        !ArtemisLegacySplitDirectoryStemExtension(ArtemisLegacyNormalizePath(baseFull), &baseDir, &baseStem, &baseExt)) {
+        return false;
+    }
+
+    return fullDir == baseDir &&
+        fullExt == baseExt &&
+        fullStem.size() == baseStem.size() + 5 &&
+        fullStem.compare(0, baseStem.size(), baseStem) == 0 &&
+        fullStem[baseStem.size()] == L'_' &&
+        iswxdigit(fullStem[baseStem.size() + 1]) &&
+        iswxdigit(fullStem[baseStem.size() + 2]) &&
+        iswxdigit(fullStem[baseStem.size() + 3]) &&
+        iswxdigit(fullStem[baseStem.size() + 4]);
+}
+
+static bool ArtemisLegacyLooksLikeFontData(const std::vector<BYTE>& bytes) {
+    if (bytes.size() < 12) return false;
+    return (bytes[0] == 0x00 && bytes[1] == 0x01 && bytes[2] == 0x00 && bytes[3] == 0x00) ||
+        memcmp(bytes.data(), "OTTO", 4) == 0 ||
+        memcmp(bytes.data(), "ttcf", 4) == 0 ||
+        memcmp(bytes.data(), "true", 4) == 0;
+}
+
+static bool ArtemisLegacyReadFontFileForProxy(const std::wstring& path,
+    const wchar_t* faceHint, std::vector<BYTE>& bytes) {
+    bytes.clear();
+    if (path.empty()) return false;
+
+    HANDLE hFile = orgCreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0 || size.QuadPart > 128 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    bytes.resize((size_t)size.QuadPart);
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, bytes.data(), (DWORD)bytes.size(), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read != bytes.size() || !ArtemisLegacyLooksLikeFontData(bytes)) {
+        bytes.clear();
+        return false;
+    }
+
+    if (FontPatcher::IsFontCollection(bytes.data(), bytes.size())) {
+        std::vector<BYTE> extracted;
+        if (!FontPatcher::ExtractFontFromCollectionByName(bytes, faceHint, extracted)) {
+            ArtemisLegacyTraceLimited("proxy-font-ttc-extract-failed source='%s' face='%s'",
+                ArtemisLegacyWideToUtf8(path).c_str(),
+                ArtemisLegacyWideToUtf8(faceHint ? faceHint : L"").c_str());
+            bytes.clear();
+            return false;
+        }
+        bytes.swap(extracted);
+    }
+    return ArtemisLegacyLooksLikeFontData(bytes);
+}
+
+static std::vector<FontPatcher::CmapAlias> ArtemisLegacyBuildCmapAliasesFromTextSubstitution() {
+    std::vector<FontPatcher::CmapAlias> aliases;
+    if (!IsTextSubstitutionActive()) return aliases;
+
+    const TextSubstitutionTable& table = ActiveTextSubstitutionTable();
+    aliases.reserve(table.count);
+    for (size_t i = 0; i < table.count; ++i) {
+        DWORD from = (DWORD)table.pairs[i].from;
+        DWORD to = (DWORD)table.pairs[i].to;
+        if (from == to || from > 0xFFFF || to > 0xFFFF) continue;
+
+        FontPatcher::CmapAlias alias = {};
+        alias.fromCodepoint = from;
+        alias.toCodepoint = to;
+        aliases.push_back(alias);
+    }
+    return aliases;
+}
+
+static void ArtemisLegacyPatchProxyFontBytes(std::vector<BYTE>& bytes,
+    const wchar_t* familyName, bool patchFamilyName, const char* sourceMode) {
+    if (bytes.empty() || !ArtemisLegacyLooksLikeFontData(bytes)) return;
+
+    bool namePatched = false;
+    bool cmapPatched = false;
+    bool codepagePatched = false;
+    bool metricsPatched = false;
+
+    if (patchFamilyName && familyName && familyName[0]) {
+        namePatched = FontPatcher::PatchNameTableFamily(bytes, familyName);
+    }
+
+    std::vector<FontPatcher::CmapAlias> aliases = ArtemisLegacyBuildCmapAliasesFromTextSubstitution();
+    if (!aliases.empty()) {
+        cmapPatched = FontPatcher::PatchCmapAliases(bytes, aliases.data(), aliases.size());
+    }
+
+    if (Config::EnableCharsetReplace) {
+        codepagePatched = FontPatcher::PatchOS2CodePageRangeForCharset(bytes, Config::ForcedCharset);
+    }
+
+    if (Config::EnableFontVerticalMetrics) {
+        int lineGap = Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0;
+        metricsPatched = FontPatcher::PatchVerticalMetrics(bytes,
+            Config::FontAscentPermille, Config::FontDescentPermille, lineGap);
+    }
+
+    ArtemisLegacyTraceLimited("proxy-font-patched mode=%s bytes=%lu name=%d cmap=%d aliases=%lu codepage=%d metrics=%d family='%s'",
+        sourceMode ? sourceMode : "unknown", (DWORD)bytes.size(),
+        namePatched ? 1 : 0, cmapPatched ? 1 : 0, (DWORD)aliases.size(),
+        codepagePatched ? 1 : 0, metricsPatched ? 1 : 0,
+        ArtemisLegacyWideToUtf8((patchFamilyName && familyName) ? familyName : L"").c_str());
+}
+
+static bool ArtemisLegacyExportSelectedFontToMemory(std::vector<BYTE>& bytes, LONG version) {
+    bytes.clear();
+    if (Config::ForcedFontNameW[0] == L'\0') return false;
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) return false;
+
+    LOGFONTW lf = {};
+    lf.lfHeight = -64;
+    lf.lfWeight = (Config::EnableFontWeight && Config::FontWeight > 0) ? Config::FontWeight : FW_NORMAL;
+    lf.lfCharSet = Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(lf.lfFaceName, Config::ForcedFontNameW);
+
+    HFONT hFont = orgCreateFontIndirectW(&lf);
+    if (!hFont) {
+        DeleteDC(hdc);
+        ArtemisLegacyTraceLimited("font-export-failed version=%ld reason=create-font face='%s' err=%lu",
+            version, ArtemisLegacyWideToUtf8(Config::ForcedFontNameW).c_str(), GetLastError());
+        return false;
+    }
+
+    HGDIOBJ old = orgSelectObject(hdc, hFont);
+    DWORD size = orgGetFontData(hdc, 0, 0, NULL, 0);
+    if (size == GDI_ERROR || size < 12 || size > 128 * 1024 * 1024) {
+        DWORD err = GetLastError();
+        orgSelectObject(hdc, old);
+        DeleteObject(hFont);
+        DeleteDC(hdc);
+        SetLastError(err);
+        ArtemisLegacyTraceLimited("font-export-failed version=%ld reason=get-size face='%s' err=%lu size=%lu",
+            version, ArtemisLegacyWideToUtf8(Config::ForcedFontNameW).c_str(), err, size);
+        return false;
+    }
+
+    bytes.resize(size);
+    DWORD read = orgGetFontData(hdc, 0, 0, bytes.data(), size);
+    DWORD err = GetLastError();
+    orgSelectObject(hdc, old);
+    DeleteObject(hFont);
+    DeleteDC(hdc);
+
+    if (read == GDI_ERROR || read != size || !ArtemisLegacyLooksLikeFontData(bytes)) {
+        SetLastError(err);
+        ArtemisLegacyTraceLimited("font-export-failed version=%ld reason=get-data face='%s' err=%lu read=%lu size=%lu",
+            version, ArtemisLegacyWideToUtf8(Config::ForcedFontNameW).c_str(), err, read, size);
+        bytes.clear();
+        return false;
+    }
+
+    ArtemisLegacyPatchProxyFontBytes(bytes, Config::ForcedFontNameW, true, "gdi-export");
+    ArtemisLegacyTraceLimited("font-export-memory version=%ld face='%s' bytes=%lu",
+        version, ArtemisLegacyWideToUtf8(Config::ForcedFontNameW).c_str(), (DWORD)bytes.size());
+    return true;
+}
+
+static bool ArtemisLegacyEnsureVirtualFontMemory(LONG version, const std::wstring& target, DWORD* outByteCount) {
+    DWORD byteCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_artemisLegacyVirtualFontMutex);
+        if (g_artemisLegacyExportedFontVersion == version && !g_artemisLegacyExportedFontBytes.empty()) {
+            if (outByteCount) *outByteCount = (DWORD)g_artemisLegacyExportedFontBytes.size();
+            InterlockedExchange(&g_artemisLegacyLastVirtualFontReadyVersion, version);
+            return true;
+        }
+
+        std::vector<BYTE> bytes;
+        const char* sourceMode = "gdi-export";
+        std::wstring sourcePath;
+        if (!ArtemisLegacyExportSelectedFontToMemory(bytes, version)) {
+            sourcePath = ArtemisLegacyFindConfiguredSystemFontFile();
+            if (!sourcePath.empty() &&
+                ArtemisLegacyReadFontFileForProxy(sourcePath, Config::ForcedFontNameW, bytes)) {
+                ArtemisLegacyPatchProxyFontBytes(bytes, Config::ForcedFontNameW, true, "system-file");
+                sourceMode = "system-file";
+            }
+        }
+        if (bytes.empty()) {
+            sourcePath = ArtemisLegacyFindConfiguredLocalFontFile();
+            if (!sourcePath.empty() &&
+                ArtemisLegacyReadFontFileForProxy(sourcePath, Config::ForcedFontNameW, bytes)) {
+                // Local fallback is often already a prepared proxy font. Keep
+                // its internal family name when the configured face cannot be
+                // resolved through GDI.
+                ArtemisLegacyPatchProxyFontBytes(bytes, NULL, false, "local-file");
+                sourceMode = "local-file";
+            }
+        }
+        if (bytes.empty()) {
+            ArtemisLegacyTraceLimited("font-sync-failed version=%ld mode=proxy-memory virtual='%s'",
+                version, ArtemisLegacyWideToUtf8(target).c_str());
+            return false;
+        }
+
+        g_artemisLegacyExportedFontBytes.swap(bytes);
+        g_artemisLegacyExportedFontVersion = version;
+        byteCount = (DWORD)g_artemisLegacyExportedFontBytes.size();
+        ArtemisLegacyTraceLimited("font-sync-source version=%ld mode=%s source='%s'",
+            version, sourceMode, ArtemisLegacyWideToUtf8(sourcePath).c_str());
+    }
+
+    InterlockedExchange(&g_artemisLegacyLastVirtualFontReadyVersion, version);
+    if (outByteCount) *outByteCount = byteCount;
+    ArtemisLegacyTraceLimited("font-sync version=%ld mode=memory virtual='%s' bytes=%lu",
+        version, ArtemisLegacyWideToUtf8(target).c_str(), byteCount);
+    return true;
+}
+
+static bool ArtemisLegacySyncVirtualFontFile(LONG version) {
+    if (!Config::EnableArtemisHook || !Config::ArtemisRedirectFontFiles ||
+        !Config::EnableFontHook || !Config::EnableFaceNameReplace) {
+        return false;
+    }
+
+    std::wstring target = ArtemisLegacyVirtualFontFullPathForVersion(version);
+    if (target.empty()) {
+        ArtemisLegacyTraceLimited("font-sync-skip version=%ld reason=no-target path='%s'",
+            version, ArtemisLegacyWideToUtf8(ArtemisLegacyBuildVirtualFontPathForVersion(version)).c_str());
+        return false;
+    }
+
+    DWORD byteCount = 0;
+    if (ArtemisLegacyEnsureVirtualFontMemory(version, target, &byteCount)) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool ArtemisLegacyIsIetPath(const std::wstring& normalized) {
+    if (!ArtemisLegacyHasExtension(normalized, L".iet")) return false;
+    return normalized.find(L"\\system\\") != std::wstring::npos ||
+        normalized.find(L"\\scenario\\") != std::wstring::npos ||
+        normalized.find(L"\\_base\\") != std::wstring::npos;
+}
+
+static bool ArtemisLegacyIsTextScriptPath(const std::wstring& normalized) {
+    if (!ArtemisLegacyHasExtension(normalized, L".txt")) return false;
+    return normalized.find(L"\\scenario\\") != std::wstring::npos ||
+        normalized.find(L"\\system\\") != std::wstring::npos;
+}
+
+static bool ArtemisLegacyIsFontFilePath(const std::wstring& normalized) {
+    bool inFontDir =
+        normalized.find(L"\\_base\\font\\") != std::wstring::npos ||
+        normalized.find(L"\\font\\") != std::wstring::npos;
+    if (!inFontDir) return false;
+    return ArtemisLegacyHasExtension(normalized, L".ttf") ||
+        ArtemisLegacyHasExtension(normalized, L".otf") ||
+        ArtemisLegacyHasExtension(normalized, L".ttc");
+}
+
+static bool ArtemisLegacyIsRenderedFontPath(const std::wstring& normalized) {
+    bool inFontDir =
+        normalized.find(L"\\_base\\font\\") != std::wstring::npos ||
+        normalized.find(L"\\font\\") != std::wstring::npos;
+    return inFontDir && ArtemisLegacyHasExtension(normalized, L".rft");
+}
+
+static bool ArtemisLegacyShouldHideRenderedFontW(const wchar_t* path) {
+    UNREFERENCED_PARAMETER(path);
+    return false;
+}
+
+static ArtemisLegacyPathInfo ArtemisLegacyClassifyPath(const wchar_t* path) {
+    ArtemisLegacyPathInfo info = {};
+    info.kind = ARTEMIS_LEGACY_RESOURCE_NONE;
+    if (!Config::EnableArtemisHook || IsPickerThread() || !path || !path[0]) return info;
+    if (!ArtemisLegacyLooksLikeEngineRoot()) return info;
+
+    info.requestedPath = path;
+    info.fullPath = ArtemisLegacyFullPath(path);
+    if (!ArtemisLegacyIsUnderRoot(info.fullPath)) return info;
+
+    std::wstring normalized = ArtemisLegacyNormalizePath(info.fullPath);
+    if (Config::ArtemisPatchTables && ArtemisLegacyIsIetPath(normalized) && ArtemisLegacyPathExists(info.fullPath)) {
+        info.kind = ARTEMIS_LEGACY_RESOURCE_IET_SCRIPT;
+        info.sourcePath = info.fullPath;
+        return info;
+    }
+
+    if (ArtemisLegacyIsTextScriptPath(normalized) && ArtemisLegacyPathExists(info.fullPath)) {
+        info.kind = ARTEMIS_LEGACY_RESOURCE_TEXT_SCRIPT;
+        info.sourcePath = info.fullPath;
+        return info;
+    }
+
+    bool wantsFontRedirect =
+        (Config::EnableFontHook && Config::EnableFaceNameReplace) || Config::ArtemisFontPath[0] != L'\0';
+    bool isVirtualFontPath = ArtemisLegacyMatchesVirtualFontPath(info.fullPath);
+    bool isLegacyFontResource =
+        ArtemisLegacyIsFontFilePath(normalized) ||
+        ArtemisLegacyIsRenderedFontPath(normalized);
+    if (wantsFontRedirect && Config::ArtemisRedirectFontFiles &&
+        (isVirtualFontPath || isLegacyFontResource)) {
+        if (ArtemisLegacyEnsureVirtualFontMemory(Config::ConfigVersion,
+            ArtemisLegacyVirtualFontFullPathForVersion(Config::ConfigVersion), NULL)) {
+            info.kind = ARTEMIS_LEGACY_RESOURCE_FONT_FILE;
+            info.memoryFont = true;
+        }
+    }
+
+    return info;
+}
+
+static void ArtemisLegacyTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_artemisLegacyTraceCount);
+    if (hit > 2048) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][ArtemisLegacy] %s", message);
+}

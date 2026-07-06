@@ -1,0 +1,84 @@
+static void PaintTitleBar(HDC mem, const RECT& rc)
+{
+    // Title bar.
+    RECT titleRc = { 0, 0, rc.right, TITLE_HEIGHT };
+    GradientV(mem, titleRc, COL_TITLE_TOP, COL_TITLE_BOT);
+
+    // Decorative brackets for title area (Galgame style)
+    {
+        HPEN bpen = CreatePen(PS_SOLID, 2, COL_ACCENT);
+        HGDIOBJ old = SelectObject(mem, bpen);
+        // Top-left bracket
+        MoveToEx(mem, 10, 10, NULL); LineTo(mem, 25, 10);
+        MoveToEx(mem, 10, 10, NULL); LineTo(mem, 10, 25);
+        SelectObject(mem, old);
+        DeleteObject(bpen);
+    }
+
+    // Bottom accent line (sakura pink, 2px)
+    HPEN accentPen = CreatePen(PS_SOLID, 2, COL_ACCENT);
+    HGDIOBJ oldPen = SelectObject(mem, accentPen);
+    MoveToEx(mem, 0, TITLE_HEIGHT - 1, NULL);
+    LineTo(mem, rc.right, TITLE_HEIGHT - 1);
+    SelectObject(mem, oldPen);
+    DeleteObject(accentPen);
+
+    // Decorative petals on title bar
+    DrawPetal(mem, 14, TITLE_HEIGHT / 2, 5, 7, MixColor(COL_ACCENT, COL_TITLE_TOP, 0.3f));
+    DrawPetal(mem, 28, TITLE_HEIGHT / 2 - 6, 3, 4, MixColor(COL_ACCENT2, COL_TITLE_TOP, 0.5f));
+    DrawSparkle(mem, rc.right - 116, 12, 3, MixColor(COL_ACCENT2, COL_TITLE_TOP, 0.4f));
+    DrawSparkle(mem, 50, 8, 2, COL_ACCENT3);
+
+    // Title text
+    HFONT titleFont = GetCachedPickerFont(L"MS UI Gothic", SF(15), 0, FW_BOLD, DEFAULT_CHARSET);
+    HGDIOBJ oldTitleFont = SelectObject(mem, titleFont);
+    SetTextColor(mem, COL_ACCENT);
+    RECT ttRc = { 45, 0, rc.right - 168, TITLE_HEIGHT };
+    DrawTextW(mem, L"✧ 字体选择 ✧", -1, &ttRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);  // ✧ 字体选择 ✧
+
+    // Font count in title (subtle)
+    HFONT countFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+    SelectObject(mem, countFont);
+    SetTextColor(mem, COL_TEXT_DIM);
+    wchar_t countBuf[64];
+    wsprintfW(countBuf, L"%d 个字体", (int)g_filteredIndices.size());  // 个字体
+    RECT cntRc = { 40, 0, rc.right - 168, TITLE_HEIGHT };
+    DrawTextW(mem, countBuf, -1, &cntRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    // Zoom A-/A+ buttons (before close/minimize)
+    int zoomBtnW = 34;
+    int zoomOutLeft = rc.right - 88 - zoomBtnW * 2 - 4;
+    int zoomInLeft = zoomOutLeft + zoomBtnW + 2;
+    RECT zoomOutRc = { zoomOutLeft, 0, zoomOutLeft + zoomBtnW, TITLE_HEIGHT };
+    RECT zoomInRc  = { zoomInLeft, 0, zoomInLeft + zoomBtnW, TITLE_HEIGHT };
+    if (g_zoomOutHovered)
+        FillRoundRect(mem, { zoomOutRc.left + 2, 6, zoomOutRc.right - 2, TITLE_HEIGHT - 6 }, 8, COL_BTN_HOV);
+    if (g_zoomInHovered)
+        FillRoundRect(mem, { zoomInRc.left + 2, 6, zoomInRc.right - 2, TITLE_HEIGHT - 6 }, 8, COL_BTN_HOV);
+    HFONT zoomFont = GetCachedPickerFont(L"Segoe UI", SF(13), 0, FW_BOLD, DEFAULT_CHARSET);
+    SelectObject(mem, zoomFont);
+    SetTextColor(mem, g_zoomOutHovered ? COL_ACCENT : COL_TEXT_DIM);
+    DrawTextW(mem, L"A-", -1, &zoomOutRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(mem, g_zoomInHovered ? COL_ACCENT : COL_TEXT_DIM);
+    DrawTextW(mem, L"A+", -1, &zoomInRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // Close button
+    RECT closeRc = { rc.right - 46, 0, rc.right, TITLE_HEIGHT };
+    if (g_closeHovered)
+        FillRoundRect(mem, { rc.right - 42, 6, rc.right - 4, TITLE_HEIGHT - 6 }, 8, COL_CLOSE_HOV);
+    HFONT symFont = GetCachedPickerFont(L"Segoe UI Symbol", SF(16), 0, FW_NORMAL, DEFAULT_CHARSET);
+    SelectObject(mem, symFont);
+    SetTextColor(mem, g_closeHovered ? RGB(255, 255, 255) : COL_TEXT);
+    DrawTextW(mem, L"×", -1, &closeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // Minimize button
+    RECT minRc = { rc.right - 88, 0, rc.right - 46, TITLE_HEIGHT };
+    if (g_minHovered)
+        FillRoundRect(mem, { rc.right - 86, 6, rc.right - 48, TITLE_HEIGHT - 6 }, 8, COL_BTN_HOV);
+    HFONT minFont = GetCachedPickerFont(L"Segoe UI", SF(14), 0, FW_NORMAL, DEFAULT_CHARSET);
+    SelectObject(mem, minFont);
+    SetTextColor(mem, COL_TEXT);
+    DrawTextW(mem, L"—", -1, &minRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mem, oldTitleFont);
+
+}

@@ -1,0 +1,170 @@
+// Charset detection.
+static void DetectCharset(DWORD charset) {
+    if (g_CharsetDetected) return;
+    if (charset != DEFAULT_CHARSET && charset != OEM_CHARSET) {
+        g_CharsetDetected = true;
+        Config::DetectedCharset = charset;
+        Utils::Log("[Charset] Game uses charset: %u (System ACP: %u)", charset, GetACP());
+    } else if (charset == DEFAULT_CHARSET) {
+        // DEFAULT_CHARSET means "use system default". Infer from system ACP.
+        UINT acp = GetACP();
+        DWORD inferred = DEFAULT_CHARSET;
+        if (acp == 932) inferred = SHIFTJIS_CHARSET;
+        else if (acp == 936) inferred = GB2312_CHARSET;
+        else if (acp == 949) inferred = HANGUL_CHARSET;
+        else if (acp == 950) inferred = CHINESEBIG5_CHARSET;
+        else if (acp == 1252) inferred = ANSI_CHARSET;
+        if (inferred != DEFAULT_CHARSET) {
+            g_CharsetDetected = true;
+            Config::DetectedCharset = inferred;
+            Utils::Log("[Charset] Game uses DEFAULT_CHARSET, inferred %u from ACP %u", inferred, acp);
+        }
+    }
+}
+
+// Font picker thread.
+static DWORD g_pickerThreadId = 0;
+
+static bool IsPickerThread() {
+    return g_pickerThreadId != 0 && GetCurrentThreadId() == g_pickerThreadId;
+}
+
+static unsigned __stdcall FontPickerThread(void* param) {
+    g_pickerThreadId = GetCurrentThreadId();
+    FontPicker::Init((HMODULE)param);
+    return 0;
+}
+
+// Private font collection (GDI+).
+static bool FindFontFilePath() {
+    if (g_FontFilePath[0] != 0) return true;
+    WCHAR rootDir[MAX_PATH];
+    GetModuleFileNameW(g_hModule, rootDir, MAX_PATH);
+    PathRemoveFileSpecW(rootDir);
+    swprintf_s(g_FontFilePath, MAX_PATH, L"%s\\%s", rootDir, Config::FontFileName);
+    if (PathFileExistsW(g_FontFilePath)) return true;
+    g_FontFilePath[0] = 0;
+    return false;
+}
+
+static bool LoadGdiPlusPrivateFont() {
+    if (g_PrivateFontCollection != NULL) return true;
+    HMODULE hGdiPlus = GetModuleHandleW(L"gdiplus.dll");
+    if (!hGdiPlus) hGdiPlus = LoadLibraryW(L"gdiplus.dll");
+    if (!hGdiPlus) return false;
+    ptrGdipNewPrivateFontCollection = (pGdipNewPrivateFontCollection)GetProcAddress(hGdiPlus, "GdipNewPrivateFontCollection");
+    ptrGdipPrivateAddFontFile = (pGdipPrivateAddFontFile)GetProcAddress(hGdiPlus, "GdipPrivateAddFontFile");
+    if (!ptrGdipNewPrivateFontCollection || !ptrGdipPrivateAddFontFile) return false;
+    if (!FindFontFilePath()) return false;
+    GpStatus status = ptrGdipNewPrivateFontCollection(&g_PrivateFontCollection);
+    if (status != 0 || g_PrivateFontCollection == NULL) return false;
+    status = ptrGdipPrivateAddFontFile(g_PrivateFontCollection, g_FontFilePath);
+    if (status != 0) { g_PrivateFontCollection = NULL; return false; }
+    return true;
+}
+
+void EnsureInitialized() {
+    if (g_Initialized) return;
+    g_Initialized = true;
+    g_CustomFontLoaded = Utils::LoadCustomFont(g_hModule) != FALSE;
+    InstallGdiPlusHooks();
+}
+
+static __declspec(thread) bool g_inSelectObject = false;
+
+static void RestoreHdcFont(HDC hdc, HFONT hOld, HFONT hNew) {
+    if (!hNew) return;
+
+    ReplacementFontInfo oldInfo = {};
+    bool oldWasStaleReplacement =
+        hOld && TryGetReplacementInfo(hOld, &oldInfo) && oldInfo.configVersion != Config::ConfigVersion;
+
+    if (!oldWasStaleReplacement) {
+        orgSelectObject(hdc, hOld);
+    }
+
+    if (!IsManagedReplacementFont(hNew)) {
+        DeleteObject(hNew);
+    }
+}
+
+// HDC font replacement helper.
+static HFONT ReplaceHdcFont(HDC hdc, HFONT* pOldFont) {
+    *pOldFont = NULL;
+    HookPolicy::RuntimeContext policyContext = {
+        IsPickerThread(),
+        Config::EnableFontHook,
+        Config::EnableCodepageSpoof,
+        Config::EnableFaceNameReplace,
+        SoftpalShouldReplaceFontDataQueries() ||
+        MiraiShouldReplaceFontDataQueries() ||
+        MajiroShouldReplaceFontDataQueries() ||
+        DxLibShouldReplaceFontDataQueries(),
+    };
+    HookPolicy::HdcReplaceDecision policyDecision =
+        HookPolicy::ShouldReplaceHdcFont(HookPolicy::CurrentApi(), policyContext);
+    if (!policyDecision.allow) {
+        static LONG pickerSkipLogCount = 0;
+        LONG occurrence = 1;
+        if (policyDecision.reason == HookPolicy::SkipReason::PickerThread) {
+            occurrence = InterlockedIncrement(&pickerSkipLogCount);
+        }
+        if (Config::EnableDebugLog && HookPolicy::ShouldLogSkipReason(policyDecision.reason, occurrence)) {
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p action=skip reason=%s",
+                DebugCurrentApiName(), hdc, HookPolicy::SkipReasonName(policyDecision.reason));
+        }
+        return NULL;
+    }
+
+    HFONT hCurFont = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    if (!hCurFont) {
+        if (Config::EnableDebugLog)
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p action=skip reason=no-current-font", DebugCurrentApiName(), hdc);
+        return NULL;
+    }
+    if (IsStockFontHandle(hCurFont)) {
+        if (Config::EnableDebugLog)
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p current=%p action=skip reason=stock-font", DebugCurrentApiName(), hdc, hCurFont);
+        return NULL;
+    }
+
+    ReplacementFontInfo currentInfo = {};
+    LOGFONTW sourceLogfont = {};
+    HFONT originalFont = hCurFont;
+
+    if (TryGetReplacementInfo(hCurFont, &currentInfo)) {
+        if (currentInfo.configVersion == Config::ConfigVersion) {
+            if (Config::EnableDebugLog)
+                Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p current=%p action=skip reason=already-current version=%ld",
+                    DebugCurrentApiName(), hdc, hCurFont, currentInfo.configVersion);
+            return NULL;
+        }
+        sourceLogfont = currentInfo.sourceLogfont;
+        originalFont = currentInfo.originalFont;
+    } else if (orgGetObjectW(hCurFont, sizeof(sourceLogfont), &sourceLogfont) == 0) {
+        if (Config::EnableDebugLog)
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p current=%p action=skip reason=getobject-failed err=%lu",
+                DebugCurrentApiName(), hdc, hCurFont, GetLastError());
+        return NULL;
+    }
+
+    HFONT hNewFont = GetOrCreateReplacementFont(originalFont, sourceLogfont);
+    if (!hNewFont || hNewFont == hCurFont) {
+        if (Config::EnableDebugLog)
+            Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p current=%p new=%p action=skip reason=no-replacement",
+                DebugCurrentApiName(), hdc, hCurFont, hNewFont);
+        return NULL;
+    }
+
+    *pOldFont = (HFONT)orgSelectObject(hdc, hNewFont);
+    DWORD selectErr = GetLastError();
+    TraceApiHit(TRACE_REPLACE_HDC, "hdc=%p cur=%p new=%p old=%p original=%p sourceH=%ld weight=%ld",
+        hdc, hCurFont, hNewFont, *pOldFont, originalFont,
+        sourceLogfont.lfHeight, sourceLogfont.lfWeight);
+    if (Config::EnableDebugLog) {
+        Utils::Trace("[DEBUG][ReplaceDecision] api=%s hdc=%p current=%p new=%p old=%p original=%p action=select err=%lu",
+            DebugCurrentApiName(), hdc, hCurFont, hNewFont, *pOldFont, originalFont, selectErr);
+    }
+    return hNewFont;
+}
+

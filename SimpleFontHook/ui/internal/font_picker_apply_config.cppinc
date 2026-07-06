@@ -1,0 +1,543 @@
+// Picker config application and game redraw notification.
+static std::string PickerWideToUtf8(const wchar_t* text) {
+    if (!text || !text[0]) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::vector<char> buffer(len);
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, buffer.data(), len, NULL, NULL);
+    return std::string(buffer.data());
+}
+
+static void PostGameFontChangeMessages() {
+    Utils::BeginWatchdogStage("PostGameFontChangeMessages");
+    DWORD pid = GetCurrentProcessId();
+    PostMessage(HWND_BROADCAST, WM_FONTCHANGE, 0, 0);
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        DWORD wp = 0;
+        GetWindowThreadProcessId(hwnd, &wp);
+        if (wp == (DWORD)lp && hwnd != g_hWnd) {
+            PostMessage(hwnd, WM_FONTCHANGE, 0, 0);
+            PostMessage(hwnd, WM_SETTINGCHANGE, 0, (LPARAM)L"Font");
+            RedrawWindow(hwnd, NULL, NULL,
+                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+        }
+        return TRUE;
+    }, (LPARAM)pid);
+    Utils::EndWatchdogStage("posted");
+}
+
+static volatile LONG g_pickerNotifyPendingVersion = LONG_MIN;
+static volatile LONG g_pickerNotifyActive = 0;
+
+static unsigned __stdcall PickerNotifyConfigChangedThread(void*) {
+    for (;;) {
+        LONG version = InterlockedExchange(&g_pickerNotifyPendingVersion, LONG_MIN);
+        if (version == LONG_MIN) {
+            InterlockedExchange(&g_pickerNotifyActive, 0);
+            if (InterlockedCompareExchange(&g_pickerNotifyPendingVersion, LONG_MIN, LONG_MIN) == LONG_MIN ||
+                InterlockedCompareExchange(&g_pickerNotifyActive, 1, 0) != 0) {
+                break;
+            }
+            continue;
+        }
+
+        DWORD startTick = GetTickCount();
+        Utils::BeginWatchdogStage("NotifyConfigChanged version=%ld", version);
+        FontHooks::NotifyConfigChanged(version);
+        Utils::EndWatchdogStage("font-hooks");
+        PostGameFontChangeMessages();
+        DWORD elapsed = GetTickCount() - startTick;
+        if (elapsed >= 20) {
+            Utils::Trace("[TRACE][v%ld] async NotifyConfigChanged elapsed=%lu ms",
+                version, elapsed);
+        }
+    }
+    return 0;
+}
+
+static void QueueGameFontNotify(LONG version) {
+    InterlockedExchange(&g_pickerNotifyPendingVersion, version);
+    if (InterlockedCompareExchange(&g_pickerNotifyActive, 1, 0) != 0) return;
+
+    uintptr_t thread = _beginthreadex(NULL, 0, PickerNotifyConfigChangedThread, NULL, 0, NULL);
+    if (thread) {
+        CloseHandle((HANDLE)thread);
+        return;
+    }
+
+    InterlockedExchange(&g_pickerNotifyActive, 0);
+    LONG latest = InterlockedExchange(&g_pickerNotifyPendingVersion, LONG_MIN);
+    if (latest != LONG_MIN) {
+        Utils::BeginWatchdogStage("NotifyConfigChanged fallback version=%ld", latest);
+        FontHooks::NotifyConfigChanged(latest);
+        Utils::EndWatchdogStage("font-hooks");
+        PostGameFontChangeMessages();
+    }
+}
+
+static void ForceGameRedraw() {
+    LONG version = InterlockedIncrement(&Config::ConfigVersion);
+    InterlockedExchange(&Config::NeedFontReload, 1);
+    Utils::Breadcrumb("ForceGameRedraw version=%ld font='%S'", version, Config::ForcedFontNameW);
+    Utils::MarkFontSwitchForWatchdog(version, Config::ForcedFontNameW);
+    Utils::Trace("[TRACE][v%ld] ForceGameRedraw requested font='%s' height=%.3f width=%.3f gap=%d asc=%d desc=%d line=%d weightOn=%d weight=%d",
+        version, PickerWideToUtf8(Config::ForcedFontNameW).c_str(), Config::FontHeightScale, Config::FontWidthScale,
+        Config::FontCharSpacing, Config::FontAscentPermille, Config::FontDescentPermille,
+        Config::FontLineSpacing, Config::EnableFontWeight ? 1 : 0, Config::FontWeight);
+    QueueGameFontNotify(version);
+}
+
+static void SavePickerConfig() {
+    bool saveVisibleSource =
+        !g_metricCloneFace.empty() &&
+        !g_metricCloneSourceFace.empty() &&
+        _wcsicmp(g_appliedFont.c_str(), g_metricCloneFace.c_str()) == 0;
+
+    wchar_t backupNameW[LF_FACESIZE] = {};
+    char backupNameA[LF_FACESIZE] = {};
+    if (saveVisibleSource) {
+        wcsncpy_s(backupNameW, Config::ForcedFontNameW, _TRUNCATE);
+        strncpy_s(backupNameA, Config::ForcedFontNameA, _TRUNCATE);
+
+        wcsncpy_s(Config::ForcedFontNameW, g_metricCloneSourceFace.c_str(), LF_FACESIZE - 1);
+        WideCharToMultiByte(CP_ACP, 0, g_metricCloneSourceFace.c_str(), -1,
+            Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+        Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+    }
+
+    Utils::SaveConfig(g_hModule);
+
+    if (saveVisibleSource) {
+        wcsncpy_s(Config::ForcedFontNameW, backupNameW, _TRUNCATE);
+        strncpy_s(Config::ForcedFontNameA, backupNameA, _TRUNCATE);
+    }
+}
+
+static void RefreshFontHookEnabled() {
+    Config::EnableFontHook =
+        Config::EnableFaceNameReplace ||
+        Config::EnableCharsetReplace ||
+        Config::EnableFontHeightScale ||
+        Config::EnableFontWidthScale ||
+        Config::EnableFontCharSpacing ||
+        Config::EnableFontVerticalMetrics ||
+        Config::EnableFontLineSpacing ||
+        Config::EnableFontWeight ||
+        Config::EnableCodepageSpoof;
+}
+
+static void ApplyMetricsConfig() {
+    if ((Config::EnableFontVerticalMetrics || Config::EnableCodepageSpoof) &&
+        !CreatePatchedFontCloneFromCurrentTarget()) {
+        Utils::Trace("[TRACE] Patched font clone unavailable target='%S' asc=%d desc=%d line=%d codepage=%d",
+            GetMetricTargetFont().c_str(), Config::FontAscentPermille,
+            Config::FontDescentPermille, Config::FontLineSpacing,
+            Config::EnableCodepageSpoof ? 1 : 0);
+    }
+    RefreshFontHookEnabled();
+    ForceGameRedraw();
+    SavePickerConfig();
+}
+
+static void AdjustFontHeightScale(int deltaPercent) {
+    int oldPct = GetFontHeightPercent();
+    int pct = ClampInt(oldPct + deltaPercent, FONT_SCALE_MIN_PERCENT, FONT_SCALE_MAX_PERCENT);
+    if (pct == oldPct) return;
+    Config::FontHeightScale = pct / 100.0f;
+    Config::EnableFontHeightScale = (pct != 100);
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontWidthScale(int deltaPercent) {
+    int oldPct = GetFontWidthPercent();
+    int pct = ClampInt(oldPct + deltaPercent, FONT_SCALE_MIN_PERCENT, FONT_SCALE_MAX_PERCENT);
+    if (pct == oldPct) return;
+    Config::FontWidthScale = pct / 100.0f;
+    Config::EnableFontWidthScale = (pct != 100);
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontSpacing(int delta) {
+    int oldValue = GetFontSpacingValue();
+    int value = ClampInt(oldValue + delta, FONT_SPACING_MIN, FONT_SPACING_MAX);
+    if (value == oldValue) return;
+    Config::FontCharSpacing = value;
+    Config::EnableFontCharSpacing = (value != 0);
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontAscent(int delta) {
+    int oldValue = GetFontAscentValue();
+    int value = ClampInt(oldValue + delta, FONT_ASCENT_MIN, FONT_ASCENT_MAX);
+    if (value == oldValue) return;
+    Config::FontAscentPermille = value;
+    Config::EnableFontVerticalMetrics = true;
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontDescent(int delta) {
+    int oldValue = GetFontDescentValue();
+    int value = ClampInt(oldValue + delta, FONT_DESCENT_MIN, FONT_DESCENT_MAX);
+    if (value == oldValue) return;
+    Config::FontDescentPermille = value;
+    Config::EnableFontVerticalMetrics = true;
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontLineSpacing(int delta) {
+    int oldValue = GetFontLineValue();
+    int value = ClampInt(oldValue + delta, FONT_LINE_MIN, FONT_LINE_MAX);
+    if (value == oldValue) return;
+    Config::FontLineSpacing = value;
+    Config::EnableFontLineSpacing = (value != 0);
+    ApplyMetricsConfig();
+}
+
+static void AdjustFontWeight(int deltaWeight) {
+    int oldWeight = GetFontWeightValue();
+    int weight = ClampInt(oldWeight + deltaWeight, FONT_WEIGHT_MIN, FONT_WEIGHT_MAX);
+    if (weight == oldWeight) return;
+    Config::FontWeight = weight;
+    Config::EnableFontWeight = (weight != FW_NORMAL);
+    ApplyMetricsConfig();
+}
+
+static void AutoVerticalMetrics() {
+    std::wstring referenceFace = GetMetricReferenceFont();
+    HDC hdc = GetDC(NULL);
+
+    bool measured = false;
+
+    auto scaleToPermille = [](int value, int em) -> int {
+        if (em <= 0) return value;
+        long long scaled = (long long)value * 1000LL;
+        if (scaled >= 0) return (int)((scaled + em / 2) / em);
+        return (int)((scaled - em / 2) / em);
+    };
+
+    auto acceptMetrics = [&](int asc, int descAbs, int line, const wchar_t* source) -> bool {
+        if (asc <= 0 || descAbs <= 0) return false;
+        int ascPermille = asc;
+        int descPermille = descAbs;
+        int linePermille = line;
+        if (ascPermille < 500 || ascPermille > 1300 ||
+            descPermille < 1 || descPermille > 700 ||
+            ascPermille + descPermille > 1600 ||
+            linePermille < FONT_LINE_MIN || linePermille > FONT_LINE_MAX) {
+            Utils::Trace("[TRACE] AutoVerticalMetrics rejected reference='%S' source='%S' asc=%d desc=%d line=%d",
+                referenceFace.c_str(), source, ascPermille, -descPermille, linePermille);
+            return false;
+        }
+        Config::FontAscentPermille = ClampInt(ascPermille, FONT_ASCENT_MIN, FONT_ASCENT_MAX);
+        Config::FontDescentPermille = ClampInt(-descPermille, FONT_DESCENT_MIN, FONT_DESCENT_MAX);
+        Config::FontLineSpacing = ClampInt(linePermille, FONT_LINE_MIN, FONT_LINE_MAX);
+        Config::FontHeightScale = 1.0f;
+        Config::EnableFontHeightScale = false;
+        Config::EnableFontVerticalMetrics = true;
+        Config::EnableFontLineSpacing = (Config::FontLineSpacing != 0);
+        Utils::Trace("[TRACE] AutoVerticalMetrics accepted target='%S' reference='%S' source='%S' asc=%d desc=%d line=%d heightScale=%.3f",
+            GetMetricTargetFont().c_str(), referenceFace.c_str(), source, Config::FontAscentPermille,
+            Config::FontDescentPermille, Config::FontLineSpacing, Config::FontHeightScale);
+        return true;
+    };
+
+    auto acceptDesignMetrics = [&](int em, int asc, int descAbs, int line, const wchar_t* source) -> bool {
+        if (em <= 0) return false;
+        int ascPermille = scaleToPermille(asc, em);
+        int descPermille = abs(scaleToPermille(descAbs, em));
+        int linePermille = scaleToPermille(line, em);
+        return acceptMetrics(ascPermille, descPermille, linePermille, source);
+    };
+
+    auto readU16BE = [](const BYTE* p) -> int {
+        return (int)((p[0] << 8) | p[1]);
+    };
+
+    auto readS16BE = [&](const BYTE* p) -> int {
+        int value = readU16BE(p);
+        return (value & 0x8000) ? value - 0x10000 : value;
+    };
+
+    auto hdcFaceMatches = [&](HDC probeHdc, BYTE charset) -> bool {
+        wchar_t actualFace[LF_FACESIZE] = {};
+        if (GetTextFaceW(probeHdc, LF_FACESIZE, actualFace) <= 0) return true;
+        if (_wcsicmp(actualFace, referenceFace.c_str()) == 0) return true;
+        Utils::Trace("[TRACE] AutoVerticalMetrics rejected fallback face reference='%S' actual='%S' charset=%u",
+            referenceFace.c_str(), actualFace, (unsigned)charset);
+        return false;
+    };
+
+    auto tryMeasureWithCharset = [&](BYTE charset) -> bool {
+        if (!hdc) return false;
+
+        LOGFONTW lf = {};
+        lf.lfHeight = -1000;
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = charset;
+        wcsncpy_s(lf.lfFaceName, referenceFace.c_str(), LF_FACESIZE - 1);
+
+        HFONT hFont = CreateFontIndirectW(&lf);
+        if (!hFont) return false;
+
+        HGDIOBJ old = SelectObject(hdc, hFont);
+        bool ok = false;
+        if (hdcFaceMatches(hdc, charset)) {
+            // GalFontTool uses ref_font['hhea'] scaled by unitsPerEm.
+            BYTE headTable[20] = {};
+            BYTE hheaTable[10] = {};
+            DWORD headRead = GetFontData(hdc, 0x64616568, 0, headTable, sizeof(headTable)); // 'head'
+            DWORD hheaRead = GetFontData(hdc, 0x61656868, 0, hheaTable, sizeof(hheaTable)); // 'hhea'
+            if (headRead >= sizeof(headTable) && hheaRead >= sizeof(hheaTable)) {
+                int em = readU16BE(headTable + 18);
+                int asc = readS16BE(hheaTable + 4);
+                int desc = readS16BE(hheaTable + 6);
+                int gap = readS16BE(hheaTable + 8);
+                ok = acceptDesignMetrics(em, asc, abs(desc), gap, L"fontdata-hhea");
+            }
+
+            if (!ok) {
+                UINT otmSize = GetOutlineTextMetricsW(hdc, 0, NULL);
+                if (otmSize >= sizeof(OUTLINETEXTMETRICW) && otmSize <= 1024 * 1024) {
+                    std::vector<BYTE> otmBuffer(otmSize);
+                    OUTLINETEXTMETRICW* otm = (OUTLINETEXTMETRICW*)otmBuffer.data();
+                    if (GetOutlineTextMetricsW(hdc, otmSize, otm) != 0 && otm->otmEMSquare > 0 && otm->otmAscent > 0) {
+                        int em = max(1, (int)otm->otmEMSquare);
+                        ok =
+                            acceptDesignMetrics(em, (int)otm->otmMacAscent, abs((int)otm->otmMacDescent), (int)otm->otmMacLineGap, L"outline-mac") ||
+                            acceptDesignMetrics(em, (int)otm->otmAscent, abs((int)otm->otmDescent), (int)otm->otmLineGap, L"outline-typo");
+                    }
+                } else if (otmSize != 0) {
+                    Utils::Trace("[TRACE] AutoVerticalMetrics outline skipped reference='%S' suspiciousSize=%u",
+                        referenceFace.c_str(), otmSize);
+                }
+            }
+
+            TEXTMETRICW tm = {};
+            if (!ok && GetTextMetricsW(hdc, &tm)) {
+                int em = max(1, (int)(tm.tmAscent + tm.tmDescent));
+                ok = acceptDesignMetrics(em, tm.tmAscent, tm.tmDescent, tm.tmExternalLeading, L"textmetric");
+            }
+        }
+
+        SelectObject(hdc, old);
+        DeleteObject(hFont);
+        return ok;
+    };
+
+    BYTE charsets[8] = {};
+    int charsetCount = 0;
+    auto addCharset = [&](BYTE charset) {
+        for (int i = 0; i < charsetCount; ++i) {
+            if (charsets[i] == charset) return;
+        }
+        if (charsetCount < (int)_countof(charsets)) charsets[charsetCount++] = charset;
+    };
+    addCharset(DEFAULT_CHARSET);
+    if (Config::EnableCharsetReplace) addCharset((BYTE)Config::ForcedCharset);
+    if (g_selectedCharset >= 0 && g_selectedCharset < g_charsetCount)
+        addCharset(g_charsets[g_selectedCharset].value);
+    addCharset(GB2312_CHARSET);
+    addCharset(SHIFTJIS_CHARSET);
+    addCharset(ANSI_CHARSET);
+    addCharset(OEM_CHARSET);
+
+    for (int i = 0; i < charsetCount && !measured; ++i) {
+        measured = tryMeasureWithCharset(charsets[i]);
+    }
+
+    if (!measured) {
+        Config::FontAscentPermille = 880;
+        Config::FontDescentPermille = -120;
+        Config::FontLineSpacing = 0;
+        Config::FontHeightScale = 1.0f;
+        Config::EnableFontVerticalMetrics = true;
+        Config::EnableFontLineSpacing = false;
+        Config::EnableFontHeightScale = false;
+        Utils::Trace("[TRACE] AutoVerticalMetrics fallback defaults target='%S' reference='%S'",
+            GetMetricTargetFont().c_str(), referenceFace.c_str());
+    }
+    if (hdc) ReleaseDC(NULL, hdc);
+    ApplyMetricsConfig();
+}
+
+static void ResetDetailedMetrics() {
+    std::wstring restoreFace;
+    if (!g_metricCloneFace.empty() && !g_metricCloneSourceFace.empty() &&
+        _wcsicmp(g_appliedFont.c_str(), g_metricCloneFace.c_str()) == 0)
+        restoreFace = g_metricCloneSourceFace;
+
+    Config::FontWidthScale = 1.0f;
+    Config::FontHeightScale = 1.0f;
+    Config::FontCharSpacing = 0;
+    Config::FontAscentPermille = 880;
+    Config::FontDescentPermille = -120;
+    Config::FontLineSpacing = 0;
+    Config::FontWeight = FW_NORMAL;
+    Config::EnableFontWidthScale = false;
+    Config::EnableFontHeightScale = false;
+    Config::EnableFontCharSpacing = false;
+    Config::EnableFontVerticalMetrics = false;
+    Config::EnableFontLineSpacing = false;
+    Config::EnableFontWeight = false;
+
+    if (!restoreFace.empty()) {
+        g_appliedFont = restoreFace;
+        wcsncpy_s(Config::ForcedFontNameW, restoreFace.c_str(), LF_FACESIZE - 1);
+        WideCharToMultiByte(CP_ACP, 0, restoreFace.c_str(), -1,
+            Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+        Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+        Config::EnableFaceNameReplace = true;
+    }
+    ClearMetricCloneFonts();
+    ApplyMetricsConfig();
+}
+
+static int FindCharsetIndexByValue(BYTE value) {
+    for (int i = 0; i < g_charsetCount; ++i) {
+        if (g_charsets[i].value == value)
+            return i;
+    }
+    return 0;
+}
+
+static BYTE ResolveSpoofRuntimeSourceCharset(BYTE targetCharset) {
+    BYTE source = GetGameCharset();
+    if (source != DEFAULT_CHARSET && source != targetCharset)
+        return source;
+
+    if (Config::EnableCharsetReplace &&
+        Config::ForcedCharset != DEFAULT_CHARSET &&
+        Config::ForcedCharset != targetCharset)
+        return (BYTE)Config::ForcedCharset;
+
+    if (g_selectedCharset >= 0 && g_selectedCharset < g_charsetCount) {
+        BYTE selected = g_charsets[g_selectedCharset].value;
+        if (selected != DEFAULT_CHARSET && selected != targetCharset)
+            return selected;
+    }
+
+    return targetCharset == GB2312_CHARSET ? SHIFTJIS_CHARSET : GB2312_CHARSET;
+}
+
+// Apply spoof config to Config namespace and force redraw
+static void ApplySpoofConfig() {
+    BYTE targetCharset = g_spoofCharsets[g_spoofCharsetIdx].value;
+    BYTE sourceCharset = ResolveSpoofRuntimeSourceCharset(targetCharset);
+    g_spoofFromIdx = FindCharsetIndexByValue(sourceCharset);
+    g_spoofToIdx = FindCharsetIndexByValue(targetCharset);
+
+    Config::EnableCodepageSpoof = g_spoofEnabled;
+    Config::EnableCodepageRuntimeReplace = g_spoofRuntimeReplaceEnabled;
+    Config::SpoofFromCharset = sourceCharset;
+    Config::SpoofToCharset = targetCharset;
+
+    Utils::Log("[Config] Codepage spoof: %s, target=%u, bit=%d, runtimeReplace=%d, source=%u (Reloading...)",
+        g_spoofEnabled ? "ON" : "OFF", 
+        (DWORD)Config::SpoofToCharset,
+        FontPatcher::CodePageRangeBitForCharset(Config::SpoofToCharset),
+        g_spoofRuntimeReplaceEnabled ? 1 : 0,
+        (DWORD)Config::SpoofFromCharset);
+
+    // Reload fonts to apply/remove OS/2 patches
+    EnumerateFonts();
+    if (Config::EnableCodepageSpoof || Config::EnableFontVerticalMetrics) {
+        if (!CreatePatchedFontCloneFromCurrentTarget()) {
+            Utils::Trace("[TRACE] Codepage spoof clone unavailable target='%S' charset=%lu",
+                GetMetricTargetFont().c_str(), Config::SpoofToCharset);
+        }
+    } else {
+        std::wstring restoreFace;
+        if (!g_metricCloneFace.empty() && !g_metricCloneSourceFace.empty() &&
+            _wcsicmp(g_appliedFont.c_str(), g_metricCloneFace.c_str()) == 0)
+            restoreFace = g_metricCloneSourceFace;
+        ClearMetricCloneFonts();
+        if (!restoreFace.empty()) {
+            g_appliedFont = restoreFace;
+            wcsncpy_s(Config::ForcedFontNameW, restoreFace.c_str(), LF_FACESIZE - 1);
+            WideCharToMultiByte(CP_ACP, 0, restoreFace.c_str(), -1,
+                Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+            Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
+            Config::EnableFaceNameReplace = true;
+        }
+    }
+    
+    RefreshFontHookEnabled();
+    ForceGameRedraw();
+    SavePickerConfig();
+}
+
+// Decorative primitives used by the picker renderer.
+static void ApplyTextSubstitutionConfig() {
+    Config::EnableTextSubstitution = g_textSubstitutionEnabled;
+    Config::TextSubstitutionMode = g_textSubstitutionModes[g_textSubstitutionModeIdx].mode;
+    Config::TextSubstitutionCodepage = g_textSubstitutionCodepages[g_textSubstitutionCodepageIdx].codepage;
+    Utils::Log("[Config] Text substitution: %s, mode=%d, codepage=%u",
+        g_textSubstitutionEnabled ? "ON" : "OFF",
+        Config::TextSubstitutionMode,
+        Config::TextSubstitutionCodepage);
+    ForceGameRedraw();
+    SavePickerConfig();
+}
+
+static int FindCodepageRedirectPresetIndex(UINT fromCodepage, UINT toCodepage) {
+    for (int i = 0; i < g_codepageRedirectPresetCount; ++i) {
+        if (g_codepageRedirectPresets[i].fromCodepage == fromCodepage &&
+            g_codepageRedirectPresets[i].toCodepage == toCodepage) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void ApplyCodepageRedirectConfig() {
+    const CodepageRedirectPresetEntry& preset = g_codepageRedirectPresets[g_codepageRedirectPresetIdx];
+    Config::EnableCodepageRedirect = g_codepageRedirectEnabled;
+    Config::CodepageRedirectFrom = preset.fromCodepage;
+    Config::CodepageRedirectTo = preset.toCodepage;
+    Utils::Log("[Config] Codepage redirect: %s, %u -> %u",
+        g_codepageRedirectEnabled ? "ON" : "OFF",
+        Config::CodepageRedirectFrom,
+        Config::CodepageRedirectTo);
+    ForceGameRedraw();
+    SavePickerConfig();
+}
+
+static void DrawPetal(HDC hdc, int cx, int cy, int w, int h, COLORREF col) {
+    POINT pts[4] = { {cx, cy - h}, {cx + w, cy}, {cx, cy + h}, {cx - w, cy} };
+    HBRUSH br = CreateSolidBrush(col);
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HGDIOBJ oldBr = SelectObject(hdc, br);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    Polygon(hdc, pts, 4);
+    SelectObject(hdc, oldBr);
+    SelectObject(hdc, oldPen);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+static void DrawDiagonalPattern(HDC hdc, const RECT& rc, COLORREF col) {
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HGDIOBJ old = SelectObject(hdc, pen);
+    int step = SF(12);
+    for (int x = rc.left - rc.bottom; x < rc.right; x += step) {
+        MoveToEx(hdc, x, rc.top, NULL);
+        LineTo(hdc, x + (rc.bottom - rc.top), rc.bottom);
+    }
+    SelectObject(hdc, old);
+    DeleteObject(pen);
+}
+
+// Sparkle: 4-pointed star
+static void DrawSparkle(HDC hdc, int cx, int cy, int sz, COLORREF col) {
+    HPEN pen = CreatePen(PS_SOLID, 1, col);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    MoveToEx(hdc, cx - sz, cy, NULL); LineTo(hdc, cx + sz + 1, cy);
+    MoveToEx(hdc, cx, cy - sz, NULL); LineTo(hdc, cx, cy + sz + 1);
+    int d = sz * 6 / 10;
+    MoveToEx(hdc, cx - d, cy - d, NULL); LineTo(hdc, cx + d + 1, cy + d + 1);
+    MoveToEx(hdc, cx + d, cy - d, NULL); LineTo(hdc, cx - d - 1, cy + d + 1);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+

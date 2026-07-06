@@ -1,0 +1,131 @@
+static void PaintMetricsBar(HDC mem, const RECT& rc)
+{
+    // Game font metrics bar.
+    {
+        int mtTop = GetMetricsTop();
+        RECT mtBg = { 0, mtTop, rc.right, mtTop + METRICS_HEIGHT };
+        HBRUSH mtBgBr = CreateSolidBrush(RGB(22, 18, 38));
+        FillRect(mem, &mtBg, mtBgBr);
+        DeleteObject(mtBgBr);
+
+        HPEN mtSep = CreatePen(PS_SOLID, 1, COL_SEPARATOR);
+        HGDIOBJ oldMtSep = SelectObject(mem, mtSep);
+        MoveToEx(mem, 0, mtTop, NULL);
+        LineTo(mem, rc.right, mtTop);
+        MoveToEx(mem, 0, mtTop + METRICS_HEIGHT - 1, NULL);
+        LineTo(mem, rc.right, mtTop + METRICS_HEIGHT - 1);
+        SelectObject(mem, oldMtSep);
+        DeleteObject(mtSep);
+
+        HFONT mtFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+        HFONT mtBold = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_BOLD, DEFAULT_CHARSET);
+        HGDIOBJ oldMtFont = SelectObject(mem, mtFont);
+
+        MetricsRects mr;
+        GetMetricsRects(mr);
+
+        auto drawMetricButton = [&](const RECT& br, const wchar_t* text, int hit, bool enabled) {
+            COLORREF bgCol = (g_metricHovered == hit && enabled) ? COL_HOVER_BG : RGB(38, 30, 56);
+            FillRoundRect(mem, br, 7, bgCol);
+            DrawRoundRectOutline(mem, br, 7, enabled ? COL_BORDER : RGB(55, 45, 75));
+            SetTextColor(mem, enabled ? (g_metricHovered == hit ? COL_ACCENT : COL_TEXT_DIM) : RGB(85, 70, 105));
+            RECT textRc = br;
+            DrawTextW(mem, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        };
+
+        auto drawMetricValue = [&](const RECT& vr, const wchar_t* text, bool active) {
+            FillRoundRect(mem, vr, 7, RGB(30, 24, 48));
+            DrawRoundRectOutline(mem, vr, 7, active ? COL_ACCENT : COL_BORDER);
+            SetTextColor(mem, active ? COL_ACCENT : COL_TEXT);
+            RECT textRc = vr;
+            DrawTextW(mem, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        };
+
+        auto drawStepper = [&](const MetricStepperRects& sr, const wchar_t* label, const wchar_t* value,
+                               bool active, bool canDown, bool canUp) {
+            SelectObject(mem, mtBold);
+            SetTextColor(mem, active ? COL_ACCENT : COL_TEXT_DIM);
+            RECT labelRc = sr.label;
+            DrawTextW(mem, label, -1, &labelRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(mem, mtFont);
+            drawMetricButton(sr.down, L"-", sr.hitDown, canDown);
+            drawMetricButton(sr.up, L"+", sr.hitUp, canUp);
+            drawMetricValue(sr.value, value, active);
+        };
+
+        auto drawWideButton = [&](const RECT& br, const wchar_t* text, int hit, bool enabled) {
+            COLORREF bgCol = (g_metricHovered == hit && enabled) ? COL_HOVER_BG : RGB(34, 26, 52);
+            FillRoundRect(mem, br, 7, bgCol);
+            DrawRoundRectOutline(mem, br, 7, enabled ? COL_BORDER : RGB(55, 45, 75));
+            SelectObject(mem, mtBold);
+            SetTextColor(mem, enabled ? (g_metricHovered == hit ? COL_ACCENT : COL_TEXT_DIM) : RGB(85, 70, 105));
+            RECT textRc = br;
+            DrawTextW(mem, text, -1, &textRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        };
+
+        wchar_t valueBuf[96];
+        int widthPct = GetFontWidthPercent();
+        swprintf_s(valueBuf, L"%.2f", widthPct / 100.0);
+        drawStepper(mr.width, L"\x5b57\x5bbd", valueBuf, Config::EnableFontWidthScale,
+            widthPct > FONT_SCALE_MIN_PERCENT, widthPct < FONT_SCALE_MAX_PERCENT);
+
+        int heightPct = GetFontHeightPercent();
+        swprintf_s(valueBuf, L"%.2f", heightPct / 100.0);
+        drawStepper(mr.height, L"\x5b57\x9ad8", valueBuf, Config::EnableFontHeightScale,
+            heightPct > FONT_SCALE_MIN_PERCENT, heightPct < FONT_SCALE_MAX_PERCENT);
+
+        int spacing = GetFontSpacingValue();
+        wsprintfW(valueBuf, L"%d", spacing);
+        drawStepper(mr.spacing, L"\x5b57\x8ddd", valueBuf, Config::EnableFontCharSpacing,
+            spacing > FONT_SPACING_MIN, spacing < FONT_SPACING_MAX);
+
+        int ascent = GetFontAscentValue();
+        wsprintfW(valueBuf, L"%d", ascent);
+        drawStepper(mr.ascent, L"\x4e0a\x884c", valueBuf, Config::EnableFontVerticalMetrics,
+            ascent > FONT_ASCENT_MIN, ascent < FONT_ASCENT_MAX);
+
+        int descent = GetFontDescentValue();
+        wsprintfW(valueBuf, L"%d", descent);
+        drawStepper(mr.descent, L"\x4e0b\x884c", valueBuf, Config::EnableFontVerticalMetrics,
+            descent > FONT_DESCENT_MIN, descent < FONT_DESCENT_MAX);
+
+        int line = GetFontLineValue();
+        wsprintfW(valueBuf, L"%d", line);
+        drawStepper(mr.line, L"\x884c\x8ddd", valueBuf, Config::EnableFontLineSpacing,
+            line > FONT_LINE_MIN, line < FONT_LINE_MAX);
+
+        int weight = GetFontWeightValue();
+        wsprintfW(valueBuf, L"%d", weight);
+        drawStepper(mr.weight, L"\x7c97\x7ec6", valueBuf, Config::EnableFontWeight,
+            weight > FONT_WEIGHT_MIN, weight < FONT_WEIGHT_MAX);
+
+        bool hasDetailedMetrics =
+            Config::EnableFontWidthScale || Config::EnableFontHeightScale ||
+            Config::EnableFontCharSpacing || Config::EnableFontVerticalMetrics ||
+            Config::EnableFontLineSpacing || Config::EnableFontWeight ||
+            widthPct != 100 || heightPct != 100 || spacing != 0 ||
+            ascent != 880 || descent != -120 || line != 0 || weight != FW_NORMAL;
+        drawWideButton(mr.referenceBtn, L"\x8bbe\x4e3a\x53c2\x7167", METRIC_SET_REFERENCE, !GetSelectedFontName().empty());
+        drawWideButton(mr.autoBtn, L"\x6309\x53c2\x7167\x8ba1\x7b97", METRIC_AUTO_VERTICAL, true);
+        drawWideButton(mr.resetBtn, L"\x6e05\x7a7a\x8c03\x6574", METRIC_RESET_METRICS, hasDetailedMetrics);
+
+        std::wstring refFace = GetMetricReferenceFont();
+        std::wstring targetFace = GetUserVisibleFontName(GetMetricTargetFont());
+        if (!targetFace.empty())
+            swprintf_s(valueBuf, L"\x76ee\x6807: %.18s  \x53c2\x7167: %.18s", targetFace.c_str(), refFace.c_str());
+        else
+            swprintf_s(valueBuf, L"\x53c2\x7167: %.48s", refFace.c_str());
+        FillRoundRect(mem, mr.referenceInfo, 7, RGB(30, 24, 48));
+        DrawRoundRectOutline(mem, mr.referenceInfo, 7, COL_BORDER);
+        SelectObject(mem, mtFont);
+        SetTextColor(mem, COL_TEXT_DIM);
+        RECT refRc = mr.referenceInfo;
+        refRc.left += 8;
+        refRc.right -= 8;
+        DrawTextW(mem, valueBuf, -1, &refRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        SelectObject(mem, oldMtFont);
+    }
+
+}

@@ -1,0 +1,485 @@
+// GDI font creation types.
+typedef HFONT(WINAPI* pCreateFontA)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
+typedef HFONT(WINAPI* pCreateFontIndirectA)(const LOGFONTA*);
+typedef HFONT(WINAPI* pCreateFontW)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCWSTR);
+typedef HFONT(WINAPI* pCreateFontIndirectW)(const LOGFONTW*);
+
+static pCreateFontA orgCreateFontA = CreateFontA;
+static pCreateFontIndirectA orgCreateFontIndirectA = CreateFontIndirectA;
+static pCreateFontW orgCreateFontW = CreateFontW;
+static pCreateFontIndirectW orgCreateFontIndirectW = CreateFontIndirectW;
+
+// GDI text output types.
+typedef BOOL(WINAPI* pTextOutA)(HDC, int, int, LPCSTR, int);
+typedef BOOL(WINAPI* pTextOutW)(HDC, int, int, LPCWSTR, int);
+typedef BOOL(WINAPI* pExtTextOutA)(HDC, int, int, UINT, const RECT*, LPCSTR, UINT, const int*);
+typedef BOOL(WINAPI* pExtTextOutW)(HDC, int, int, UINT, const RECT*, LPCWSTR, UINT, const int*);
+typedef int (WINAPI* pDrawTextA)(HDC, LPCSTR, int, LPRECT, UINT);
+typedef int (WINAPI* pDrawTextW)(HDC, LPCWSTR, int, LPRECT, UINT);
+typedef int (WINAPI* pDrawTextExA)(HDC, LPSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS);
+typedef int (WINAPI* pDrawTextExW)(HDC, LPWSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS);
+
+
+static pTextOutA orgTextOutA = TextOutA;
+static pTextOutW orgTextOutW = TextOutW;
+static pExtTextOutA orgExtTextOutA = ExtTextOutA;
+static pExtTextOutW orgExtTextOutW = ExtTextOutW;
+static pDrawTextA orgDrawTextA = DrawTextA;
+static pDrawTextW orgDrawTextW = DrawTextW;
+static pDrawTextExA orgDrawTextExA = DrawTextExA;
+static pDrawTextExW orgDrawTextExW = DrawTextExW;
+
+
+// Glyph and metrics types used by engines that cache glyphs.
+typedef DWORD(WINAPI* pGetGlyphOutlineA)(HDC, UINT, UINT, LPGLYPHMETRICS, DWORD, LPVOID, const MAT2*);
+typedef DWORD(WINAPI* pGetGlyphOutlineW)(HDC, UINT, UINT, LPGLYPHMETRICS, DWORD, LPVOID, const MAT2*);
+typedef BOOL(WINAPI* pGetCharABCWidthsA)(HDC, UINT, UINT, LPABC);
+typedef BOOL(WINAPI* pGetCharABCWidthsW)(HDC, UINT, UINT, LPABC);
+typedef BOOL(WINAPI* pGetCharABCWidthsFloatA)(HDC, UINT, UINT, LPABCFLOAT);
+typedef BOOL(WINAPI* pGetCharABCWidthsFloatW)(HDC, UINT, UINT, LPABCFLOAT);
+typedef BOOL(WINAPI* pGetCharWidthA)(HDC, UINT, UINT, LPINT);
+typedef BOOL(WINAPI* pGetCharWidthW)(HDC, UINT, UINT, LPINT);
+typedef BOOL(WINAPI* pGetCharWidth32A)(HDC, UINT, UINT, LPINT);
+typedef BOOL(WINAPI* pGetCharWidth32W)(HDC, UINT, UINT, LPINT);
+typedef BOOL(WINAPI* pGetTextExtentPoint32A)(HDC, LPCSTR, int, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentPoint32W)(HDC, LPCWSTR, int, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentExPointA)(HDC, LPCSTR, int, int, LPINT, LPINT, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentExPointW)(HDC, LPCWSTR, int, int, LPINT, LPINT, LPSIZE);
+
+static pGetGlyphOutlineA orgGetGlyphOutlineA = GetGlyphOutlineA;
+static pGetGlyphOutlineW orgGetGlyphOutlineW = GetGlyphOutlineW;
+static pGetCharABCWidthsA orgGetCharABCWidthsA = GetCharABCWidthsA;
+static pGetCharABCWidthsW orgGetCharABCWidthsW = GetCharABCWidthsW;
+static pGetCharABCWidthsFloatA orgGetCharABCWidthsFloatA = GetCharABCWidthsFloatA;
+static pGetCharABCWidthsFloatW orgGetCharABCWidthsFloatW = GetCharABCWidthsFloatW;
+static pGetCharWidthA orgGetCharWidthA = GetCharWidthA;
+static pGetCharWidthW orgGetCharWidthW = GetCharWidthW;
+static pGetCharWidth32A orgGetCharWidth32A = GetCharWidth32A;
+static pGetCharWidth32W orgGetCharWidth32W = GetCharWidth32W;
+static pGetTextExtentPoint32A orgGetTextExtentPoint32A = GetTextExtentPoint32A;
+static pGetTextExtentPoint32W orgGetTextExtentPoint32W = GetTextExtentPoint32W;
+static pGetTextExtentExPointA orgGetTextExtentExPointA = GetTextExtentExPointA;
+static pGetTextExtentExPointW orgGetTextExtentExPointW = GetTextExtentExPointW;
+
+// SelectObject hook type.
+typedef HGDIOBJ(WINAPI* pSelectObject)(HDC, HGDIOBJ);
+static pSelectObject orgSelectObject = SelectObject;
+typedef HGDIOBJ(WINAPI* pGetCurrentObject)(HDC, UINT);
+static pGetCurrentObject orgGetCurrentObject = GetCurrentObject;
+
+// GetObjectW/A hook types.
+typedef int (WINAPI* pGetObjectA)(HANDLE, int, LPVOID);
+typedef int (WINAPI* pGetObjectW)(HANDLE, int, LPVOID);
+static pGetObjectA orgGetObjectA = GetObjectA;
+static pGetObjectW orgGetObjectW = GetObjectW;
+
+// GetTextMetrics hook types.
+typedef BOOL(WINAPI* pGetTextMetricsA)(HDC, LPTEXTMETRICA);
+typedef BOOL(WINAPI* pGetTextMetricsW)(HDC, LPTEXTMETRICW);
+static pGetTextMetricsA orgGetTextMetricsA = GetTextMetricsA;
+static pGetTextMetricsW orgGetTextMetricsW = GetTextMetricsW;
+typedef int (WINAPI* pGetTextCharset)(HDC);
+typedef int (WINAPI* pGetTextCharsetInfo)(HDC, LPFONTSIGNATURE, DWORD);
+static pGetTextCharset orgGetTextCharset = GetTextCharset;
+static pGetTextCharsetInfo orgGetTextCharsetInfo = GetTextCharsetInfo;
+
+// GetTextFace hook types.
+typedef int (WINAPI* pGetTextFaceA)(HDC, int, LPSTR);
+typedef int (WINAPI* pGetTextFaceW)(HDC, int, LPWSTR);
+static pGetTextFaceA orgGetTextFaceA = GetTextFaceA;
+static pGetTextFaceW orgGetTextFaceW = GetTextFaceW;
+
+// EnumFontFamiliesEx hook types.
+typedef int (WINAPI* pEnumFontFamiliesExA)(HDC, LPLOGFONTA, FONTENUMPROCA, LPARAM, DWORD);
+typedef int (WINAPI* pEnumFontFamiliesExW)(HDC, LPLOGFONTW, FONTENUMPROCW, LPARAM, DWORD);
+static pEnumFontFamiliesExA orgEnumFontFamiliesExA = EnumFontFamiliesExA;
+static pEnumFontFamiliesExW orgEnumFontFamiliesExW = EnumFontFamiliesExW;
+
+// CreateFontIndirectEx hook types.
+typedef HFONT(WINAPI* pCreateFontIndirectExA)(const ENUMLOGFONTEXDVA*);
+typedef HFONT(WINAPI* pCreateFontIndirectExW)(const ENUMLOGFONTEXDVW*);
+static pCreateFontIndirectExA orgCreateFontIndirectExA = CreateFontIndirectExA;
+static pCreateFontIndirectExW orgCreateFontIndirectExW = CreateFontIndirectExW;
+
+
+
+// Old-style font enumeration hook types.
+typedef int (WINAPI* pEnumFontsA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
+typedef int (WINAPI* pEnumFontsW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
+typedef int (WINAPI* pEnumFontFamiliesA)(HDC, LPCSTR, FONTENUMPROCA, LPARAM);
+typedef int (WINAPI* pEnumFontFamiliesW)(HDC, LPCWSTR, FONTENUMPROCW, LPARAM);
+static pEnumFontsA orgEnumFontsA = EnumFontsA;
+static pEnumFontsW orgEnumFontsW = EnumFontsW;
+static pEnumFontFamiliesA orgEnumFontFamiliesA = EnumFontFamiliesA;
+static pEnumFontFamiliesW orgEnumFontFamiliesW = EnumFontFamiliesW;
+
+// Glyph and width supplement hook types.
+typedef BOOL(WINAPI* pGetCharWidthFloatA)(HDC, UINT, UINT, PFLOAT);
+typedef BOOL(WINAPI* pGetCharWidthFloatW)(HDC, UINT, UINT, PFLOAT);
+typedef BOOL(WINAPI* pGetCharWidthI)(HDC, UINT, UINT, LPWORD, LPINT);
+typedef BOOL(WINAPI* pGetCharABCWidthsI)(HDC, UINT, UINT, LPWORD, LPABC);
+typedef DWORD(WINAPI* pGetCharacterPlacementA)(HDC, LPCSTR, int, int, LPGCP_RESULTSA, DWORD);
+typedef DWORD(WINAPI* pGetCharacterPlacementW)(HDC, LPCWSTR, int, int, LPGCP_RESULTSW, DWORD);
+typedef DWORD(WINAPI* pGetKerningPairsA)(HDC, DWORD, LPKERNINGPAIR);
+typedef DWORD(WINAPI* pGetKerningPairsW)(HDC, DWORD, LPKERNINGPAIR);
+typedef DWORD(WINAPI* pGetGlyphIndicesA)(HDC, LPCSTR, int, LPWORD, DWORD);
+typedef DWORD(WINAPI* pGetGlyphIndicesW)(HDC, LPCWSTR, int, LPWORD, DWORD);
+static pGetCharWidthFloatA orgGetCharWidthFloatA = GetCharWidthFloatA;
+static pGetCharWidthFloatW orgGetCharWidthFloatW = GetCharWidthFloatW;
+static pGetCharWidthI orgGetCharWidthI = GetCharWidthI;
+static pGetCharABCWidthsI orgGetCharABCWidthsI = GetCharABCWidthsI;
+static pGetCharacterPlacementA orgGetCharacterPlacementA = GetCharacterPlacementA;
+static pGetCharacterPlacementW orgGetCharacterPlacementW = GetCharacterPlacementW;
+static pGetKerningPairsA orgGetKerningPairsA = GetKerningPairsA;
+static pGetKerningPairsW orgGetKerningPairsW = GetKerningPairsW;
+static pGetGlyphIndicesA orgGetGlyphIndicesA = GetGlyphIndicesA;
+static pGetGlyphIndicesW orgGetGlyphIndicesW = GetGlyphIndicesW;
+
+// Font info supplement hook types.
+typedef UINT(WINAPI* pGetOutlineTextMetricsA)(HDC, UINT, LPOUTLINETEXTMETRICA);
+typedef UINT(WINAPI* pGetOutlineTextMetricsW)(HDC, UINT, LPOUTLINETEXTMETRICW);
+typedef BOOL(WINAPI* pGetTextExtentPointA)(HDC, LPCSTR, int, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentPointW)(HDC, LPCWSTR, int, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentPointI)(HDC, LPWORD, int, LPSIZE);
+typedef BOOL(WINAPI* pGetTextExtentExPointI)(HDC, LPWORD, int, int, LPINT, LPINT, LPSIZE);
+typedef DWORD(WINAPI* pGetFontData)(HDC, DWORD, DWORD, PVOID, DWORD);
+typedef DWORD(WINAPI* pGetFontLanguageInfo)(HDC);
+typedef DWORD(WINAPI* pGetFontUnicodeRanges)(HDC, LPGLYPHSET);
+static pGetOutlineTextMetricsA orgGetOutlineTextMetricsA = GetOutlineTextMetricsA;
+static pGetOutlineTextMetricsW orgGetOutlineTextMetricsW = GetOutlineTextMetricsW;
+static pGetTextExtentPointA orgGetTextExtentPointA = GetTextExtentPointA;
+static pGetTextExtentPointW orgGetTextExtentPointW = GetTextExtentPointW;
+static pGetTextExtentPointI orgGetTextExtentPointI = GetTextExtentPointI;
+static pGetTextExtentExPointI orgGetTextExtentExPointI = GetTextExtentExPointI;
+static pGetFontData orgGetFontData = GetFontData;
+static pGetFontLanguageInfo orgGetFontLanguageInfo = GetFontLanguageInfo;
+static pGetFontUnicodeRanges orgGetFontUnicodeRanges = GetFontUnicodeRanges;
+
+
+
+
+
+// GDI+ hook types.
+typedef GpStatus(WINAPI* pGdipCreateFontFamilyFromName)(const WCHAR*, GpFontCollection*, GpFontFamily**);
+typedef GpStatus(WINAPI* pGdipCreateFontFromLogfontW)(HDC, const LOGFONTW*, GpFont**);
+typedef GpStatus(WINAPI* pGdipCreateFontFromLogfontA)(HDC, const LOGFONTA*, GpFont**);
+typedef GpStatus(WINAPI* pGdipNewPrivateFontCollection)(GpFontCollection**);
+typedef GpStatus(WINAPI* pGdipPrivateAddFontFile)(GpFontCollection*, const WCHAR*);
+
+static pGdipCreateFontFamilyFromName orgGdipCreateFontFamilyFromName = NULL;
+static pGdipCreateFontFromLogfontW orgGdipCreateFontFromLogfontW = NULL;
+static pGdipCreateFontFromLogfontA orgGdipCreateFontFromLogfontA = NULL;
+static pGdipNewPrivateFontCollection ptrGdipNewPrivateFontCollection = NULL;
+static pGdipPrivateAddFontFile ptrGdipPrivateAddFontFile = NULL;
+
+// DirectWrite hook types.
+typedef HRESULT(WINAPI* pDWriteCreateFactory)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+static pDWriteCreateFactory orgDWriteCreateFactory = NULL;
+static volatile LONG g_DWriteCreateFactoryHookState = 0;
+static volatile LONG g_DWriteFactoryVtableHookState = 0;
+static volatile LONG g_DWriteCreateTextFormatTraceCount = 0;
+static volatile LONG g_DWriteCreateTextLayoutTraceCount = 0;
+
+// 新增：IDWriteFactory::CreateTextFormat 虚函数索引为 15
+typedef HRESULT(STDMETHODCALLTYPE* pCreateTextFormat)(
+    IDWriteFactory*, const WCHAR*, IDWriteFontCollection*, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_STYLE, DWRITE_FONT_STRETCH, FLOAT, const WCHAR*, IDWriteTextFormat**);
+static pCreateTextFormat orgCreateTextFormat = NULL;
+
+// IDWriteFactory::CreateTextLayout 虚函数索引为 18
+typedef HRESULT(STDMETHODCALLTYPE* pCreateTextLayout)(
+    IDWriteFactory*, const WCHAR*, UINT32, IDWriteTextFormat*, FLOAT, FLOAT, IDWriteTextLayout**);
+static pCreateTextLayout orgCreateTextLayout = NULL;
+
+typedef HRESULT(STDMETHODCALLTYPE* pIDWriteTextLayout_Draw)(
+    IDWriteTextLayout*, void*, IDWriteTextRenderer*, FLOAT, FLOAT);
+static pIDWriteTextLayout_Draw orgIDWriteTextLayout_Draw = NULL;
+
+// Library hook types.
+typedef HMODULE(WINAPI* pLoadLibraryW)(LPCWSTR);
+typedef HMODULE(WINAPI* pLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+
+static pLoadLibraryW orgLoadLibraryW = LoadLibraryW;
+static pLoadLibraryExW orgLoadLibraryExW = LoadLibraryExW;
+
+// Codepage conversion API hook types.
+typedef int (WINAPI* pMultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
+typedef int (WINAPI* pWideCharToMultiByte)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
+
+static pMultiByteToWideChar orgMultiByteToWideChar = MultiByteToWideChar;
+static pWideCharToMultiByte orgWideCharToMultiByte = WideCharToMultiByte;
+
+// INI profile API hook types.
+typedef DWORD(WINAPI* pGetPrivateProfileStringA)(LPCSTR, LPCSTR, LPCSTR, LPSTR, DWORD, LPCSTR);
+typedef DWORD(WINAPI* pGetPrivateProfileStringW)(LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, DWORD, LPCWSTR);
+typedef UINT(WINAPI* pGetPrivateProfileIntA)(LPCSTR, LPCSTR, INT, LPCSTR);
+typedef UINT(WINAPI* pGetPrivateProfileIntW)(LPCWSTR, LPCWSTR, INT, LPCWSTR);
+
+static pGetPrivateProfileStringA orgGetPrivateProfileStringA = GetPrivateProfileStringA;
+static pGetPrivateProfileStringW orgGetPrivateProfileStringW = GetPrivateProfileStringW;
+static pGetPrivateProfileIntA orgGetPrivateProfileIntA = GetPrivateProfileIntA;
+static pGetPrivateProfileIntW orgGetPrivateProfileIntW = GetPrivateProfileIntW;
+
+// File API hook types.
+typedef HANDLE(WINAPI* pCreateFileA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef HANDLE(WINAPI* pCreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef DWORD(WINAPI* pGetFileAttributesA)(LPCSTR);
+typedef DWORD(WINAPI* pGetFileAttributesW)(LPCWSTR);
+typedef BOOL(WINAPI* pGetFileAttributesExA)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+typedef BOOL(WINAPI* pGetFileAttributesExW)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
+typedef HANDLE(WINAPI* pFindFirstFileA)(LPCSTR, LPWIN32_FIND_DATAA);
+typedef HANDLE(WINAPI* pFindFirstFileW)(LPCWSTR, LPWIN32_FIND_DATAW);
+
+static pCreateFileA orgCreateFileA = CreateFileA;
+static pCreateFileW orgCreateFileW = CreateFileW;
+static pGetFileAttributesA orgGetFileAttributesA = GetFileAttributesA;
+static pGetFileAttributesW orgGetFileAttributesW = GetFileAttributesW;
+static pGetFileAttributesExA orgGetFileAttributesExA = GetFileAttributesExA;
+static pGetFileAttributesExW orgGetFileAttributesExW = GetFileAttributesExW;
+static pFindFirstFileA orgFindFirstFileA = FindFirstFileA;
+static pFindFirstFileW orgFindFirstFileW = FindFirstFileW;
+
+// Forward declarations
+void InstallGdiPlusHooks();
+
+// Shared hook state.
+static bool g_Initialized = false;
+static bool g_CharsetDetected = false;
+static bool g_CustomFontLoaded = false;
+static bool g_GdiPlusHooksInstalled = false;
+static HMODULE g_hModule = NULL;
+static GpFontCollection* g_PrivateFontCollection = NULL;
+static wchar_t g_FontFilePath[MAX_PATH] = { 0 };
+
+struct ReplacementFontInfo {
+    HFONT originalFont;
+    LOGFONTW sourceLogfont;
+    LONG configVersion;
+};
+
+struct GlyphMapKey {
+    HFONT font;
+    LONG configVersion;
+    WORD glyphIndex;
+
+    bool operator==(const GlyphMapKey& other) const {
+        return font == other.font &&
+            configVersion == other.configVersion &&
+            glyphIndex == other.glyphIndex;
+    }
+};
+
+struct GlyphMapKeyHash {
+    size_t operator()(const GlyphMapKey& key) const {
+        uintptr_t font = (uintptr_t)key.font;
+        size_t h = (size_t)(font ^ (font >> 7));
+        h ^= (size_t)key.configVersion * 16777619u;
+        h ^= (size_t)key.glyphIndex * 2166136261u;
+        return h;
+    }
+};
+
+static std::mutex g_fontCacheMutex;
+static std::unordered_map<HFONT, HFONT> g_replacementByOriginal;
+static std::unordered_map<HFONT, ReplacementFontInfo> g_replacementInfoByFont;
+static std::unordered_map<GlyphMapKey, WORD, GlyphMapKeyHash> g_realToVirtualGlyph;
+static std::unordered_map<GlyphMapKey, WORD, GlyphMapKeyHash> g_virtualToRealGlyph;
+static volatile LONG g_observedConfigVersion = 0;
+
+enum TraceKind {
+    TRACE_CREATE_FONT = 0,
+    TRACE_SELECT_OBJECT,
+    TRACE_TEXT_DRAW,
+    TRACE_GLYPH_OUTLINE,
+    TRACE_GLYPH_INDICES,
+    TRACE_METRICS,
+    TRACE_GET_OBJECT,
+    TRACE_GET_TEXT_FACE,
+    TRACE_REPLACE_HDC,
+    TRACE_KIND_COUNT
+};
+
+static const char* g_traceKindNames[TRACE_KIND_COUNT] = {
+    "CreateFont",
+    "SelectObject",
+    "TextDraw",
+    "GetGlyphOutline",
+    "GetGlyphIndices",
+    "Metrics",
+    "GetObject",
+    "GetTextFace",
+    "ReplaceHdcFont",
+};
+
+static std::mutex g_traceStatsMutex;
+static LONG g_traceStatsVersion = LONG_MIN;
+static unsigned long long g_traceCounts[TRACE_KIND_COUNT] = {};
+
+static void TraceLogCurrentConfig(const char* prefix, LONG version) {
+    char fontName[LF_FACESIZE * 4] = {};
+    WideCharToMultiByte(CP_UTF8, 0, Config::ForcedFontNameW, -1, fontName, sizeof(fontName), NULL, NULL);
+    Utils::Trace("[TRACE][v%ld] %s font='%s' face=%d charset=%d sizeH=%d scale=%.3f weightOn=%d weight=%d spoof=%d debug=%d slowMs=%d",
+        version, prefix, fontName,
+        Config::EnableFaceNameReplace ? 1 : 0,
+        Config::EnableCharsetReplace ? 1 : 0,
+        Config::EnableFontHeightScale ? 1 : 0,
+        Config::FontHeightScale,
+        Config::EnableFontWeight ? 1 : 0,
+        Config::FontWeight,
+        Config::EnableCodepageSpoof ? 1 : 0,
+        Config::EnableDebugLog ? 1 : 0,
+        Config::DebugSlowMs);
+    Utils::Trace("[TRACE][v%ld] policy hookCreateW=%d hookCreateIW=%d hookTextFace=%d skipDrawTextA=%d skipFontData=%d selectTrackedOnly=%d traceSample=%d pickerLogLimit=%d",
+        version,
+        Config::CompatHookCreateFontW ? 1 : 0,
+        Config::CompatHookCreateFontIndirectW ? 1 : 0,
+        Config::CompatHookGetTextFace ? 1 : 0,
+        Config::CompatSkipDrawTextA ? 1 : 0,
+        Config::CompatSkipFontDataQueries ? 1 : 0,
+        Config::CompatSelectObjectTrackedOnly ? 1 : 0,
+        Config::DebugTraceSampleLimit,
+        Config::DebugPickerThreadLogLimit);
+    char artemisFontPath[MAX_PATH * 4] = {};
+    WideCharToMultiByte(CP_UTF8, 0, Config::ArtemisFontPath, -1, artemisFontPath, sizeof(artemisFontPath), NULL, NULL);
+    Utils::Trace("[TRACE][v%ld] artemis enabled=%d patchTables=%d redirectFonts=%d clearCacheOnSwitch=%d tableFontPath='%s' size=%d ruby=%d",
+        version,
+        Config::EnableArtemisHook ? 1 : 0,
+        Config::ArtemisPatchTables ? 1 : 0,
+        Config::ArtemisRedirectFontFiles ? 1 : 0,
+        Config::ArtemisClearFontCacheOnSwitch ? 1 : 0,
+        artemisFontPath,
+        Config::ArtemisFontSize,
+        Config::ArtemisRubySize);
+    Utils::Trace("[TRACE][v%ld] krkr enabled=%d disablePrerenderedFonts=%d",
+        version,
+        Config::EnableKrkrHook ? 1 : 0,
+        Config::KrkrDisablePrerenderedFonts ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] softpal enabled=%d disableDefaultFontDat=%d forceDefaultOptionToSystem=%d",
+        version,
+        Config::EnableSoftpalHook ? 1 : 0,
+        Config::SoftpalDisableDefaultFontDat ? 1 : 0,
+        Config::SoftpalForceDefaultOptionToSystemFont ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] escude enabled=%d virtualFontConfig=%d",
+        version,
+        Config::EnableEscudeHook ? 1 : 0,
+        Config::EscudeVirtualFontConfig ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] mirai enabled=%d replaceFontData=%d redirectFontFiles=%d pinFontData=%d",
+        version,
+        Config::EnableMiraiHook ? 1 : 0,
+        Config::MiraiReplaceFontDataQueries ? 1 : 0,
+        Config::MiraiRedirectFontFiles ? 1 : 0,
+        Config::MiraiPinFontDataSource ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] majiro enabled=%d disableFontCache=%d",
+        version,
+        Config::EnableMajiroHook ? 1 : 0,
+        Config::MajiroDisableFontCache ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] dxlib enabled=%d disableFontCache=%d replaceFontData=%d clearRuntimeCache=%d",
+        version,
+        Config::EnableDxLibHook ? 1 : 0,
+        Config::DxLibDisableFontCache ? 1 : 0,
+        Config::DxLibReplaceFontDataQueries ? 1 : 0,
+        Config::DxLibClearRuntimeFontCacheOnSwitch ? 1 : 0);
+}
+
+static void TraceFlushEpochLocked(LONG nextVersion) {
+    if (g_traceStatsVersion != LONG_MIN) {
+        Utils::Trace("[TRACE][v%ld] epoch summary CreateFont=%llu SelectObject=%llu TextDraw=%llu GlyphOutline=%llu GlyphIndices=%llu Metrics=%llu GetObject=%llu GetTextFace=%llu ReplaceHdcFont=%llu",
+            g_traceStatsVersion,
+            g_traceCounts[TRACE_CREATE_FONT],
+            g_traceCounts[TRACE_SELECT_OBJECT],
+            g_traceCounts[TRACE_TEXT_DRAW],
+            g_traceCounts[TRACE_GLYPH_OUTLINE],
+            g_traceCounts[TRACE_GLYPH_INDICES],
+            g_traceCounts[TRACE_METRICS],
+            g_traceCounts[TRACE_GET_OBJECT],
+            g_traceCounts[TRACE_GET_TEXT_FACE],
+            g_traceCounts[TRACE_REPLACE_HDC]);
+    }
+
+    ZeroMemory(g_traceCounts, sizeof(g_traceCounts));
+    g_traceStatsVersion = nextVersion;
+    TraceLogCurrentConfig("epoch begin", nextVersion);
+}
+
+static void TraceApiHit(TraceKind kind, const char* format = NULL, ...) {
+    if (!Config::EnableDebugLog || Config::DebugTraceSampleLimit <= 0) return;
+    if (kind < 0 || kind >= TRACE_KIND_COUNT) return;
+
+    char detail[1024] = {};
+    if (format) {
+        va_list args;
+        va_start(args, format);
+        vsprintf_s(detail, format, args);
+        va_end(args);
+    }
+
+    std::lock_guard<std::mutex> lock(g_traceStatsMutex);
+    LONG version = Config::ConfigVersion;
+    if (g_traceStatsVersion != version) {
+        TraceFlushEpochLocked(version);
+    }
+
+    unsigned long long count = ++g_traceCounts[kind];
+    unsigned long long sampleLimit = HookPolicy::TraceSampleLimit();
+    if (sampleLimit > 0 && count <= sampleLimit) {
+        Utils::Trace("[TRACE][v%ld][%s #%llu] %s",
+            version, g_traceKindNames[kind], count, detail);
+    }
+}
+
+static LONG g_debugCallSeq = 0;
+
+static const char* DebugCurrentApiName() {
+    return HookPolicy::CurrentApiName();
+}
+
+static void DebugWideToUtf8(const wchar_t* wide, char* out, size_t outCount) {
+    if (!out || outCount == 0) return;
+    out[0] = '\0';
+    if (!wide) return;
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, (int)outCount, NULL, NULL);
+    out[outCount - 1] = '\0';
+}
+
+static void DebugFormatLogFontW(const LOGFONTW& lf, char* out, size_t outCount) {
+    char face[LF_FACESIZE * 4] = {};
+    DebugWideToUtf8(lf.lfFaceName, face, sizeof(face));
+    sprintf_s(out, outCount,
+        "face='%s' h=%ld w=%ld esc=%ld orient=%ld weight=%ld italic=%u underline=%u strike=%u charset=%u out=%u clip=%u qual=%u pitch=0x%02X",
+        face, lf.lfHeight, lf.lfWidth, lf.lfEscapement, lf.lfOrientation,
+        lf.lfWeight, (unsigned)lf.lfItalic, (unsigned)lf.lfUnderline,
+        (unsigned)lf.lfStrikeOut, (unsigned)lf.lfCharSet,
+        (unsigned)lf.lfOutPrecision, (unsigned)lf.lfClipPrecision,
+        (unsigned)lf.lfQuality, (unsigned)lf.lfPitchAndFamily);
+}
+
+static void DebugTraceLogFontW(const char* tag, const LOGFONTW& lf) {
+    if (!Config::EnableDebugLog) return;
+    char formatted[512] = {};
+    DebugFormatLogFontW(lf, formatted, sizeof(formatted));
+    Utils::Trace("[DEBUG][LOGFONTW][%s] %s", tag, formatted);
+}
+
+static LONG DebugGdiEnter(const char* api, HDC hdc, HFONT replacementFont) {
+    if (!Config::EnableDebugLog || !replacementFont) return 0;
+    return InterlockedIncrement(&g_debugCallSeq);
+}
+
+static void DebugGdiExit(LONG seq, const char* api, HDC hdc, ULONGLONG startMs, unsigned long long ret, DWORD lastError, HFONT replacementFont) {
+    if (!Config::EnableDebugLog) return;
+    ULONGLONG elapsed = GetTickCount64() - startMs;
+    bool slow = Config::DebugSlowMs >= 0 && elapsed >= (ULONGLONG)Config::DebugSlowMs;
+    if (!slow) return;
+
+    Utils::Trace("[DEBUG][CALL #%ld][SLOW] api=%s hdc=%p ret=0x%llX ms=%llu lastError=%lu replacement=%p",
+        seq, api, hdc, ret, elapsed, lastError, replacementFont);
+}
+
+#define DEBUG_API_CONTEXT(nameLiteral) HookPolicy::ApiScope debugApiContext(nameLiteral)
+#define DEBUG_GDI_ENTER(apiName, hdcValue, replacementFontValue) \
+    ULONGLONG debugGdiStartMs = GetTickCount64(); \
+    LONG debugGdiSeq = DebugGdiEnter(apiName, hdcValue, replacementFontValue); \
+    SetLastError(0)
+#define DEBUG_GDI_EXIT(apiName, hdcValue, retValue, replacementFontValue) \
+    DebugGdiExit(debugGdiSeq, apiName, hdcValue, debugGdiStartMs, (unsigned long long)(uintptr_t)(retValue), GetLastError(), replacementFontValue)
+

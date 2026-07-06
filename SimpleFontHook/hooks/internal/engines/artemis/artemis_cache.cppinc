@@ -1,0 +1,1164 @@
+struct ArtemisCacheTarget {
+    DWORD* entryCount;
+    DWORD* bucketCount;
+    uintptr_t** buckets;
+};
+
+struct ArtemisCacheClearPlan {
+    BYTE* moduleBase;
+    DWORD moduleSize;
+    ArtemisCacheTarget first;
+    ArtemisCacheTarget second;
+    ArtemisCacheTarget glyph;
+};
+
+static ArtemisCacheClearPlan g_artemisCacheClearPlan = {};
+static bool g_artemisCacheClearResolved = false;
+static bool g_artemisCacheClearAvailable = false;
+static volatile LONG g_artemisCacheClearLastVersion = LONG_MIN;
+static volatile LONG g_artemisConfigNotifyVersion = LONG_MIN;
+static volatile LONG g_artemisFontObjectScanActive = 0;
+static volatile LONG g_artemisFreeTypeReloadActive = 0;
+static volatile LONG g_artemisFreeTypeReloadLastVersion = LONG_MIN;
+static volatile LONG g_artemisLastFreeTypeReloadAppliedVersion = LONG_MIN;
+static volatile LONG g_artemisAtlasDiscoveryActive = 0;
+static volatile LONG g_artemisAtlasDiscoveryLastVersion = LONG_MIN;
+static volatile LONG g_artemisAtlasInvalidateLastVersion = LONG_MIN;
+static std::string g_artemisActiveFreeTypeReloadPathKey;
+static std::vector<void*> g_artemisKnownFreeTypeFonts;
+static std::mutex g_artemisKnownFreeTypeFontsMutex;
+static std::vector<void*> g_artemisKnownFontAtlases;
+static std::mutex g_artemisKnownFontAtlasesMutex;
+
+struct ArtemisFontObjectProbeClass {
+    const char* name;
+    uintptr_t originalVa;
+};
+
+struct ArtemisFontObjectProbeResult {
+    const char* name;
+    DWORD count;
+    void* samples[4];
+};
+
+struct ArtemisFreeTypeFontDetail {
+    BYTE size;
+    BYTE flag0;
+    BYTE flag1;
+};
+
+struct ArtemisFontRendererDetail {
+    DWORD size;
+    DWORD atlasWidth;
+    DWORD atlasHeight;
+    BYTE flags;
+    void* activeObject;
+    void* activeRef;
+    DWORD childCount;
+};
+
+struct ArtemisRenderedFontDetail {
+    BYTE size;
+    BYTE loaded;
+    void* facePtr0;
+    void* facePtr1;
+    void* facePtr2;
+    void* facePtr3;
+    void* glyphCache0;
+    void* glyphCache1;
+};
+
+static const uintptr_t ARTEMIS_KNOWN_IMAGE_BASE = 0x400000;
+static const uintptr_t ARTEMIS_CFONT_RENDERER_ATLAS_VTABLE_VA = 0x7E4BE4;
+static const uintptr_t ARTEMIS_CFREE_TYPE_FONT_VTABLE_VA = 0x7C7504;
+static const uintptr_t ARTEMIS_CFREE_TYPE_FONT_RELOAD_VA = 0x5D7950;
+
+static const ArtemisFontObjectProbeClass g_artemisFontObjectProbeClasses[] = {
+    { "CFreeTypeFont", 0x7C7504 },
+    { "COneFont@CFreeTypeFont", 0x7E4BFC },
+    { "CFontRenderer", 0x7E4BEC },
+    { "CAtlas@CFontRenderer", 0x7E4BE4 },
+    { "CRenderedFont", 0x7E5090 },
+    { "CRenderedFontFile", 0x7E50BC },
+    { "CSystemFont", 0x7E5134 },
+    { "CFont", 0x7C7CD8 },
+};
+
+static bool ArtemisReadInlineAnsiString(void* stringObject, std::string& out);
+
+static uintptr_t ArtemisReadPtr32(const BYTE* p) {
+    return (uintptr_t)(*(const DWORD*)p);
+}
+
+static bool ArtemisPointerInMainModule(const ArtemisCacheClearPlan& plan, const void* p) {
+    uintptr_t value = (uintptr_t)p;
+    uintptr_t base = (uintptr_t)plan.moduleBase;
+    return value >= base && value < base + plan.moduleSize;
+}
+
+static bool ArtemisWritableRange(void* ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return false;
+
+    BYTE* current = (BYTE*)ptr;
+    BYTE* end = current + bytes;
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(current, &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 || (mbi.Protect & PAGE_NOACCESS) != 0)
+            return false;
+
+        DWORD writable =
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & writable) == 0) return false;
+
+        BYTE* regionEnd = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd <= current) return false;
+        current = regionEnd;
+    }
+    return true;
+}
+
+static bool ArtemisWritableObjectScanProtect(DWORD protect) {
+    if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    DWORD baseProtect = protect & 0xFF;
+    return baseProtect == PAGE_READWRITE ||
+        baseProtect == PAGE_WRITECOPY ||
+        baseProtect == PAGE_EXECUTE_READWRITE ||
+        baseProtect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static void ArtemisRememberFreeTypeFontObject(void* object) {
+    if (!object) return;
+    std::lock_guard<std::mutex> lock(g_artemisKnownFreeTypeFontsMutex);
+    for (void* existing : g_artemisKnownFreeTypeFonts) {
+        if (existing == object) return;
+    }
+    if (g_artemisKnownFreeTypeFonts.size() < 32) g_artemisKnownFreeTypeFonts.push_back(object);
+}
+
+static bool ArtemisReadFreeTypeFontDetailProtected(void* object, ArtemisFreeTypeFontDetail* detail) {
+    if (!object || !detail) return false;
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(detail);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)object;
+        detail->size = *(BYTE*)(obj + 0x08);
+        detail->flag0 = *(BYTE*)(obj + 0x3C);
+        detail->flag1 = *(BYTE*)(obj + 0x3D);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisReadFontRendererDetailProtected(void* object, ArtemisFontRendererDetail* detail) {
+    if (!object || !detail) return false;
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(detail);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)object;
+        detail->size = *(DWORD*)(obj + 0x3C);
+        detail->atlasWidth = *(DWORD*)(obj + 0x40);
+        detail->atlasHeight = *(DWORD*)(obj + 0x44);
+        detail->flags = *(BYTE*)(obj + 0x48);
+        detail->activeObject = *(void**)(obj + 0x18);
+        detail->activeRef = *(void**)(obj + 0x1C);
+        uintptr_t begin = *(uintptr_t*)(obj + 0x04);
+        uintptr_t end = *(uintptr_t*)(obj + 0x08);
+        detail->childCount = 0;
+        if (end >= begin && end - begin <= 1024 * 8) {
+            detail->childCount = (DWORD)((end - begin) / 8);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisReadRenderedFontDetailProtected(void* object, ArtemisRenderedFontDetail* detail) {
+    if (!object || !detail) return false;
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(detail);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)object;
+        detail->size = *(BYTE*)(obj + 0x44);
+        detail->loaded = *(BYTE*)(obj + 0x45);
+        detail->facePtr0 = *(void**)(obj + 0x1C);
+        detail->facePtr1 = *(void**)(obj + 0x20);
+        detail->facePtr2 = *(void**)(obj + 0x24);
+        detail->facePtr3 = *(void**)(obj + 0x28);
+        detail->glyphCache0 = *(void**)(obj + 0x48);
+        detail->glyphCache1 = *(void**)(obj + 0x4C);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static void ArtemisTraceFontObjectDetail(LONG version, const char* phase,
+    const char* className, void* object) {
+    if (!Config::EnableDebugLog || !className || !object) return;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(version);
+    UNREFERENCED_PARAMETER(phase);
+    UNREFERENCED_PARAMETER(className);
+    UNREFERENCED_PARAMETER(object);
+#else
+    if (strcmp(className, "CFreeTypeFont") == 0) {
+        std::string path;
+        ArtemisReadInlineAnsiString((BYTE*)object + 0x24, path);
+        ArtemisFreeTypeFontDetail detail = {};
+        if (ArtemisReadFreeTypeFontDetailProtected(object, &detail)) {
+            ArtemisTraceLimited("font-object-detail version=%ld phase=%s class=%s object=%p path='%s' size=%u flags=%u,%u",
+                version, phase ? phase : "", className, object, path.c_str(),
+                (unsigned)detail.size, (unsigned)detail.flag0, (unsigned)detail.flag1);
+        }
+    } else if (strcmp(className, "CFontRenderer") == 0) {
+        std::string path;
+        ArtemisReadInlineAnsiString((BYTE*)object + 0x24, path);
+        ArtemisFontRendererDetail detail = {};
+        if (ArtemisReadFontRendererDetailProtected(object, &detail)) {
+            ArtemisTraceLimited("font-object-detail version=%ld phase=%s class=%s object=%p path='%s' size=%lu atlas=%lux%lu flags=0x%02X active=%p/%p children=%lu",
+                version, phase ? phase : "", className, object, path.c_str(),
+                detail.size, detail.atlasWidth, detail.atlasHeight, (unsigned)detail.flags,
+                detail.activeObject, detail.activeRef, detail.childCount);
+        }
+    } else if (strcmp(className, "CRenderedFont") == 0) {
+        std::string path;
+        ArtemisReadInlineAnsiString((BYTE*)object + 0x2C, path);
+        ArtemisRenderedFontDetail detail = {};
+        if (ArtemisReadRenderedFontDetailProtected(object, &detail)) {
+            ArtemisTraceLimited("font-object-detail version=%ld phase=%s class=%s object=%p path='%s' size=%u loaded=%u facePtrs=%p/%p/%p/%p glyphCache=%p/%p",
+                version, phase ? phase : "", className, object, path.c_str(),
+                (unsigned)detail.size, (unsigned)detail.loaded, detail.facePtr0,
+                detail.facePtr1, detail.facePtr2, detail.facePtr3, detail.glyphCache0,
+                detail.glyphCache1);
+        }
+    }
+#endif
+}
+
+static void ArtemisScanFontObjects(LONG version, const char* phase) {
+    if (!Config::EnableDebugLog) return;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(version);
+    UNREFERENCED_PARAMETER(phase);
+    ArtemisTraceLimited("font-object-scan-unavailable reason=x64-artemis-vtable-signature-not-supported");
+    return;
+#else
+    if (InterlockedCompareExchange(&g_artemisFontObjectScanActive, 1, 0) != 0) {
+        ArtemisTraceLimited("font-object-scan-skipped version=%ld phase=%s reason=scan-already-running",
+            version, phase ? phase : "");
+        return;
+    }
+
+    HMODULE hExe = GetModuleHandleW(NULL);
+    MODULEINFO mi = {};
+    if (!hExe || !GetModuleInformation(GetCurrentProcess(), hExe, &mi, sizeof(mi)) || mi.SizeOfImage == 0) {
+        InterlockedExchange(&g_artemisFontObjectScanActive, 0);
+        ArtemisTraceLimited("font-object-scan-unavailable version=%ld phase=%s reason=module-info-failed",
+            version, phase ? phase : "");
+        return;
+    }
+
+    uintptr_t moduleBase = (uintptr_t)mi.lpBaseOfDll;
+    uintptr_t runtimeVtables[_countof(g_artemisFontObjectProbeClasses)] = {};
+    ArtemisFontObjectProbeResult results[_countof(g_artemisFontObjectProbeClasses)] = {};
+    for (size_t i = 0; i < _countof(g_artemisFontObjectProbeClasses); ++i) {
+        runtimeVtables[i] = moduleBase + (g_artemisFontObjectProbeClasses[i].originalVa - ARTEMIS_KNOWN_IMAGE_BASE);
+        results[i].name = g_artemisFontObjectProbeClasses[i].name;
+    }
+
+    SYSTEM_INFO sysInfo = {};
+    GetSystemInfo(&sysInfo);
+
+    SIZE_T scannedBytes = 0;
+    DWORD scannedRegions = 0;
+    DWORD skippedRegions = 0;
+    BYTE* address = (BYTE*)sysInfo.lpMinimumApplicationAddress;
+    BYTE* maxAddress = (BYTE*)sysInfo.lpMaximumApplicationAddress;
+    while (address < maxAddress) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) break;
+
+        BYTE* regionBase = (BYTE*)mbi.BaseAddress;
+        uintptr_t nextAddressValue = (uintptr_t)regionBase + mbi.RegionSize;
+        if (nextAddressValue <= (uintptr_t)address) break;
+        BYTE* nextAddress = (BYTE*)nextAddressValue;
+
+        if (mbi.State == MEM_COMMIT && ArtemisWritableObjectScanProtect(mbi.Protect) &&
+            mbi.RegionSize >= sizeof(uintptr_t)) {
+            __try {
+                uintptr_t regionStart = (uintptr_t)regionBase;
+                uintptr_t regionEnd = nextAddressValue;
+                uintptr_t scan = (regionStart + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
+                for (; scan + sizeof(uintptr_t) <= regionEnd; scan += sizeof(uintptr_t)) {
+                    uintptr_t value = *(uintptr_t*)scan;
+                    for (size_t i = 0; i < _countof(g_artemisFontObjectProbeClasses); ++i) {
+                        if (value != runtimeVtables[i]) continue;
+
+                        DWORD count = results[i].count;
+                        if (count < _countof(results[i].samples)) results[i].samples[count] = (void*)scan;
+                        if (count != MAXDWORD) results[i].count = count + 1;
+                    }
+                }
+                ++scannedRegions;
+                scannedBytes += mbi.RegionSize;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                ++skippedRegions;
+            }
+        }
+
+        address = nextAddress;
+    }
+
+    DWORD foundClasses = 0;
+    for (size_t i = 0; i < _countof(results); ++i) {
+        if (results[i].count == 0) continue;
+        ++foundClasses;
+        ArtemisTraceLimited("font-object-scan version=%ld phase=%s class=%s count=%lu vtable=%p sample0=%p sample1=%p sample2=%p sample3=%p",
+            version, phase ? phase : "", results[i].name, results[i].count,
+            (void*)runtimeVtables[i], results[i].samples[0], results[i].samples[1],
+            results[i].samples[2], results[i].samples[3]);
+        for (size_t sampleIndex = 0; sampleIndex < _countof(results[i].samples); ++sampleIndex) {
+            if (results[i].samples[sampleIndex]) {
+                ArtemisTraceFontObjectDetail(version, phase, results[i].name, results[i].samples[sampleIndex]);
+            }
+        }
+    }
+
+    ArtemisTraceLimited("font-object-scan-summary version=%ld phase=%s foundClasses=%lu scannedRegions=%lu skippedRegions=%lu scannedMB=%lu moduleBase=%p",
+        version, phase ? phase : "", foundClasses, scannedRegions, skippedRegions,
+        (DWORD)(scannedBytes / (1024 * 1024)), (void*)moduleBase);
+    InterlockedExchange(&g_artemisFontObjectScanActive, 0);
+#endif
+}
+
+static bool ArtemisReadInlineAnsiString(void* stringObject, std::string& out) {
+    out.clear();
+    if (!stringObject) return false;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(stringObject);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)stringObject;
+        DWORD length = *(DWORD*)(obj + 0x10);
+        DWORD capacity = *(DWORD*)(obj + 0x14);
+        if (length > 1024 || capacity > 1024 * 1024) return false;
+
+        const char* data = capacity < 0x10 ? (const char*)obj : *(const char**)obj;
+        if (!data && length != 0) return false;
+        out.assign(data ? data : "", data ? length : 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisVirtualFontPathFromAnsi(const std::string& ansiPath, std::wstring* fullPath) {
+    if (ansiPath.empty()) return false;
+
+    std::vector<char> nulTerminated(ansiPath.begin(), ansiPath.end());
+    nulTerminated.push_back('\0');
+    std::wstring wide = ArtemisWideFromAnsi(nulTerminated.data());
+    if (wide.empty()) return false;
+
+    for (wchar_t& ch : wide) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    wchar_t full[MAX_PATH] = {};
+    if (PathIsRelativeW(wide.c_str())) {
+        wcscpy_s(full, ArtemisGetGameRoot().c_str());
+        PathAppendW(full, wide.c_str());
+    } else {
+        wcscpy_s(full, wide.c_str());
+    }
+
+    std::wstring resolved = full;
+    if (!ArtemisMatchesVirtualFontPath(resolved)) return false;
+    if (fullPath) *fullPath = resolved;
+    return true;
+}
+
+static std::string ArtemisNormalizeAnsiPathKey(std::string path) {
+    for (char& ch : path) {
+        if (ch == '/') ch = '\\';
+        unsigned char c = (unsigned char)ch;
+        if (c >= 'A' && c <= 'Z') ch = (char)(c - 'A' + 'a');
+    }
+    return path;
+}
+
+static bool ArtemisResolveDirectFontReloadPath(std::string& reloadPath) {
+    reloadPath.clear();
+    std::wstring source = ArtemisFindSystemFontFileByFace(Config::ForcedFontNameW);
+    if (source.empty()) return false;
+
+    reloadPath = ArtemisAnsiFromWide(source);
+    return !reloadPath.empty();
+}
+
+static bool ArtemisIsFreeTypeReloadCandidatePath(const std::string& oldPath) {
+    std::wstring oldFullPath;
+    if (ArtemisVirtualFontPathFromAnsi(oldPath, &oldFullPath)) return true;
+
+    std::string key = ArtemisNormalizeAnsiPathKey(oldPath);
+    return !key.empty() && !g_artemisActiveFreeTypeReloadPathKey.empty() &&
+        key == g_artemisActiveFreeTypeReloadPathKey;
+}
+
+typedef unsigned char (__thiscall* ArtemisFreeTypeFontReloadFn)(
+    void* self, const char* path, int unused0, int size, int flag0, int flag1, int unused1);
+
+static bool ArtemisCallFreeTypeReloadProtected(void* object, ArtemisFreeTypeFontReloadFn reloadFn,
+    const char* virtualPath, unsigned char sizeArg, unsigned char flag0Arg, unsigned char flag1Arg,
+    unsigned char* result) {
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(reloadFn);
+    UNREFERENCED_PARAMETER(virtualPath);
+    UNREFERENCED_PARAMETER(sizeArg);
+    UNREFERENCED_PARAMETER(flag0Arg);
+    UNREFERENCED_PARAMETER(flag1Arg);
+    UNREFERENCED_PARAMETER(result);
+    return false;
+#else
+    __try {
+        unsigned char localResult = reloadFn(object, virtualPath, 0, sizeArg, flag0Arg, flag1Arg, 0);
+        if (result) *result = localResult;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisTryReloadFreeTypeFontObject(void* object, ArtemisFreeTypeFontReloadFn reloadFn,
+    const char* requestedVirtualPath, const char* reloadPath, LONG version, DWORD* matched,
+    DWORD* reloaded, DWORD* failed) {
+    if (!object || !reloadFn || !requestedVirtualPath || !requestedVirtualPath[0] ||
+        !reloadPath || !reloadPath[0]) return false;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(reloadFn);
+    UNREFERENCED_PARAMETER(requestedVirtualPath);
+    UNREFERENCED_PARAMETER(reloadPath);
+    UNREFERENCED_PARAMETER(version);
+    UNREFERENCED_PARAMETER(matched);
+    UNREFERENCED_PARAMETER(reloaded);
+    UNREFERENCED_PARAMETER(failed);
+    return false;
+#else
+    std::string oldPath;
+    if (!ArtemisReadInlineAnsiString((BYTE*)object + 0x24, oldPath)) return false;
+
+    if (!ArtemisIsFreeTypeReloadCandidatePath(oldPath)) return false;
+    if (matched) ++(*matched);
+
+    BYTE* obj = (BYTE*)object;
+    unsigned char size = *(unsigned char*)(obj + 0x08);
+    unsigned char flag0 = *(unsigned char*)(obj + 0x3C);
+    unsigned char flag1 = *(unsigned char*)(obj + 0x3D);
+    unsigned char probeSize = size == 255 ? (unsigned char)254 : (unsigned char)(size + 1);
+    bool sameReloadPath = ArtemisNormalizeAnsiPathKey(oldPath) == ArtemisNormalizeAnsiPathKey(reloadPath);
+
+    unsigned char probeResult = 0xFF;
+    bool probeOk = false;
+    unsigned char finalResult = 0xFF;
+    bool finalOk = ArtemisCallFreeTypeReloadProtected(object, reloadFn, reloadPath,
+        size, flag0, flag1, &finalResult);
+
+    if (sameReloadPath && finalOk && finalResult == 0) {
+        probeOk = ArtemisCallFreeTypeReloadProtected(object, reloadFn, reloadPath,
+            probeSize, flag0, flag1, &probeResult);
+        if (probeOk && probeResult == 0) {
+            finalOk = ArtemisCallFreeTypeReloadProtected(object, reloadFn, reloadPath,
+            size, flag0, flag1, &finalResult);
+        }
+    }
+
+    std::string afterPath;
+    ArtemisReadInlineAnsiString((BYTE*)object + 0x24, afterPath);
+    bool reloadOk = finalOk && finalResult == 0 &&
+        (!sameReloadPath || (probeOk && probeResult == 0));
+    if (reloadOk) {
+        if (reloaded) ++(*reloaded);
+        ArtemisRememberFreeTypeFontObject(object);
+    } else if (failed) {
+        ++(*failed);
+    }
+
+    ArtemisTraceLimited("font-reload-attempt version=%ld object=%p oldPath='%s' requestedNewPath='%s' reloadPath='%s' mode=%s size=%u probeSize=%u flags=%u,%u probeResult=%u probeOk=%d finalResult=%u finalOk=%d reloadOk=%d afterPath='%s'",
+        version, object, oldPath.c_str(), requestedVirtualPath, reloadPath,
+        sameReloadPath ? "force-same-path" : "direct-path", (unsigned)size,
+        (unsigned)probeSize, (unsigned)flag0, (unsigned)flag1, (unsigned)probeResult,
+        probeOk ? 1 : 0, (unsigned)finalResult, finalOk ? 1 : 0, reloadOk ? 1 : 0,
+        afterPath.c_str());
+    return reloadOk;
+#endif
+}
+
+static void ArtemisScanFreeTypeReloadRegion(BYTE* regionBase, uintptr_t regionEnd,
+    uintptr_t freeTypeVtable, ArtemisFreeTypeFontReloadFn reloadFn, const char* requestedVirtualPath,
+    const char* reloadPath, LONG version, DWORD* matched, DWORD* reloaded, DWORD* failed) {
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(regionBase);
+    UNREFERENCED_PARAMETER(regionEnd);
+    UNREFERENCED_PARAMETER(freeTypeVtable);
+    UNREFERENCED_PARAMETER(reloadFn);
+    UNREFERENCED_PARAMETER(requestedVirtualPath);
+    UNREFERENCED_PARAMETER(reloadPath);
+    UNREFERENCED_PARAMETER(version);
+    UNREFERENCED_PARAMETER(matched);
+    UNREFERENCED_PARAMETER(reloaded);
+    UNREFERENCED_PARAMETER(failed);
+#else
+    __try {
+        uintptr_t regionStart = (uintptr_t)regionBase;
+        uintptr_t scan = (regionStart + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
+        for (; scan + 0x4C <= regionEnd && (!matched || *matched < 16); scan += sizeof(uintptr_t)) {
+            if (*(uintptr_t*)scan != freeTypeVtable) continue;
+            ArtemisTryReloadFreeTypeFontObject((void*)scan, reloadFn, requestedVirtualPath,
+                reloadPath, version, matched, reloaded, failed);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (failed) ++(*failed);
+    }
+#endif
+}
+
+static bool ArtemisReloadActiveFreeTypeFonts(LONG version) {
+    if (!Config::EnableArtemisHook || !Config::ArtemisRedirectFontFiles ||
+        !Config::EnableFontHook || !Config::EnableFaceNameReplace) {
+        return false;
+    }
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(version);
+    ArtemisTraceLimited("font-reload-unavailable reason=x64-artemis-signature-not-supported");
+    return false;
+#else
+    if (InterlockedCompareExchange(&g_artemisFreeTypeReloadLastVersion, version, version) == version) return true;
+    if (InterlockedCompareExchange(&g_artemisFreeTypeReloadActive, 1, 0) != 0) {
+        ArtemisTraceLimited("font-reload-skipped version=%ld reason=reload-already-running", version);
+        return false;
+    }
+
+    HMODULE hExe = GetModuleHandleW(NULL);
+    MODULEINFO mi = {};
+    if (!hExe || !GetModuleInformation(GetCurrentProcess(), hExe, &mi, sizeof(mi)) || mi.SizeOfImage == 0) {
+        InterlockedExchange(&g_artemisFreeTypeReloadActive, 0);
+        ArtemisTraceLimited("font-reload-unavailable version=%ld reason=module-info-failed", version);
+        return false;
+    }
+
+    uintptr_t moduleBase = (uintptr_t)mi.lpBaseOfDll;
+    uintptr_t freeTypeVtable = moduleBase + (ARTEMIS_CFREE_TYPE_FONT_VTABLE_VA - ARTEMIS_KNOWN_IMAGE_BASE);
+    ArtemisFreeTypeFontReloadFn reloadFn = (ArtemisFreeTypeFontReloadFn)
+        (moduleBase + (ARTEMIS_CFREE_TYPE_FONT_RELOAD_VA - ARTEMIS_KNOWN_IMAGE_BASE));
+
+    std::string virtualPath = ArtemisAnsiFromWide(ArtemisBuildVirtualFontPathForVersion(version));
+    for (char& ch : virtualPath) {
+        if (ch == '\\') ch = '/';
+    }
+    std::string reloadPath;
+    bool directReloadPath = ArtemisResolveDirectFontReloadPath(reloadPath);
+    if (!directReloadPath) reloadPath = virtualPath;
+    std::string reloadPathKey = ArtemisNormalizeAnsiPathKey(reloadPath);
+
+    SYSTEM_INFO sysInfo = {};
+    GetSystemInfo(&sysInfo);
+
+    DWORD matched = 0;
+    DWORD reloaded = 0;
+    DWORD failed = 0;
+    DWORD scannedRegions = 0;
+
+    std::vector<void*> knownFreeTypeFonts;
+    {
+        std::lock_guard<std::mutex> lock(g_artemisKnownFreeTypeFontsMutex);
+        knownFreeTypeFonts = g_artemisKnownFreeTypeFonts;
+    }
+    for (void* object : knownFreeTypeFonts) {
+        if (matched >= 16) break;
+        ArtemisTryReloadFreeTypeFontObject(object, reloadFn, virtualPath.c_str(),
+            reloadPath.c_str(), version, &matched, &reloaded, &failed);
+    }
+
+    if (reloaded > 0) {
+        InterlockedExchange(&g_artemisFreeTypeReloadLastVersion, version);
+        g_artemisActiveFreeTypeReloadPathKey = reloadPathKey;
+        InterlockedExchange(&g_artemisLastFreeTypeReloadAppliedVersion, version);
+        InterlockedExchange(&g_artemisFreeTypeReloadActive, 0);
+        ArtemisTraceLimited("font-reload-summary version=%ld mode=known matched=%lu reloaded=%lu failed=%lu known=%lu newPath='%s' reloadPath='%s' directPath=%d",
+            version, matched, reloaded, failed, (DWORD)knownFreeTypeFonts.size(),
+            virtualPath.c_str(), reloadPath.c_str(), directReloadPath ? 1 : 0);
+        return true;
+    }
+
+    matched = 0;
+    reloaded = 0;
+    failed = 0;
+    BYTE* address = (BYTE*)sysInfo.lpMinimumApplicationAddress;
+    BYTE* maxAddress = (BYTE*)sysInfo.lpMaximumApplicationAddress;
+    while (address < maxAddress && matched < 16) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) break;
+
+        BYTE* regionBase = (BYTE*)mbi.BaseAddress;
+        uintptr_t nextAddressValue = (uintptr_t)regionBase + mbi.RegionSize;
+        if (nextAddressValue <= (uintptr_t)address) break;
+        BYTE* nextAddress = (BYTE*)nextAddressValue;
+
+        if (mbi.State == MEM_COMMIT && ArtemisWritableObjectScanProtect(mbi.Protect) &&
+            mbi.RegionSize >= sizeof(uintptr_t)) {
+            ArtemisScanFreeTypeReloadRegion(regionBase, nextAddressValue, freeTypeVtable,
+                reloadFn, virtualPath.c_str(), reloadPath.c_str(), version, &matched, &reloaded, &failed);
+            ++scannedRegions;
+        }
+
+        address = nextAddress;
+    }
+
+    InterlockedExchange(&g_artemisFreeTypeReloadLastVersion, version);
+    if (reloaded > 0) {
+        g_artemisActiveFreeTypeReloadPathKey = reloadPathKey;
+        InterlockedExchange(&g_artemisLastFreeTypeReloadAppliedVersion, version);
+    }
+    InterlockedExchange(&g_artemisFreeTypeReloadActive, 0);
+    ArtemisTraceLimited("font-reload-summary version=%ld mode=scan matched=%lu reloaded=%lu failed=%lu scannedRegions=%lu known=%lu newPath='%s' reloadPath='%s' directPath=%d",
+        version, matched, reloaded, failed, scannedRegions, (DWORD)knownFreeTypeFonts.size(),
+        virtualPath.c_str(), reloadPath.c_str(), directReloadPath ? 1 : 0);
+    return reloaded > 0;
+#endif
+}
+
+static bool ArtemisTryInvalidateFontAtlasObject(void* object, LONG version,
+    DWORD* matched, DWORD* invalidated, DWORD* failed) {
+    if (!object) return false;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(version);
+    UNREFERENCED_PARAMETER(matched);
+    UNREFERENCED_PARAMETER(invalidated);
+    UNREFERENCED_PARAMETER(failed);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)object;
+        DWORD width = *(DWORD*)(obj + 0x0C);
+        DWORD height = *(DWORD*)(obj + 0x10);
+        DWORD oldRowHeight = *(DWORD*)(obj + 0x1C);
+        DWORD oldX = *(DWORD*)(obj + 0x20);
+        DWORD oldY = *(DWORD*)(obj + 0x24);
+        if (width == 0 || height == 0 || width > 16384 || height > 16384) return false;
+        if (matched) ++(*matched);
+
+        *(DWORD*)(obj + 0x1C) = 0;
+        *(DWORD*)(obj + 0x20) = 0;
+        *(DWORD*)(obj + 0x24) = 0;
+        if (invalidated) ++(*invalidated);
+
+        ArtemisTraceLimited("font-atlas-invalidate-attempt version=%ld object=%p size=%lux%lu oldCursor=%lu,%lu oldRow=%lu newCursor=0,0",
+            version, object, width, height, oldX, oldY, oldRowHeight);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (failed) ++(*failed);
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisReadPointerProtected(void* address, uintptr_t* value) {
+    if (!address || !value) return false;
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(address);
+    UNREFERENCED_PARAMETER(value);
+    return false;
+#else
+    __try {
+        *value = *(uintptr_t*)address;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static bool ArtemisIsLiveFontAtlasObject(void* object, uintptr_t atlasVtable) {
+    if (!object) return false;
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(object);
+    UNREFERENCED_PARAMETER(atlasVtable);
+    return false;
+#else
+    __try {
+        BYTE* obj = (BYTE*)object;
+        if (*(uintptr_t*)obj != atlasVtable) return false;
+        DWORD width = *(DWORD*)(obj + 0x0C);
+        DWORD height = *(DWORD*)(obj + 0x10);
+        return width != 0 && height != 0 && width <= 16384 && height <= 16384;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+static void ArtemisRememberFontAtlas(std::vector<void*>& found, void* object) {
+    for (void* existing : found) {
+        if (existing == object) return;
+    }
+    found.push_back(object);
+}
+
+static unsigned __stdcall ArtemisFontAtlasDiscoveryThread(void* param) {
+    LONG version = param ? *(LONG*)param : LONG_MIN;
+    delete (LONG*)param;
+    if (version == LONG_MIN) {
+        InterlockedExchange(&g_artemisAtlasDiscoveryActive, 0);
+        return 0;
+    }
+
+#ifdef _WIN64
+    ArtemisTraceLimited("font-atlas-discovery-unavailable version=%ld reason=x64-artemis-signature-not-supported", version);
+    InterlockedExchange(&g_artemisAtlasDiscoveryActive, 0);
+    return 0;
+#else
+    HMODULE hExe = GetModuleHandleW(NULL);
+    MODULEINFO mi = {};
+    if (!hExe || !GetModuleInformation(GetCurrentProcess(), hExe, &mi, sizeof(mi)) || mi.SizeOfImage == 0) {
+        ArtemisTraceLimited("font-atlas-discovery-unavailable version=%ld reason=module-info-failed", version);
+        InterlockedExchange(&g_artemisAtlasDiscoveryActive, 0);
+        return 0;
+    }
+
+    uintptr_t moduleBase = (uintptr_t)mi.lpBaseOfDll;
+    uintptr_t atlasVtable = moduleBase + (ARTEMIS_CFONT_RENDERER_ATLAS_VTABLE_VA - ARTEMIS_KNOWN_IMAGE_BASE);
+    std::vector<void*> found;
+
+    SYSTEM_INFO sysInfo = {};
+    GetSystemInfo(&sysInfo);
+
+    DWORD scannedRegions = 0;
+    DWORD skippedReads = 0;
+    BYTE* address = (BYTE*)sysInfo.lpMinimumApplicationAddress;
+    BYTE* maxAddress = (BYTE*)sysInfo.lpMaximumApplicationAddress;
+    while (address < maxAddress && found.size() < 64) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) break;
+
+        BYTE* regionBase = (BYTE*)mbi.BaseAddress;
+        uintptr_t nextAddressValue = (uintptr_t)regionBase + mbi.RegionSize;
+        if (nextAddressValue <= (uintptr_t)address) break;
+        BYTE* nextAddress = (BYTE*)nextAddressValue;
+
+        if (mbi.State == MEM_COMMIT && ArtemisWritableObjectScanProtect(mbi.Protect) &&
+            mbi.RegionSize >= sizeof(uintptr_t)) {
+            uintptr_t regionStart = (uintptr_t)regionBase;
+            uintptr_t scan = (regionStart + sizeof(uintptr_t) - 1) & ~(uintptr_t)(sizeof(uintptr_t) - 1);
+            for (; scan + 0x28 <= nextAddressValue && found.size() < 64; scan += sizeof(uintptr_t)) {
+                uintptr_t value = 0;
+                if (!ArtemisReadPointerProtected((void*)scan, &value)) {
+                    ++skippedReads;
+                    continue;
+                }
+                if (value != atlasVtable) continue;
+                if (ArtemisIsLiveFontAtlasObject((void*)scan, atlasVtable)) {
+                    ArtemisRememberFontAtlas(found, (void*)scan);
+                }
+            }
+            ++scannedRegions;
+        }
+
+        address = nextAddress;
+    }
+
+    DWORD knownCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_artemisKnownFontAtlasesMutex);
+        g_artemisKnownFontAtlases.swap(found);
+        knownCount = (DWORD)g_artemisKnownFontAtlases.size();
+    }
+
+    InterlockedExchange(&g_artemisAtlasDiscoveryLastVersion, version);
+    InterlockedExchange(&g_artemisAtlasDiscoveryActive, 0);
+    ArtemisTraceLimited("font-atlas-discovery-summary version=%ld known=%lu scannedRegions=%lu skippedReads=%lu",
+        version, knownCount, scannedRegions, skippedReads);
+    return 0;
+#endif
+}
+
+static void ArtemisScheduleFontAtlasDiscovery(LONG version) {
+    if (!Config::EnableArtemisHook || !Config::ArtemisClearFontCacheOnSwitch) return;
+    if (InterlockedCompareExchange(&g_artemisAtlasDiscoveryActive, 1, 0) != 0) return;
+
+    LONG* heapVersion = new LONG(version);
+    uintptr_t thread = _beginthreadex(NULL, 0, ArtemisFontAtlasDiscoveryThread, heapVersion, 0, NULL);
+    if (thread == 0) {
+        delete heapVersion;
+        InterlockedExchange(&g_artemisAtlasDiscoveryActive, 0);
+        return;
+    }
+    CloseHandle((HANDLE)thread);
+}
+
+static bool ArtemisInvalidateActiveFontAtlases(LONG version) {
+    if (!Config::EnableArtemisHook || !Config::ArtemisClearFontCacheOnSwitch) return false;
+    if (InterlockedCompareExchange(&g_artemisAtlasInvalidateLastVersion, version, version) == version) return true;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(version);
+    ArtemisTraceLimited("font-atlas-invalidate-unavailable reason=x64-artemis-signature-not-supported");
+    return false;
+#else
+    std::vector<void*> atlases;
+    {
+        std::lock_guard<std::mutex> lock(g_artemisKnownFontAtlasesMutex);
+        atlases = g_artemisKnownFontAtlases;
+    }
+
+    DWORD matched = 0;
+    DWORD invalidated = 0;
+    DWORD failed = 0;
+    if (atlases.empty()) {
+        ArtemisScheduleFontAtlasDiscovery(version);
+        ArtemisTraceLimited("font-atlas-invalidate-summary version=%ld mode=known matched=0 invalidated=0 failed=0 reason=no-known-atlas",
+            version);
+        return false;
+    }
+
+    HMODULE hExe = GetModuleHandleW(NULL);
+    MODULEINFO mi = {};
+    uintptr_t atlasVtable = 0;
+    if (hExe && GetModuleInformation(GetCurrentProcess(), hExe, &mi, sizeof(mi)) && mi.SizeOfImage != 0) {
+        uintptr_t moduleBase = (uintptr_t)mi.lpBaseOfDll;
+        atlasVtable = moduleBase + (ARTEMIS_CFONT_RENDERER_ATLAS_VTABLE_VA - ARTEMIS_KNOWN_IMAGE_BASE);
+    }
+
+    for (void* atlas : atlases) {
+        if (atlasVtable && !ArtemisIsLiveFontAtlasObject(atlas, atlasVtable)) {
+            ++failed;
+            continue;
+        }
+        ArtemisTryInvalidateFontAtlasObject(atlas, version, &matched, &invalidated, &failed);
+    }
+
+    if (failed != 0 || invalidated == 0) ArtemisScheduleFontAtlasDiscovery(version);
+    if (invalidated > 0) InterlockedExchange(&g_artemisAtlasInvalidateLastVersion, version);
+    ArtemisTraceLimited("font-atlas-invalidate-summary version=%ld mode=known matched=%lu invalidated=%lu failed=%lu known=%lu",
+        version, matched, invalidated, failed, (DWORD)atlases.size());
+    return invalidated > 0;
+#endif
+}
+
+static BYTE* ArtemisFindBytes(BYTE* start, size_t size, const BYTE* pattern, size_t patternSize) {
+    if (!start || !pattern || patternSize == 0 || size < patternSize) return NULL;
+    BYTE* end = start + size - patternSize;
+    for (BYTE* p = start; p <= end; ++p) {
+        if (memcmp(p, pattern, patternSize) == 0) return p;
+    }
+    return NULL;
+}
+
+static BYTE* ArtemisFindPointer32(BYTE* start, size_t size, uintptr_t value) {
+    DWORD needle = (DWORD)value;
+    return ArtemisFindBytes(start, size, (const BYTE*)&needle, sizeof(needle));
+}
+
+static BYTE* ArtemisFindHashClearPattern(BYTE* start, size_t size) {
+    if (!start || size < 23) return NULL;
+
+    for (BYTE* p = start; p + 23 <= start + size; ++p) {
+        if (p[0] == 0x83 && p[1] == 0x3D &&
+            p[6] == 0x00 &&
+            p[7] == 0x74 &&
+            p[9] == 0x8B && p[10] == 0x0D &&
+            p[15] == 0xA1 &&
+            p[20] == 0x8D && p[21] == 0x04 && p[22] == 0x81) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static bool ArtemisParseCacheTarget(BYTE* hashPattern, ArtemisCacheTarget* target,
+    const ArtemisCacheClearPlan& plan) {
+    if (!hashPattern || !target) return false;
+
+    target->entryCount = (DWORD*)ArtemisReadPtr32(hashPattern + 2);
+    target->buckets = (uintptr_t**)ArtemisReadPtr32(hashPattern + 11);
+    target->bucketCount = (DWORD*)ArtemisReadPtr32(hashPattern + 16);
+
+    return ArtemisPointerInMainModule(plan, target->entryCount) &&
+        ArtemisPointerInMainModule(plan, target->bucketCount) &&
+        ArtemisPointerInMainModule(plan, target->buckets);
+}
+
+static bool ArtemisResolveCacheClearPlan() {
+    if (g_artemisCacheClearResolved) return g_artemisCacheClearAvailable;
+    g_artemisCacheClearResolved = true;
+
+#ifdef _WIN64
+    ArtemisTraceLimited("cache-clear-unavailable reason=x64-artemis-signature-not-supported");
+    return false;
+#else
+    HMODULE hExe = GetModuleHandleW(NULL);
+    MODULEINFO mi = {};
+    if (!hExe || !GetModuleInformation(GetCurrentProcess(), hExe, &mi, sizeof(mi)) || mi.SizeOfImage == 0) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=module-info-failed");
+        return false;
+    }
+
+    ArtemisCacheClearPlan plan = {};
+    plan.moduleBase = (BYTE*)mi.lpBaseOfDll;
+    plan.moduleSize = mi.SizeOfImage;
+
+    const BYTE marker[] = "clear_cache";
+    BYTE* markerAddress = ArtemisFindBytes(plan.moduleBase, plan.moduleSize, marker, sizeof(marker));
+    if (!markerAddress) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=clear-cache-string-not-found");
+        return false;
+    }
+
+    BYTE* xref = ArtemisFindPointer32(plan.moduleBase, plan.moduleSize, (uintptr_t)markerAddress);
+    if (!xref) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=clear-cache-xref-not-found");
+        return false;
+    }
+
+    BYTE* scanStart = xref;
+    size_t scanSize = std::min((size_t)1024, (size_t)(plan.moduleBase + plan.moduleSize - scanStart));
+    BYTE* lockBlock = NULL;
+    for (BYTE* p = scanStart; p + 24 < scanStart + scanSize; ++p) {
+        if (p[0] == 0x68 && p[5] == 0xE8 &&
+            p[10] == 0x83 && p[11] == 0xC4 && p[12] == 0x04 &&
+            p[13] == 0x85 && p[14] == 0xC0 && p[15] == 0x74 &&
+            p[17] == 0x50 && p[18] == 0xE8) {
+            lockBlock = p;
+            break;
+        }
+    }
+    if (!lockBlock) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=lock-pattern-not-found");
+        return false;
+    }
+
+    BYTE* firstHash = ArtemisFindHashClearPattern(lockBlock + 20,
+        (size_t)(plan.moduleBase + plan.moduleSize - (lockBlock + 20)));
+    BYTE* secondHash = firstHash ? ArtemisFindHashClearPattern(firstHash + 23,
+        (size_t)(plan.moduleBase + plan.moduleSize - (firstHash + 23))) : NULL;
+    if (!firstHash || !secondHash) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=hash-pattern-not-found");
+        return false;
+    }
+
+    if (!ArtemisParseCacheTarget(firstHash, &plan.first, plan) ||
+        !ArtemisParseCacheTarget(secondHash, &plan.second, plan)) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=target-parse-failed");
+        return false;
+    }
+
+    plan.glyph.bucketCount = (DWORD*)(plan.moduleBase + (0x878C28 - ARTEMIS_KNOWN_IMAGE_BASE));
+    plan.glyph.entryCount = (DWORD*)(plan.moduleBase + (0x878C2C - ARTEMIS_KNOWN_IMAGE_BASE));
+    plan.glyph.buckets = (uintptr_t**)(plan.moduleBase + (0x878C38 - ARTEMIS_KNOWN_IMAGE_BASE));
+    if (!ArtemisPointerInMainModule(plan, plan.glyph.entryCount) ||
+        !ArtemisPointerInMainModule(plan, plan.glyph.bucketCount) ||
+        !ArtemisPointerInMainModule(plan, plan.glyph.buckets)) {
+        ArtemisTraceLimited("cache-clear-unavailable reason=glyph-target-out-of-module entry=%p count=%p buckets=%p",
+            plan.glyph.entryCount, plan.glyph.bucketCount, plan.glyph.buckets);
+        return false;
+    }
+
+    g_artemisCacheClearPlan = plan;
+    g_artemisCacheClearAvailable = true;
+    ArtemisTraceLimited("cache-clear-resolved mode=detach firstCount=%p secondCount=%p glyphCount=%p glyphBuckets=%p",
+        plan.first.entryCount, plan.second.entryCount, plan.glyph.entryCount, plan.glyph.buckets);
+    return true;
+#endif
+}
+
+static bool ArtemisClearHashTarget(const ArtemisCacheTarget& target, DWORD* clearedEntries, DWORD* detachedList) {
+    if (!target.entryCount || !target.bucketCount || !target.buckets) return false;
+
+    DWORD entries = *target.entryCount;
+    if (entries == 0) {
+        if (clearedEntries) *clearedEntries = 0;
+        if (detachedList) *detachedList = 0;
+        return true;
+    }
+
+    DWORD bucketsCount = *target.bucketCount;
+    uintptr_t* buckets = *target.buckets;
+    if (bucketsCount > 1024 * 1024 || !buckets ||
+        !ArtemisWritableRange(buckets, ((size_t)bucketsCount + 1) * sizeof(uintptr_t)) ||
+        !ArtemisWritableRange(target.entryCount, sizeof(DWORD))) {
+        return false;
+    }
+
+    uintptr_t* end = buckets + bucketsCount;
+    for (uintptr_t* p = buckets; p != end; ++p) *p = 0;
+
+    uintptr_t listHead = *end;
+    *end = 0;
+    *target.entryCount = 0;
+
+    if (clearedEntries) *clearedEntries = entries;
+    if (detachedList) *detachedList = listHead ? 1 : 0;
+    return true;
+}
+
+static bool ArtemisClearInternalFontCache(LONG version) {
+    if (!Config::EnableArtemisHook || !Config::ArtemisClearFontCacheOnSwitch) return false;
+    if (InterlockedCompareExchange(&g_artemisCacheClearLastVersion, version, version) == version) return true;
+    if (!ArtemisResolveCacheClearPlan()) return false;
+
+#ifdef _WIN64
+    UNREFERENCED_PARAMETER(version);
+    return false;
+#else
+    ArtemisCacheClearPlan& plan = g_artemisCacheClearPlan;
+    DWORD firstEntries = 0, firstDetached = 0, secondEntries = 0, secondDetached = 0;
+    DWORD glyphEntries = 0, glyphDetached = 0;
+    bool firstOk = ArtemisClearHashTarget(plan.first, &firstEntries, &firstDetached);
+    bool secondOk = ArtemisClearHashTarget(plan.second, &secondEntries, &secondDetached);
+    bool glyphOk = ArtemisClearHashTarget(plan.glyph, &glyphEntries, &glyphDetached);
+
+    if (!firstOk || !secondOk || !glyphOk) {
+        ArtemisTraceLimited("cache-clear-failed version=%ld firstOk=%d secondOk=%d glyphOk=%d",
+            version, firstOk ? 1 : 0, secondOk ? 1 : 0, glyphOk ? 1 : 0);
+        return false;
+    }
+
+    InterlockedExchange(&g_artemisCacheClearLastVersion, version);
+    ArtemisTraceLimited("cache-clear version=%ld mode=detach firstEntries=%lu firstDetached=%lu secondEntries=%lu secondDetached=%lu glyphEntries=%lu glyphDetached=%lu",
+        version, firstEntries, firstDetached, secondEntries, secondDetached, glyphEntries, glyphDetached);
+    return true;
+#endif
+}
+
+static void ArtemisRecordFontRedirect() {
+    InterlockedExchange(&g_artemisLastFontRedirectVersion, Config::ConfigVersion);
+    ArtemisScheduleFontAtlasDiscovery(Config::ConfigVersion);
+}
+
+static unsigned __stdcall ArtemisDelayedHotSwitchProbe(void* param) {
+    LONG version = param ? *(LONG*)param : LONG_MIN;
+    delete (LONG*)param;
+    if (version == LONG_MIN) return 0;
+
+    Sleep(1200);
+    if (!Config::EnableArtemisHook) return 0;
+    if (InterlockedCompareExchange(&g_artemisLastHotSwitchProbeVersion, version, version) == version) return 0;
+    InterlockedExchange(&g_artemisLastHotSwitchProbeVersion, version);
+
+    LONG lastRedirectVersion = InterlockedCompareExchange(&g_artemisLastFontRedirectVersion, 0, 0);
+    LONG lastTableOpenVersion = InterlockedCompareExchange(&g_artemisLastTableOpenVersion, 0, 0);
+    LONG lastTablePatchVersion = InterlockedCompareExchange(&g_artemisLastTablePatchVersion, 0, 0);
+    LONG lastFontReadyVersion = InterlockedCompareExchange(&g_artemisLastVirtualFontReadyVersion, 0, 0);
+    LONG lastReloadVersion = InterlockedCompareExchange(&g_artemisLastFreeTypeReloadAppliedVersion, 0, 0);
+    LONG lastRendererReloadVersion = LONG_MIN;
+    LONG atlasInvalidateVersion = InterlockedCompareExchange(&g_artemisAtlasInvalidateLastVersion, 0, 0);
+    LONG cacheClearVersion = InterlockedCompareExchange(&g_artemisCacheClearLastVersion, 0, 0);
+
+    const char* status = "ok";
+    const char* reason = "virtual-font-reopened";
+    bool scanFontObjects = false;
+    if (lastFontReadyVersion < version) {
+        status = "failed";
+        reason = "font-bytes-not-ready";
+        scanFontObjects = true;
+    } else if (lastRedirectVersion < version && lastRendererReloadVersion >= version &&
+        atlasInvalidateVersion >= version) {
+        reason = "font-renderer-reloaded-atlas-invalidated";
+    } else if (lastRedirectVersion < version && lastRendererReloadVersion >= version) {
+        reason = "font-renderer-reloaded";
+    } else if (lastRedirectVersion < version && lastReloadVersion >= version &&
+        atlasInvalidateVersion >= version) {
+        reason = "free-type-object-reloaded-atlas-invalidated";
+    } else if (lastRedirectVersion < version && lastReloadVersion >= version) {
+        reason = "free-type-object-reloaded";
+    } else if (lastRedirectVersion < version) {
+        status = "stale";
+        reason = "virtual-font-not-reopened-after-switch";
+        scanFontObjects = true;
+    }
+
+    ArtemisTraceLimited("hot-switch-probe version=%ld status=%s reason=%s tableOpen=%ld tablePatch=%ld fontRedirect=%ld fontReady=%ld fontReload=%ld rendererReload=%ld atlasInvalidate=%ld cacheClear=%ld virtual='%s' detail='If fontRedirect, fontReload, rendererReload, and atlasInvalidate are all lower than version, Artemis kept an already-created font object/cache after this switch.'",
+        version, status, reason, lastTableOpenVersion, lastTablePatchVersion,
+        lastRedirectVersion, lastFontReadyVersion, lastReloadVersion, lastRendererReloadVersion,
+        atlasInvalidateVersion, cacheClearVersion,
+        ArtemisWideToUtf8(ArtemisBuildVirtualFontPathForVersion(version)).c_str());
+    if (scanFontObjects) ArtemisScanFontObjects(version, reason);
+    return 0;
+}
+
+static void ArtemisScheduleHotSwitchProbe(LONG version) {
+    LONG* heapVersion = new LONG(version);
+
+    uintptr_t thread = _beginthreadex(NULL, 0, ArtemisDelayedHotSwitchProbe, heapVersion, 0, NULL);
+    if (thread == 0) {
+        delete heapVersion;
+        return;
+    }
+    CloseHandle((HANDLE)thread);
+}
+
+static void ArtemisNotifyConfigChanged(LONG version) {
+    if (!Config::EnableArtemisHook) return;
+    if (!ArtemisLooksLikeEngineRoot()) return;
+
+    LONG previous = InterlockedExchange(&g_artemisConfigNotifyVersion, version);
+    LONG lastRedirectVersion = InterlockedCompareExchange(&g_artemisLastFontRedirectVersion, 0, 0);
+    LONG lastTableOpenVersion = InterlockedCompareExchange(&g_artemisLastTableOpenVersion, 0, 0);
+    LONG lastTablePatchVersion = InterlockedCompareExchange(&g_artemisLastTablePatchVersion, 0, 0);
+    LONG lastFontReadyVersion = InterlockedCompareExchange(&g_artemisLastVirtualFontReadyVersion, 0, 0);
+    if (previous != LONG_MIN) {
+        const char* reason = NULL;
+        if (lastRedirectVersion < previous) {
+            reason = "virtual-font-not-reopened-after-previous-switch";
+        } else if (lastTableOpenVersion < previous) {
+            reason = "no-table-open-after-switch";
+        } else if (lastTablePatchVersion < previous) {
+            reason = "table-opened-but-not-patched-after-switch";
+        }
+
+        if (reason) {
+            ArtemisTraceLimited("hot-switch-diagnosis previousVersion=%ld currentVersion=%ld reason=%s tableOpen=%ld tablePatch=%ld fontRedirect=%ld fontReady=%ld detail='Artemis kept an already-created FreeType/rendered font object; the hook can replace the font bytes only after the engine reopens the patched table or virtual font path.'",
+                previous, version, reason, lastTableOpenVersion, lastTablePatchVersion,
+                lastRedirectVersion, lastFontReadyVersion);
+        }
+    }
+
+    bool fontSynced = ArtemisSyncVirtualFontFile(version);
+    bool fontReloaded = fontSynced && ArtemisReloadActiveFreeTypeFonts(version);
+    bool rendererReloaded = false;
+    bool atlasInvalidated = ArtemisInvalidateActiveFontAtlases(version);
+    bool cacheCleared = ArtemisClearInternalFontCache(version);
+    ArtemisTraceLimited("hot-switch-request version=%ld font='%s' virtual='%s' fontSync=%d fontReload=%d rendererReload=%d atlasInvalidate=%d cacheClear=%d lastTableOpen=%ld lastTablePatch=%ld lastFontRedirect=%ld",
+        version, ArtemisWideToUtf8(Config::ForcedFontNameW).c_str(),
+        ArtemisWideToUtf8(ArtemisBuildVirtualFontPathForVersion(version)).c_str(),
+        fontSynced ? 1 : 0, fontReloaded ? 1 : 0, rendererReloaded ? 1 : 0,
+        atlasInvalidated ? 1 : 0, cacheCleared ? 1 : 0,
+        lastTableOpenVersion, lastTablePatchVersion, lastRedirectVersion);
+    ArtemisScheduleHotSwitchProbe(version);
+}

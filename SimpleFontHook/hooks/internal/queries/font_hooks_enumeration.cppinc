@@ -1,0 +1,135 @@
+// EnumFontFamiliesEx hooks.
+// Some engines re-enumerate fonts when the user changes settings. We inject
+// our replacement font into the enumeration so the engine "discovers" it
+// and rebuilds its font cache using our font.
+int WINAPI newEnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpProc, LPARAM lParam, DWORD dwFlags) {
+    // Always call original first
+    int ret = orgEnumFontFamiliesExA(hdc, lpLogfont, lpProc, lParam, dwFlags);
+    // Then inject our font if hook is active and NOT in picker thread
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTA lf = {};
+        AppendEpochSuffixA(Config::ForcedFontNameA, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICA tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+
+int WINAPI newEnumFontFamiliesExW(HDC hdc, LPLOGFONTW lpLogfont, FONTENUMPROCW lpProc, LPARAM lParam, DWORD dwFlags) {
+    int ret = orgEnumFontFamiliesExW(hdc, lpLogfont, lpProc, lParam, dwFlags);
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTW lf = {};
+        AppendEpochSuffixW(Config::ForcedFontNameW, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICW tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+
+// CreateFontIndirectEx hooks.
+HFONT WINAPI newCreateFontIndirectExA(const ENUMLOGFONTEXDVA* lpelfe) {
+    if (!lpelfe) return orgCreateFontIndirectExA(lpelfe);
+    if (IsPickerThread()) return orgCreateFontIndirectExA(lpelfe);
+    EnsureInitialized();
+    if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectExA(lpelfe);
+    ENUMLOGFONTEXDVA elfe = *lpelfe;
+    LOGFONTW requestedLogfont = {};
+    LogFontAToW(lpelfe->elfEnumLogfontEx.elfLogFont, requestedLogfont);
+
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+    StripEpochSuffixA(elfe.elfEnumLogfontEx.elfLogFont.lfFaceName);
+
+    if (Config::EnableFaceNameReplace) strncpy_s(elfe.elfEnumLogfontEx.elfLogFont.lfFaceName, Config::ForcedFontNameA, LF_FACESIZE - 1);
+    if (Config::EnableCharsetReplace) elfe.elfEnumLogfontEx.elfLogFont.lfCharSet = (BYTE)Config::ForcedCharset;
+    elfe.elfEnumLogfontEx.elfLogFont.lfCharSet = SpoofCharsetB(elfe.elfEnumLogfontEx.elfLogFont.lfCharSet);
+    if (Config::EnableFontHeightScale) elfe.elfEnumLogfontEx.elfLogFont.lfHeight = ScaleLogFontValue(elfe.elfEnumLogfontEx.elfLogFont.lfHeight, Config::FontHeightScale);
+    if (Config::EnableFontWidthScale) elfe.elfEnumLogfontEx.elfLogFont.lfWidth = ScaleLogFontWidth(elfe.elfEnumLogfontEx.elfLogFont.lfWidth, elfe.elfEnumLogfontEx.elfLogFont.lfHeight);
+    if (Config::EnableFontWeight && Config::FontWeight > 0) elfe.elfEnumLogfontEx.elfLogFont.lfWeight = Config::FontWeight;
+    HFONT hFont = orgCreateFontIndirectExA(&elfe);
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+
+HFONT WINAPI newCreateFontIndirectExW(const ENUMLOGFONTEXDVW* lpelfe) {
+    if (!lpelfe) return orgCreateFontIndirectExW(lpelfe);
+    if (IsPickerThread()) return orgCreateFontIndirectExW(lpelfe);
+    EnsureInitialized();
+    if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectExW(lpelfe);
+    ENUMLOGFONTEXDVW elfe = *lpelfe;
+    LOGFONTW requestedLogfont = lpelfe->elfEnumLogfontEx.elfLogFont;
+
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+    StripEpochSuffixW(elfe.elfEnumLogfontEx.elfLogFont.lfFaceName);
+
+    if (Config::EnableFaceNameReplace) wcscpy_s(elfe.elfEnumLogfontEx.elfLogFont.lfFaceName, Config::ForcedFontNameW);
+    if (Config::EnableCharsetReplace) elfe.elfEnumLogfontEx.elfLogFont.lfCharSet = (BYTE)Config::ForcedCharset;
+    elfe.elfEnumLogfontEx.elfLogFont.lfCharSet = SpoofCharsetB(elfe.elfEnumLogfontEx.elfLogFont.lfCharSet);
+    if (Config::EnableFontHeightScale) elfe.elfEnumLogfontEx.elfLogFont.lfHeight = ScaleLogFontValue(elfe.elfEnumLogfontEx.elfLogFont.lfHeight, Config::FontHeightScale);
+    if (Config::EnableFontWidthScale) elfe.elfEnumLogfontEx.elfLogFont.lfWidth = ScaleLogFontWidth(elfe.elfEnumLogfontEx.elfLogFont.lfWidth, elfe.elfEnumLogfontEx.elfLogFont.lfHeight);
+    if (Config::EnableFontWeight && Config::FontWeight > 0) elfe.elfEnumLogfontEx.elfLogFont.lfWeight = Config::FontWeight;
+    HFONT hFont = orgCreateFontIndirectExW(&elfe);
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+
+
+
+// Old-style font enumeration hooks.
+int WINAPI newEnumFontsA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc, LPARAM lParam) {
+    int ret = orgEnumFontsA(hdc, lpFaceName, lpProc, lParam);
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTA lf = {};
+        AppendEpochSuffixA(Config::ForcedFontNameA, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICA tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+
+int WINAPI newEnumFontsW(HDC hdc, LPCWSTR lpFaceName, FONTENUMPROCW lpProc, LPARAM lParam) {
+    int ret = orgEnumFontsW(hdc, lpFaceName, lpProc, lParam);
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTW lf = {};
+        AppendEpochSuffixW(Config::ForcedFontNameW, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICW tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+
+int WINAPI newEnumFontFamiliesA(HDC hdc, LPCSTR lpFaceName, FONTENUMPROCA lpProc, LPARAM lParam) {
+    int ret = orgEnumFontFamiliesA(hdc, lpFaceName, lpProc, lParam);
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTA lf = {};
+        AppendEpochSuffixA(Config::ForcedFontNameA, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICA tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+
+int WINAPI newEnumFontFamiliesW(HDC hdc, LPCWSTR lpFaceName, FONTENUMPROCW lpProc, LPARAM lParam) {
+    int ret = orgEnumFontFamiliesW(hdc, lpFaceName, lpProc, lParam);
+    if (!IsPickerThread() && Config::EnableFontHook && Config::EnableFaceNameReplace && lpProc) {
+        LOGFONTW lf = {};
+        AppendEpochSuffixW(Config::ForcedFontNameW, lf.lfFaceName, _countof(lf.lfFaceName));
+        lf.lfCharSet = SpoofReportedCharsetB(Config::EnableCharsetReplace ? (BYTE)Config::ForcedCharset : DEFAULT_CHARSET);
+        TEXTMETRICW tm = {};
+        tm.tmCharSet = lf.lfCharSet;
+        lpProc(&lf, &tm, TRUETYPE_FONTTYPE, lParam);
+    }
+    return ret;
+}
+

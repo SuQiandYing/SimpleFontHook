@@ -1,0 +1,4 @@
+#include "model/font_hooks_codepage_epoch.cppinc"
+#include "model/font_hooks_metric_adjust.cppinc"
+#include "model/font_hooks_replacement_cache.cppinc"
+#include "model/font_hooks_glyph_virtualization.cppinc"

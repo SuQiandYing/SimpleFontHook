@@ -1,0 +1,136 @@
+// GDI font creation hooks.
+HFONT WINAPI newCreateFontA(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS, DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCSTR lpszF) {
+    EnsureInitialized();
+    DetectCharset(fC);
+
+    if (IsPickerThread() || (!Config::EnableFontHook && !Config::EnableCodepageSpoof))
+        return orgCreateFontA(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, lpszF);
+
+    LOGFONTW requestedLogfont = MakeSourceLogFontWFromA(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, lpszF);
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        SoftpalShouldUseNaturalReplacementWidth()) {
+        LOGFONTW replacementLogfont = {};
+        if (BuildReplacementLogFont(sourceLogfont, replacementLogfont)) {
+            HFONT hFont = orgCreateFontIndirectW(&replacementLogfont);
+            RegisterCreatedReplacementFont(hFont, sourceLogfont);
+            if (hFont) return hFont;
+        }
+    }
+
+    DWORD fCs = Config::EnableCharsetReplace ? Config::ForcedCharset : fC;
+    fCs = SpoofCharset(fCs);
+
+    int fH = Config::EnableFontHeightScale ? (int)ScaleLogFontValue(nH, Config::FontHeightScale) : nH;
+    int fW = (int)ScaleLogFontWidth(nW, fH);
+    int fWt = (Config::EnableFontWeight && Config::FontWeight > 0) ? Config::FontWeight : nWt;
+
+    HFONT hFont = NULL;
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        hFont = orgCreateFontW(fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, Config::ForcedFontNameW);
+    } else {
+        char faceName[LF_FACESIZE] = {};
+        if (lpszF) {
+            strncpy_s(faceName, lpszF, _TRUNCATE);
+            StripEpochSuffixA(faceName);
+        }
+        hFont = orgCreateFontA(fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, lpszF ? faceName : NULL);
+    }
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+
+HFONT WINAPI newCreateFontIndirectA(const LOGFONTA* lplf) {
+    if (!lplf) return orgCreateFontIndirectA(lplf);
+    if (IsPickerThread()) return orgCreateFontIndirectA(lplf);
+    EnsureInitialized();
+    DetectCharset(lplf->lfCharSet);
+
+    if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectA(lplf);
+
+    LOGFONTW requestedLogfont = {};
+    LogFontAToW(*lplf, requestedLogfont);
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        SoftpalShouldUseNaturalReplacementWidth()) {
+        LOGFONTW replacementLogfont = {};
+        if (BuildReplacementLogFont(sourceLogfont, replacementLogfont)) {
+            HFONT hFont = orgCreateFontIndirectW(&replacementLogfont);
+            RegisterCreatedReplacementFont(hFont, sourceLogfont);
+            if (hFont) return hFont;
+        }
+    }
+
+    LOGFONTA lf = *lplf;
+    StripEpochSuffixFromLogFont(lf);
+    if (Config::EnableFaceNameReplace)
+        strncpy_s(lf.lfFaceName, Config::ForcedFontNameA, LF_FACESIZE - 1);
+    if (Config::EnableCharsetReplace) lf.lfCharSet = (BYTE)Config::ForcedCharset;
+    lf.lfCharSet = SpoofCharsetB(lf.lfCharSet);
+
+    if (Config::EnableFontHeightScale) lf.lfHeight = ScaleLogFontValue(lf.lfHeight, Config::FontHeightScale);
+    if (Config::EnableFontWidthScale) lf.lfWidth = ScaleLogFontWidth(lf.lfWidth, lf.lfHeight);
+    if (Config::EnableFontWeight && Config::FontWeight > 0) lf.lfWeight = Config::FontWeight;
+
+    HFONT hFont = orgCreateFontIndirectA(&lf);
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+
+HFONT WINAPI newCreateFontW(int nH, int nW, int nE, int nO, int nWt, DWORD fI, DWORD fU, DWORD fS, DWORD fC, DWORD fOP, DWORD fCP, DWORD fQ, DWORD fPF, LPCWSTR lpszF) {
+    EnsureInitialized();
+    DetectCharset(fC);
+    if (IsPickerThread() || (!Config::EnableFontHook && !Config::EnableCodepageSpoof))
+        return orgCreateFontW(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, lpszF);
+
+    LOGFONTW requestedLogfont = MakeSourceLogFontW(nH, nW, nE, nO, nWt, fI, fU, fS, fC, fOP, fCP, fQ, fPF, lpszF);
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+
+    wchar_t faceName[LF_FACESIZE] = {};
+    if (lpszF) {
+        wcsncpy_s(faceName, lpszF, _TRUNCATE);
+        StripEpochSuffixW(faceName);
+    }
+    LPCWSTR fF = Config::EnableFaceNameReplace ? Config::ForcedFontNameW : (lpszF ? faceName : NULL);
+    DWORD fCs = Config::EnableCharsetReplace ? Config::ForcedCharset : fC;
+    fCs = SpoofCharset(fCs);
+
+    int fH = Config::EnableFontHeightScale ? (int)ScaleLogFontValue(nH, Config::FontHeightScale) : nH;
+    int fW = (int)ScaleLogFontWidth(nW, fH);
+    int fWt = (Config::EnableFontWeight && Config::FontWeight > 0) ? Config::FontWeight : nWt;
+
+    HFONT hFont = orgCreateFontW(fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, fF);
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+
+HFONT WINAPI newCreateFontIndirectW(const LOGFONTW* lplf) {
+    if (!lplf) return orgCreateFontIndirectW(lplf);
+    if (IsPickerThread()) return orgCreateFontIndirectW(lplf);
+    EnsureInitialized();
+    DetectCharset(lplf->lfCharSet);
+    if (!Config::EnableFontHook && !Config::EnableCodepageSpoof) return orgCreateFontIndirectW(lplf);
+
+    LOGFONTW requestedLogfont = *lplf;
+    LOGFONTW sourceLogfont = requestedLogfont;
+    StripEpochSuffixFromLogFont(sourceLogfont);
+
+    LOGFONTW lf = sourceLogfont;
+    if (Config::EnableFaceNameReplace) wcscpy_s(lf.lfFaceName, Config::ForcedFontNameW);
+    if (Config::EnableCharsetReplace) lf.lfCharSet = (BYTE)Config::ForcedCharset;
+    lf.lfCharSet = SpoofCharsetB(lf.lfCharSet);
+
+    if (Config::EnableFontHeightScale) lf.lfHeight = ScaleLogFontValue(lf.lfHeight, Config::FontHeightScale);
+    if (Config::EnableFontWidthScale) lf.lfWidth = ScaleLogFontWidth(lf.lfWidth, lf.lfHeight);
+    if (Config::EnableFontWeight && Config::FontWeight > 0) lf.lfWeight = Config::FontWeight;
+
+    HFONT hFont = orgCreateFontIndirectW(&lf);
+    RegisterCreatedReplacementFont(hFont, sourceLogfont);
+    return hFont;
+}
+

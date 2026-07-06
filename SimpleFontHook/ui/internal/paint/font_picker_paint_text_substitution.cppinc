@@ -1,0 +1,50 @@
+static void PaintTextSubstitutionBar(HDC mem, const RECT& rc)
+{
+    int top = GetTextSubTop();
+    RECT bg = { 0, top, rc.right, top + TEXTSUB_HEIGHT };
+    HBRUSH bgBr = CreateSolidBrush(RGB(18, 18, 36));
+    FillRect(mem, &bg, bgBr);
+    DeleteObject(bgBr);
+
+    HPEN sep = CreatePen(PS_SOLID, 1, COL_SEPARATOR);
+    HGDIOBJ oldSep = SelectObject(mem, sep);
+    MoveToEx(mem, 0, top + TEXTSUB_HEIGHT - 1, NULL);
+    LineTo(mem, rc.right, top + TEXTSUB_HEIGHT - 1);
+    SelectObject(mem, oldSep);
+    DeleteObject(sep);
+
+    HFONT font = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_BOLD, DEFAULT_CHARSET);
+    HGDIOBJ oldFont = SelectObject(mem, font);
+
+    auto drawButton = [&](const wchar_t* label, bool active, bool hovered, HFONT useFont, int& px) {
+        HGDIOBJ oldBtnFont = SelectObject(mem, useFont);
+        SIZE sz; GetTextExtentPoint32W(mem, label, (int)wcslen(label), &sz);
+        int bw = sz.cx + 16;
+        int py = top + (TEXTSUB_HEIGHT - 24) / 2;
+        RECT btnRc = { px, py, px + bw, py + 24 };
+        COLORREF bgCol = active ? RGB(40, 70, 85) : RGB(50, 35, 65);
+        if (hovered) bgCol = active ? RGB(50, 90, 105) : RGB(65, 48, 85);
+        FillRoundRect(mem, btnRc, 10, bgCol);
+        DrawRoundRectOutline(mem, btnRc, 10, active ? RGB(130, 210, 255) : COL_BORDER);
+        SetTextColor(mem, active ? RGB(170, 230, 255) : COL_TEXT_DIM);
+        DrawTextW(mem, label, -1, &btnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(mem, oldBtnFont);
+        px += bw + 8;
+    };
+
+    int px = 10;
+    const wchar_t* toggleLabel = g_textSubstitutionEnabled ? L"\x6620\x5C04: \x5F00" : L"\x6620\x5C04: \x5173";
+    drawButton(toggleLabel, g_textSubstitutionEnabled, g_textSubstitutionHovered, font, px);
+
+    HFONT modeFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
+    drawButton(g_textSubstitutionModes[g_textSubstitutionModeIdx].label, g_textSubstitutionEnabled,
+        g_textSubstitutionModeHovered, modeFont, px);
+
+    px += 2;
+    const wchar_t* redirectLabel = g_codepageRedirectEnabled ? L"\x8F6C\x7801: \x5F00" : L"\x8F6C\x7801: \x5173";
+    drawButton(redirectLabel, g_codepageRedirectEnabled, g_codepageRedirectHovered, font, px);
+    drawButton(g_codepageRedirectPresets[g_codepageRedirectPresetIdx].label, g_codepageRedirectEnabled,
+        g_codepageRedirectPresetHovered, modeFont, px);
+
+    SelectObject(mem, oldFont);
+}

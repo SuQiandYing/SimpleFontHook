@@ -1,0 +1,108 @@
+// Codepage spoofing.
+static DWORD SpoofCharset(DWORD cs) {
+    if (!Config::EnableCodepageSpoof || !Config::EnableCodepageRuntimeReplace) return cs;
+    if (cs == Config::SpoofFromCharset) {
+        return Config::SpoofToCharset;
+    }
+    return cs;
+}
+static BYTE SpoofCharsetB(BYTE cs) { 
+    return (BYTE)SpoofCharset((DWORD)cs); 
+}
+
+static BYTE SpoofReportedCharsetB(BYTE fallback) {
+    if (!Config::EnableCodepageSpoof) return fallback;
+    return (BYTE)Config::SpoofToCharset;
+}
+
+static void PatchFontSignatureCodepage(LPFONTSIGNATURE sig) {
+    if (!sig || !Config::EnableCodepageSpoof) return;
+    int bit = FontPatcher::CodePageRangeBitForCharset(Config::SpoofToCharset);
+    if (bit >= 0 && bit < 64) {
+        sig->fsCsb[bit / 32] |= (1u << (bit % 32));
+    }
+    sig->fsCsb[0] |= 1u;
+}
+
+static bool IsHexDigitW(wchar_t c) {
+    return (c >= L'0' && c <= L'9') ||
+        (c >= L'a' && c <= L'f') ||
+        (c >= L'A' && c <= L'F');
+}
+
+static bool IsHexDigitA(char c) {
+    return (c >= '0' && c <= '9') ||
+        (c >= 'a' && c <= 'f') ||
+        (c >= 'A' && c <= 'F');
+}
+
+static void StripEpochSuffixW(wchar_t* faceName) {
+    if (!faceName) return;
+    size_t len = wcslen(faceName);
+    if (len < 5) return;
+    size_t pos = len - 5;
+    if (faceName[pos] != L'@') return;
+    for (size_t i = pos + 1; i < len; ++i) {
+        if (!IsHexDigitW(faceName[i])) return;
+    }
+    faceName[pos] = L'\0';
+}
+
+static void StripEpochSuffixA(char* faceName) {
+    if (!faceName) return;
+    size_t len = strlen(faceName);
+    if (len < 5) return;
+    size_t pos = len - 5;
+    if (faceName[pos] != '@') return;
+    for (size_t i = pos + 1; i < len; ++i) {
+        if (!IsHexDigitA(faceName[i])) return;
+    }
+    faceName[pos] = '\0';
+}
+
+static void AppendEpochSuffixW(const wchar_t* faceName, wchar_t* outFaceName, size_t outCount) {
+    if (!outFaceName || outCount == 0) return;
+    outFaceName[0] = L'\0';
+    if (!faceName) return;
+
+    wchar_t base[LF_FACESIZE] = {};
+    wcsncpy_s(base, faceName, _TRUNCATE);
+    StripEpochSuffixW(base);
+
+    LONG version = Config::ConfigVersion;
+    if (version <= 0 || base[0] == L'\0') {
+        wcsncpy_s(outFaceName, outCount, base, _TRUNCATE);
+        return;
+    }
+
+    wchar_t suffix[8] = {};
+    swprintf_s(suffix, L"@%04lX", version & 0xFFFF);
+    size_t suffixLen = wcslen(suffix);
+    size_t maxBaseLen = (outCount > suffixLen + 1) ? (outCount - suffixLen - 1) : 0;
+    wcsncpy_s(outFaceName, outCount, base, maxBaseLen);
+    wcsncat_s(outFaceName, outCount, suffix, _TRUNCATE);
+}
+
+static void AppendEpochSuffixA(const char* faceName, char* outFaceName, size_t outCount) {
+    if (!outFaceName || outCount == 0) return;
+    outFaceName[0] = '\0';
+    if (!faceName) return;
+
+    char base[LF_FACESIZE] = {};
+    strncpy_s(base, faceName, _TRUNCATE);
+    StripEpochSuffixA(base);
+
+    LONG version = Config::ConfigVersion;
+    if (version <= 0 || base[0] == '\0') {
+        strncpy_s(outFaceName, outCount, base, _TRUNCATE);
+        return;
+    }
+
+    char suffix[8] = {};
+    sprintf_s(suffix, "@%04lX", version & 0xFFFF);
+    size_t suffixLen = strlen(suffix);
+    size_t maxBaseLen = (outCount > suffixLen + 1) ? (outCount - suffixLen - 1) : 0;
+    strncpy_s(outFaceName, outCount, base, maxBaseLen);
+    strncat_s(outFaceName, outCount, suffix, _TRUNCATE);
+}
+
