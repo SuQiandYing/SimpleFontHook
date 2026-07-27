@@ -1,6 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
+set "BUILD_TARGET=Build"
+if /I "%~1"=="rebuild" set "BUILD_TARGET=Rebuild"
+if not "%~1"=="" if /I not "%~1"=="rebuild" (
+    echo ERROR: Unknown argument "%~1". Usage: %~nx0 [rebuild]
+    exit /b 2
+)
+
 REM --- 1. Find vswhere.exe ---
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "!VSWHERE!" (
@@ -45,16 +52,20 @@ cd /d "%~dp0"
 REM Suppress LNK4099 (Missing PDB for detours.lib)
 set "LINK=/IGNORE:4099"
 
-msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=Win32 /t:Rebuild /v:minimal
+msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=Win32 /t:!BUILD_TARGET! /v:minimal
+set "BUILD_RESULT=!ERRORLEVEL!"
 
-if %ERRORLEVEL% NEQ 0 (
+if !BUILD_RESULT! NEQ 0 (
     echo.
     echo Build failed with Platform=Win32. Trying Platform=x86...
-    msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=x86 /t:Rebuild /v:minimal
+    msbuild SimpleFontHook.sln /p:Configuration=Release /p:Platform=x86 /t:!BUILD_TARGET! /v:minimal
+    set "BUILD_RESULT=!ERRORLEVEL!"
 )
 
 echo.
 echo ============================================
-echo Build finished.
+echo Build target: !BUILD_TARGET!
+echo Build finished with errorlevel: !BUILD_RESULT!
 echo ============================================
 pause
+exit /b !BUILD_RESULT!
