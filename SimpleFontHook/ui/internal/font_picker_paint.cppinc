@@ -1,0 +1,73 @@
+#include "paint/font_picker_paint_background.cppinc"
+#include "paint/font_picker_paint_title.cppinc"
+#include "paint/font_picker_paint_search.cppinc"
+#include "paint/font_picker_paint_charset.cppinc"
+#include "paint/font_picker_paint_spoof.cppinc"
+#include "paint/font_picker_paint_text_substitution.cppinc"
+#include "paint/font_picker_paint_metrics.cppinc"
+#include "paint/font_picker_paint_font_list.cppinc"
+#include "paint/font_picker_paint_scrollbar.cppinc"
+#include "paint/font_picker_paint_preview.cppinc"
+#include "paint/font_picker_paint_border.cppinc"
+
+static void PaintWindow(HWND hWnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hWnd, &ps);
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) {
+        EndPaint(hWnd, &ps);
+        return;
+    }
+
+    HDC mem = NULL;
+    HBITMAP tempBmp = NULL;
+    HBITMAP oldTempBmp = NULL;
+    bool usingPersistentBuffer = EnsurePaintBuffer(hdc, rc.right, rc.bottom);
+    if (usingPersistentBuffer) {
+        mem = g_paintMemDC;
+    } else {
+        mem = CreateCompatibleDC(hdc);
+        tempBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        if (mem && tempBmp)
+            oldTempBmp = (HBITMAP)SelectObject(mem, tempBmp);
+    }
+    if (!mem || (!usingPersistentBuffer && !tempBmp)) {
+        if (tempBmp) DeleteObject(tempBmp);
+        if (mem) DeleteDC(mem);
+        EndPaint(hWnd, &ps);
+        return;
+    }
+
+    int savedDc = SaveDC(mem);
+    HRGN dirtyRgn = CreateRectRgn(ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
+    SelectClipRgn(mem, dirtyRgn);
+    SetBkMode(mem, TRANSPARENT);
+
+    PaintBackground(mem, rc);
+    PaintTitleBar(mem, rc);
+    PaintSearchArea(mem, rc);
+    PaintCharsetBar(mem, rc);
+    PaintSpoofBar(mem, rc);
+    PaintTextSubstitutionBar(mem, rc);
+    PaintMetricsBar(mem, rc);
+    PaintFontList(mem, rc);
+    PaintScrollbar(mem);
+    PaintPreviewPanel(mem, rc);
+    PaintWindowBorder(mem, rc);
+
+    RestoreDC(mem, savedDc);
+    DeleteObject(dirtyRgn);
+
+    int dirtyW = ps.rcPaint.right - ps.rcPaint.left;
+    int dirtyH = ps.rcPaint.bottom - ps.rcPaint.top;
+    BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top, dirtyW, dirtyH,
+        mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+
+    if (!usingPersistentBuffer) {
+        if (oldTempBmp) SelectObject(mem, oldTempBmp);
+        if (tempBmp) DeleteObject(tempBmp);
+        DeleteDC(mem);
+    }
+    EndPaint(hWnd, &ps);
+}

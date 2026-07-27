@@ -1,0 +1,206 @@
+static bool GetMetricValueRect(MetricValueKind kind, RECT& out) {
+    MetricsRects r;
+    GetMetricsRects(r);
+    switch (kind) {
+    case METRIC_VALUE_WIDTH: out = r.width.value; return true;
+    case METRIC_VALUE_HEIGHT: out = r.height.value; return true;
+    case METRIC_VALUE_SPACING: out = r.spacing.value; return true;
+    case METRIC_VALUE_ASCENT: out = r.ascent.value; return true;
+    case METRIC_VALUE_DESCENT: out = r.descent.value; return true;
+    case METRIC_VALUE_LINE: out = r.line.value; return true;
+    case METRIC_VALUE_WEIGHT: out = r.weight.value; return true;
+    default: return false;
+    }
+}
+
+static std::wstring FormatMetricValue(MetricValueKind kind) {
+    wchar_t buf[32] = {};
+    switch (kind) {
+    case METRIC_VALUE_WIDTH:
+        swprintf_s(buf, L"%.2f", GetFontWidthPercent() / 100.0);
+        break;
+    case METRIC_VALUE_HEIGHT:
+        swprintf_s(buf, L"%.2f", GetFontHeightPercent() / 100.0);
+        break;
+    case METRIC_VALUE_SPACING:
+        swprintf_s(buf, L"%d", GetFontSpacingValue());
+        break;
+    case METRIC_VALUE_ASCENT:
+        swprintf_s(buf, L"%d", GetFontAscentValue());
+        break;
+    case METRIC_VALUE_DESCENT:
+        swprintf_s(buf, L"%d", GetFontDescentValue());
+        break;
+    case METRIC_VALUE_LINE:
+        swprintf_s(buf, L"%d", GetFontLineValue());
+        break;
+    case METRIC_VALUE_WEIGHT:
+        swprintf_s(buf, L"%d", GetFontWeightValue());
+        break;
+    default:
+        buf[0] = L'\0';
+        break;
+    }
+    return buf;
+}
+
+static bool ParseMetricDouble(const wchar_t* text, double& value) {
+    if (!text) return false;
+    wchar_t* end = nullptr;
+    value = wcstod(text, &end);
+    return end && end != text;
+}
+
+static bool ParseMetricInt(const wchar_t* text, int& value) {
+    if (!text) return false;
+    wchar_t* end = nullptr;
+    long parsed = wcstol(text, &end, 10);
+    if (!end || end == text) return false;
+    value = (int)parsed;
+    return true;
+}
+
+static bool ApplyMetricValueText(MetricValueKind kind, const wchar_t* text) {
+    bool changed = false;
+
+    if (kind == METRIC_VALUE_WIDTH || kind == METRIC_VALUE_HEIGHT) {
+        double raw = 0.0;
+        if (!ParseMetricDouble(text, raw)) return false;
+
+        bool asPercent = (wcschr(text, L'%') != nullptr) || fabs(raw) > 10.0;
+        double percentValue = asPercent ? raw : raw * 100.0;
+        int pct = ClampInt((int)(percentValue + (percentValue >= 0 ? 0.5 : -0.5)),
+            FONT_SCALE_MIN_PERCENT, FONT_SCALE_MAX_PERCENT);
+
+        if (kind == METRIC_VALUE_WIDTH) {
+            changed = (pct != GetFontWidthPercent()) || (Config::EnableFontWidthScale != (pct != 100));
+            Config::FontWidthScale = pct / 100.0f;
+            Config::EnableFontWidthScale = (pct != 100);
+        } else {
+            changed = (pct != GetFontHeightPercent()) || (Config::EnableFontHeightScale != (pct != 100));
+            Config::FontHeightScale = pct / 100.0f;
+            Config::EnableFontHeightScale = (pct != 100);
+        }
+    } else {
+        int value = 0;
+        if (!ParseMetricInt(text, value)) return false;
+
+        switch (kind) {
+        case METRIC_VALUE_SPACING:
+            value = ClampInt(value, FONT_SPACING_MIN, FONT_SPACING_MAX);
+            changed = (value != Config::FontCharSpacing) || (Config::EnableFontCharSpacing != (value != 0));
+            Config::FontCharSpacing = value;
+            Config::EnableFontCharSpacing = (value != 0);
+            break;
+        case METRIC_VALUE_ASCENT:
+            value = ClampInt(value, FONT_ASCENT_MIN, FONT_ASCENT_MAX);
+            changed = (value != Config::FontAscentPermille) || !Config::EnableFontVerticalMetrics;
+            Config::FontAscentPermille = value;
+            Config::EnableFontVerticalMetrics = true;
+            break;
+        case METRIC_VALUE_DESCENT:
+            if (value > 0) value = -value;
+            value = ClampInt(value, FONT_DESCENT_MIN, FONT_DESCENT_MAX);
+            changed = (value != Config::FontDescentPermille) || !Config::EnableFontVerticalMetrics;
+            Config::FontDescentPermille = value;
+            Config::EnableFontVerticalMetrics = true;
+            break;
+        case METRIC_VALUE_LINE:
+            value = ClampInt(value, FONT_LINE_MIN, FONT_LINE_MAX);
+            changed = (value != Config::FontLineSpacing) || (Config::EnableFontLineSpacing != (value != 0));
+            Config::FontLineSpacing = value;
+            Config::EnableFontLineSpacing = (value != 0);
+            break;
+        case METRIC_VALUE_WEIGHT:
+            value = ClampInt(value, FONT_WEIGHT_MIN, FONT_WEIGHT_MAX);
+            changed = (value != Config::FontWeight) || (Config::EnableFontWeight != (value != FW_NORMAL));
+            Config::FontWeight = value;
+            Config::EnableFontWeight = (value != FW_NORMAL);
+            break;
+        default:
+            return false;
+        }
+    }
+
+    if (changed)
+        ApplyMetricsConfig();
+    return true;
+}
+
+static void FinishMetricEdit(bool apply) {
+    if (!g_hMetricEdit)
+        return;
+
+    HWND edit = g_hMetricEdit;
+    MetricValueKind kind = g_metricEditKind;
+    wchar_t text[64] = {};
+    if (apply)
+        GetWindowTextW(edit, text, _countof(text));
+
+    g_metricEditClosing = true;
+    g_hMetricEdit = NULL;
+    g_metricEditKind = METRIC_VALUE_NONE;
+    DestroyWindow(edit);
+    g_OldMetricEditProc = NULL;
+    g_metricEditClosing = false;
+
+    if (apply)
+        ApplyMetricValueText(kind, text);
+
+    SetFocus(g_hWnd);
+    InvalidateUiRect(g_hWnd, GetMetricsAreaRect(), 1);
+    if (apply) {
+        InvalidateUiRect(g_hWnd, GetPreviewAreaRect(), 1);
+        InvalidateListAndScrollbar(g_hWnd);
+    }
+}
+
+static LRESULT CALLBACK MetricEditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) {
+            FinishMetricEdit(true);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            FinishMetricEdit(false);
+            return 0;
+        }
+    }
+    return CallWindowProc(g_OldMetricEditProc, hWnd, msg, wParam, lParam);
+}
+
+static void StartMetricEdit(MetricValueKind kind) {
+    RECT rc;
+    if (!GetMetricValueRect(kind, rc))
+        return;
+
+    if (g_hMetricEdit)
+        FinishMetricEdit(true);
+
+    std::wstring value = FormatMetricValue(kind);
+    g_metricEditKind = kind;
+    g_hMetricEdit = CreateWindowExW(0, L"EDIT", value.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+        rc.left + 1, rc.top + 1, rc.right - rc.left - 2, rc.bottom - rc.top - 2,
+        g_hWnd, NULL, g_hModule, NULL);
+    if (!g_hMetricEdit) {
+        g_metricEditKind = METRIC_VALUE_NONE;
+        return;
+    }
+
+    SendMessage(g_hMetricEdit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    g_OldMetricEditProc = (WNDPROC)SetWindowLongPtrW(g_hMetricEdit, GWLP_WNDPROC, (LONG_PTR)MetricEditSubclassProc);
+    SendMessage(g_hMetricEdit, EM_SETSEL, 0, -1);
+    SetFocus(g_hMetricEdit);
+}
+
+static LRESULT CALLBACK EditSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_PRIOR || wParam == VK_NEXT || wParam == VK_RETURN) {
+            SendMessage(GetParent(hWnd), msg, wParam, lParam);
+            return 0;
+        }
+    }
+    return CallWindowProc(g_OldEditProc, hWnd, msg, wParam, lParam);
+}
+

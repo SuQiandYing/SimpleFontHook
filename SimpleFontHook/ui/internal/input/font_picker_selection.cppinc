@@ -1,0 +1,15 @@
+// List scroll and selection helpers.
+static void EnsureVisible() {
+    if (g_selectedIndex < g_scrollOffset)
+        g_scrollOffset = g_selectedIndex;
+    if (g_selectedIndex >= g_scrollOffset + VISIBLE_ITEMS)
+        g_scrollOffset = g_selectedIndex - VISIBLE_ITEMS + 1;
+}
+
+static void ClampScroll() {
+    int mx = (int)g_filteredIndices.size() - VISIBLE_ITEMS;
+    if (mx < 0) mx = 0;
+    if (g_scrollOffset < 0) g_scrollOffset = 0;
+    if (g_scrollOffset > mx) g_scrollOffset = mx;
+}
+

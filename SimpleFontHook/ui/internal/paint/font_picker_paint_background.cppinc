@@ -1,0 +1,10 @@
+static void PaintBackground(HDC mem, const RECT& rc)
+{
+    // Background.
+    RECT bgRc = { 0, 0, rc.right, rc.bottom };
+    GradientV(mem, bgRc, COL_BG_TOP, COL_BG_BOT);
+    
+    // Subtle background pattern
+    DrawDiagonalPattern(mem, bgRc, MixColor(COL_BG_TOP, COL_BG_BOT, 0.2f));
+
+}

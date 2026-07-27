@@ -1,0 +1,605 @@
+static void RefreshFilteredFontList(HWND hWnd) {
+    UpdateFilter();
+    g_scrollOffset = 0;
+    g_selectedIndex = g_filteredIndices.empty() ? -1 : 0;
+    InvalidateUiRect(hWnd, GetTitleAreaRect(), 1);
+    InvalidateListAndScrollbar(hWnd);
+    InvalidateUiRect(hWnd, GetPreviewAreaRect(), 1);
+}
+
+static void SetSelectedIndex(HWND hWnd, int index, bool ensureVisible) {
+    if (g_filteredIndices.empty()) {
+        g_selectedIndex = -1;
+        return;
+    }
+
+    int maxIndex = (int)g_filteredIndices.size() - 1;
+    int nextIndex = max(0, min(maxIndex, index));
+    int oldSelected = g_selectedIndex;
+    int oldScroll = g_scrollOffset;
+    g_selectedIndex = nextIndex;
+    if (ensureVisible)
+        EnsureVisible();
+    if (oldSelected != g_selectedIndex || oldScroll != g_scrollOffset)
+        InvalidateSelectionChange(hWnd, oldSelected, oldScroll);
+}
+
+static int ListIndexFromPoint(int y) {
+    int listY = y - GetListTop();
+    int index = g_scrollOffset + listY / ITEM_HEIGHT;
+    if (listY >= 0 && y < GetListBottom() && index >= 0 && index < (int)g_filteredIndices.size())
+        return index;
+    return -1;
+}
+
+static bool IsSelectionNavigationKey(WPARAM key) {
+    return key == VK_UP || key == VK_DOWN || key == VK_PRIOR ||
+        key == VK_NEXT || key == VK_HOME || key == VK_END;
+}
+
+static bool ApplyMetricHit(int hit) {
+    switch (hit) {
+    case METRIC_WIDTH_DOWN: AdjustFontWidthScale(-FONT_SCALE_STEP_PERCENT); return true;
+    case METRIC_WIDTH_UP: AdjustFontWidthScale(FONT_SCALE_STEP_PERCENT); return true;
+    case METRIC_HEIGHT_DOWN: AdjustFontHeightScale(-FONT_SCALE_STEP_PERCENT); return true;
+    case METRIC_HEIGHT_UP: AdjustFontHeightScale(FONT_SCALE_STEP_PERCENT); return true;
+    case METRIC_SPACING_DOWN: AdjustFontSpacing(-1); return true;
+    case METRIC_SPACING_UP: AdjustFontSpacing(1); return true;
+    case METRIC_ASCENT_DOWN: AdjustFontAscent(-10); return true;
+    case METRIC_ASCENT_UP: AdjustFontAscent(10); return true;
+    case METRIC_DESCENT_DOWN: AdjustFontDescent(-10); return true;
+    case METRIC_DESCENT_UP: AdjustFontDescent(10); return true;
+    case METRIC_LINE_DOWN: AdjustFontLineSpacing(-1); return true;
+    case METRIC_LINE_UP: AdjustFontLineSpacing(1); return true;
+    case METRIC_WEIGHT_DOWN: AdjustFontWeight(-FONT_WEIGHT_STEP); return true;
+    case METRIC_WEIGHT_UP: AdjustFontWeight(FONT_WEIGHT_STEP); return true;
+    case METRIC_SET_REFERENCE: SetMetricReferenceToSelected(); return true;
+    case METRIC_AUTO_VERTICAL: AutoVerticalMetrics(); return true;
+    case METRIC_RESET_METRICS: ResetDetailedMetrics(); return true;
+    default: return false;
+    }
+}
+
+static bool HandleTitleButtonClick(HWND hWnd, int x, int y) {
+    if (y >= TITLE_HEIGHT)
+        return false;
+
+    int zoomBtnW = 34;
+    int zoomOutL = WINDOW_WIDTH - 88 - zoomBtnW * 2 - 4;
+    int zoomInL = zoomOutL + zoomBtnW + 2;
+    if (x >= zoomOutL && x < zoomOutL + zoomBtnW) {
+        g_uiScale = max(UI_SCALE_MIN, g_uiScale - UI_SCALE_STEP);
+        RecalcLayout();
+        ClampScroll();
+        InvalidateRect(hWnd, NULL, FALSE);
+        return true;
+    }
+    if (x >= zoomInL && x < zoomInL + zoomBtnW) {
+        g_uiScale = min(UI_SCALE_MAX, g_uiScale + UI_SCALE_STEP);
+        RecalcLayout();
+        ClampScroll();
+        InvalidateRect(hWnd, NULL, FALSE);
+        return true;
+    }
+    if (x >= WINDOW_WIDTH - 46) {
+        ShowWindow(hWnd, SW_HIDE);
+        g_visible = false;
+        return true;
+    }
+    if (x >= WINDOW_WIDTH - 88 && x < WINDOW_WIDTH - 46) {
+        ShowWindow(hWnd, SW_MINIMIZE);
+        g_visible = false;
+        return true;
+    }
+    return false;
+}
+
+static bool HandleCharsetClick(HWND hWnd, int x, int y) {
+    RECT area = GetCharsetAreaRect();
+    if (!PointInRect(x, y, area))
+        return false;
+
+    int hit = CharsetHitTest(x, y);
+    if (hit >= 0 && hit != g_selectedCharset) {
+        g_selectedCharset = hit;
+        InvalidateUiRect(hWnd, area, 1);
+        RefreshFilteredFontList(hWnd);
+    }
+    return true;
+}
+
+static bool HandleSpoofBarClick(HWND hWnd, int x, int y) {
+    RECT area = GetSpoofAreaRect();
+    if (!PointInRect(x, y, area))
+        return false;
+
+    int hit = SpoofBarHitTest(x, y);
+    if (hit == 0) {
+        g_spoofEnabled = !g_spoofEnabled;
+        ApplySpoofConfig();
+    } else if (hit == 1) {
+        g_spoofCharsetIdx++;
+        if (g_spoofCharsetIdx >= g_spoofCharsetCount) g_spoofCharsetIdx = 0;
+        ApplySpoofConfig();
+    } else if (hit == 2) {
+        g_spoofRuntimeReplaceEnabled = !g_spoofRuntimeReplaceEnabled;
+        ApplySpoofConfig();
+    }
+    if (hit >= 0)
+        InvalidateRect(hWnd, NULL, FALSE);
+    return true;
+}
+
+static bool HandleTextSubstitutionClick(HWND hWnd, int x, int y) {
+    RECT area = GetTextSubAreaRect();
+    if (!PointInRect(x, y, area))
+        return false;
+
+    int hit = TextSubstitutionHitTest(x, y);
+    if (hit == 0) {
+        g_textSubstitutionEnabled = !g_textSubstitutionEnabled;
+        ApplyTextSubstitutionConfig();
+    } else if (hit == 1) {
+        g_textSubstitutionModeIdx++;
+        if (g_textSubstitutionModeIdx >= g_textSubstitutionModeCount)
+            g_textSubstitutionModeIdx = 0;
+        ApplyTextSubstitutionConfig();
+    } else if (hit == 2) {
+        g_codepageRedirectEnabled = !g_codepageRedirectEnabled;
+        ApplyCodepageRedirectConfig();
+    } else if (hit == 3) {
+        g_codepageRedirectPresetIdx++;
+        if (g_codepageRedirectPresetIdx >= g_codepageRedirectPresetCount)
+            g_codepageRedirectPresetIdx = 0;
+        ApplyCodepageRedirectConfig();
+    }
+    if (hit >= 0)
+        InvalidateUiRect(hWnd, area, 1);
+    return true;
+}
+
+static bool HandleMetricClick(HWND hWnd, int x, int y) {
+    if (y < GetMetricsTop() || y >= GetPreviewTop())
+        return false;
+
+    MetricValueKind valueHit = MetricValueHitTest(x, y);
+    if (valueHit != METRIC_VALUE_NONE) {
+        StartMetricEdit(valueHit);
+        InvalidateUiRect(hWnd, GetMetricsAreaRect(), 1);
+        return true;
+    }
+
+    if (ApplyMetricHit(MetricsHitTest(x, y))) {
+        InvalidateUiRect(hWnd, GetMetricsAreaRect(), 1);
+        InvalidateUiRect(hWnd, GetPreviewAreaRect(), 1);
+        InvalidateListAndScrollbar(hWnd);
+    }
+    return true;
+}
+
+static bool HandleScrollbarClick(HWND hWnd, int x, int y) {
+    if ((int)g_filteredIndices.size() <= VISIBLE_ITEMS)
+        return false;
+
+    RECT thumbRc, trackRc;
+    GetScrollbarRect(&thumbRc, &trackRc);
+    if (PointInRect(x, y, thumbRc)) {
+        g_scrollbarDragging = true;
+        g_scrollDragStartY = y;
+        g_scrollDragStartOffset = g_scrollOffset;
+        SetCapture(hWnd);
+        return true;
+    }
+    if (PointInRect(x, y, trackRc)) {
+        int cnt = (int)g_filteredIndices.size();
+        int maxScroll = max(1, cnt - VISIBLE_ITEMS);
+        float ratio = (float)(y - trackRc.top) / (float)(trackRc.bottom - trackRc.top);
+        g_scrollOffset = (int)(ratio * maxScroll);
+        ClampScroll();
+        InvalidateListAndScrollbar(hWnd);
+        return true;
+    }
+    return false;
+}
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+
+    case WM_PAINT:
+        PaintWindow(hWnd);
+        return 0;
+
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hWnd, &pt);
+        int x = pt.x, y = pt.y;
+        int w = WINDOW_WIDTH, h = WINDOW_HEIGHT;
+        int b = RESIZE_BORDER;
+
+        // Corners (prioritized)
+        if (x < b && y < b)             return HTTOPLEFT;
+        if (x >= w - b && y < b)        return HTTOPRIGHT;
+        if (x < b && y >= h - b)        return HTBOTTOMLEFT;
+        if (x >= w - b && y >= h - b)   return HTBOTTOMRIGHT;
+        // Edges
+        if (x < b)                      return HTLEFT;
+        if (x >= w - b)                 return HTRIGHT;
+        if (y < b)                      return HTTOP;
+        if (y >= h - b)                 return HTBOTTOM;
+        // Title bar (caption for drag, but not over buttons including zoom A-/A+)
+        {
+            int zoomBtnW = 34;
+            int zoomOutL = w - 88 - zoomBtnW * 2 - 4;
+            if (y < TITLE_HEIGHT && x < zoomOutL) return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+
+    case WM_NCLBUTTONDBLCLK: return 0;
+
+    // Keep the whole popup as client area so only our custom border is visible.
+    case WM_NCCALCSIZE:
+        return 0;
+
+    case WM_COMMAND:
+        if ((HWND)lParam == g_hSearchEdit && HIWORD(wParam) == EN_CHANGE) {
+            RefreshFilteredFontList(hWnd);
+        } else if ((HWND)lParam == g_hMetricEdit && HIWORD(wParam) == EN_KILLFOCUS && !g_metricEditClosing) {
+            FinishMetricEdit(true);
+        }
+        break;
+
+    case WM_KEYDOWN:
+        if (IsSelectionNavigationKey(wParam) && g_filteredIndices.empty()) {
+            g_selectedIndex = -1;
+            return 0;
+        }
+        switch (wParam) {
+        case VK_UP:
+            if (g_selectedIndex > 0)
+                SetSelectedIndex(hWnd, g_selectedIndex - 1, true);
+            return 0;
+        case VK_DOWN:
+            if (g_selectedIndex < (int)g_filteredIndices.size() - 1)
+                SetSelectedIndex(hWnd, g_selectedIndex + 1, true);
+            return 0;
+        case VK_PRIOR:
+            SetSelectedIndex(hWnd, g_selectedIndex - VISIBLE_ITEMS, true);
+            return 0;
+        case VK_NEXT:
+            SetSelectedIndex(hWnd, g_selectedIndex + VISIBLE_ITEMS, true);
+            return 0;
+        case VK_HOME:
+            SetSelectedIndex(hWnd, 0, true);
+            return 0;
+        case VK_END:
+            SetSelectedIndex(hWnd, (int)g_filteredIndices.size() - 1, true);
+            return 0;
+        case VK_RETURN:
+            ApplySelectedFont();
+            InvalidateListAndScrollbar(hWnd);
+            InvalidateUiRect(hWnd, GetPreviewAreaRect(), 1);
+            return 0;
+        case VK_ESCAPE:
+            ShowWindow(hWnd, SW_HIDE); g_visible = false;
+            return 0;
+        }
+        break;
+
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        // Check if mouse is over charset bar for horizontal scroll
+        POINT wpt;
+        GetCursorPos(&wpt);
+        ScreenToClient(hWnd, &wpt);
+        int csTop = TITLE_HEIGHT + SEARCH_HEIGHT;
+        if (wpt.y >= csTop && wpt.y < csTop + CHARSET_HEIGHT) {
+            g_charsetWheelRemainder += delta;
+            int notches = g_charsetWheelRemainder / WHEEL_DELTA;
+            if (notches == 0)
+                return 0;
+            g_charsetWheelRemainder -= notches * WHEEL_DELTA;
+
+            int oldScrollX = g_charsetScrollX;
+            g_charsetScrollX -= notches * 40;
+            int totalW = 0;
+            CharsetHitTest(0, csTop + 8, &totalW);
+            int maxScrlX = max(0, totalW - WINDOW_WIDTH + 8);
+            if (g_charsetScrollX < 0) g_charsetScrollX = 0;
+            if (g_charsetScrollX > maxScrlX) g_charsetScrollX = maxScrlX;
+            if (oldScrollX != g_charsetScrollX)
+                InvalidateUiRect(hWnd, GetCharsetAreaRect(), 1);
+            return 0;
+        }
+        if (wpt.y >= GetMetricsTop() && wpt.y < GetPreviewTop())
+            return 0;
+        g_listWheelRemainder += delta;
+        int notches = g_listWheelRemainder / WHEEL_DELTA;
+        if (notches == 0)
+            return 0;
+        g_listWheelRemainder -= notches * WHEEL_DELTA;
+
+        int oldScroll = g_scrollOffset;
+        g_scrollOffset -= notches * 3;
+        ClampScroll();
+        if (oldScroll != g_scrollOffset) {
+            int oldHovered = g_hoveredIndex;
+            g_hoveredIndex = ListIndexFromPoint(wpt.y);
+            InvalidateListAndScrollbar(hWnd);
+            if (oldHovered != g_hoveredIndex)
+                InvalidateListRows(hWnd, oldHovered, g_hoveredIndex);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+
+        if (!g_trackingMouseLeave) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+            if (TrackMouseEvent(&tme))
+                g_trackingMouseLeave = true;
+        }
+
+        // Title buttons (zoom A-/A+, minimize, close)
+        bool inClose = (x >= WINDOW_WIDTH - 46 && y < TITLE_HEIGHT);
+        bool inMin = (x >= WINDOW_WIDTH - 88 && x < WINDOW_WIDTH - 46 && y < TITLE_HEIGHT);
+        int zBtnW = 34;
+        int zOutL = WINDOW_WIDTH - 88 - zBtnW * 2 - 4;
+        int zInL = zOutL + zBtnW + 2;
+        bool inZoomOut = (y < TITLE_HEIGHT && x >= zOutL && x < zOutL + zBtnW);
+        bool inZoomIn  = (y < TITLE_HEIGHT && x >= zInL && x < zInL + zBtnW);
+        if (inClose != g_closeHovered || inMin != g_minHovered ||
+            inZoomOut != g_zoomOutHovered || inZoomIn != g_zoomInHovered) {
+            g_closeHovered = inClose; g_minHovered = inMin;
+            g_zoomOutHovered = inZoomOut; g_zoomInHovered = inZoomIn;
+            InvalidateUiRect(hWnd, GetTitleAreaRect(), 1);
+        }
+
+        // Scrollbar drag
+        if (g_scrollbarDragging) {
+            int cnt = (int)g_filteredIndices.size();
+            int maxScroll = max(1, cnt - VISIBLE_ITEMS);
+            int listTop = GetListTop() + 4;
+            int listBot = GetListBottom() - 4;
+            int trackH = listBot - listTop;
+            int calcH = trackH * VISIBLE_ITEMS / cnt;
+            int thumbH = max(28, calcH);
+            int scrollRange = max(1, trackH - thumbH);
+
+            int dy = y - g_scrollDragStartY;
+            int newOff = g_scrollDragStartOffset + dy * maxScroll / scrollRange;
+            newOff = max(0, min(maxScroll, newOff));
+            if (newOff != g_scrollOffset) {
+                g_scrollOffset = newOff;
+                InvalidateListAndScrollbar(hWnd);
+            }
+            return 0;
+        }
+
+        // Scrollbar hover
+        if ((int)g_filteredIndices.size() > VISIBLE_ITEMS) {
+            RECT thumbRc;
+            GetScrollbarRect(&thumbRc, NULL);
+            bool inThumb = PointInRect(x, y, thumbRc);
+            if (inThumb != g_scrollbarHovered) {
+                g_scrollbarHovered = inThumb;
+                InvalidateUiRect(hWnd, GetScrollbarAreaRect(), 2);
+            }
+        }
+
+        // Charset bar hover
+        {
+            int csTop = TITLE_HEIGHT + SEARCH_HEIGHT;
+            int newHov = -1;
+            if (y >= csTop && y < csTop + CHARSET_HEIGHT)
+                newHov = CharsetHitTest(x, y);
+            if (newHov != g_hoveredCharset) {
+                g_hoveredCharset = newHov;
+                InvalidateUiRect(hWnd, GetCharsetAreaRect(), 1);
+            }
+        }
+
+        // Spoof bar hover
+        {
+            int spTop = TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT;
+            bool newToggle = false, newCharset = false, newMode = false;
+            if (y >= spTop && y < spTop + SPOOF_HEIGHT) {
+                int hit = SpoofBarHitTest(x, y);
+                newToggle = (hit == 0);
+                newCharset = (hit == 1);
+                newMode = (hit == 2);
+            }
+            if (newToggle != g_spoofToggleHovered || newCharset != g_spoofCharsetHovered ||
+                newMode != g_spoofModeHovered) {
+                g_spoofToggleHovered = newToggle;
+                g_spoofCharsetHovered = newCharset;
+                g_spoofModeHovered = newMode;
+                InvalidateUiRect(hWnd, GetSpoofAreaRect(), 1);
+            }
+        }
+
+        // Text substitution bar hover
+        {
+            int textSubTop = GetTextSubTop();
+            bool newTextSub = false, newTextSubMode = false;
+            bool newRedirect = false, newRedirectPreset = false;
+            if (y >= textSubTop && y < textSubTop + TEXTSUB_HEIGHT) {
+                int hit = TextSubstitutionHitTest(x, y);
+                newTextSub = (hit == 0);
+                newTextSubMode = (hit == 1);
+                newRedirect = (hit == 2);
+                newRedirectPreset = (hit == 3);
+            }
+            if (newTextSub != g_textSubstitutionHovered ||
+                newTextSubMode != g_textSubstitutionModeHovered ||
+                newRedirect != g_codepageRedirectHovered ||
+                newRedirectPreset != g_codepageRedirectPresetHovered) {
+                g_textSubstitutionHovered = newTextSub;
+                g_textSubstitutionModeHovered = newTextSubMode;
+                g_codepageRedirectHovered = newRedirect;
+                g_codepageRedirectPresetHovered = newRedirectPreset;
+                InvalidateUiRect(hWnd, GetTextSubAreaRect(), 1);
+            }
+        }
+
+        // Font metrics hover
+        {
+            int newMetricHover = MetricsHitTest(x, y);
+            if (newMetricHover != g_metricHovered) {
+                g_metricHovered = newMetricHover;
+                InvalidateUiRect(hWnd, GetMetricsAreaRect(), 1);
+            }
+        }
+
+        // List hover
+        int hi = ListIndexFromPoint(y);
+        if (hi >= 0) {
+            if (g_hoveredIndex != hi) {
+                int oldHovered = g_hoveredIndex;
+                g_hoveredIndex = hi;
+                InvalidateListRows(hWnd, oldHovered, g_hoveredIndex);
+            }
+        } else if (g_hoveredIndex != -1) {
+            int oldHovered = g_hoveredIndex;
+            g_hoveredIndex = -1;
+            InvalidateListRows(hWnd, oldHovered, g_hoveredIndex);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_trackingMouseLeave = false;
+        if (g_hoveredIndex != -1 || g_closeHovered || g_minHovered || g_scrollbarHovered || g_hoveredCharset != -1
+            || g_zoomInHovered || g_zoomOutHovered
+            || g_spoofToggleHovered || g_spoofCharsetHovered || g_spoofModeHovered
+            || g_textSubstitutionHovered || g_textSubstitutionModeHovered
+            || g_codepageRedirectHovered || g_codepageRedirectPresetHovered
+            || g_metricHovered != METRIC_NONE) {
+            int oldHovered = g_hoveredIndex;
+            bool dirtyTitle = g_closeHovered || g_minHovered || g_zoomInHovered || g_zoomOutHovered;
+            bool dirtyScrollbar = g_scrollbarHovered;
+            bool dirtyCharset = g_hoveredCharset != -1;
+            bool dirtySpoof = g_spoofToggleHovered || g_spoofCharsetHovered || g_spoofModeHovered;
+            bool dirtyTextSub = g_textSubstitutionHovered || g_textSubstitutionModeHovered ||
+                g_codepageRedirectHovered || g_codepageRedirectPresetHovered;
+            bool dirtyMetrics = g_metricHovered != METRIC_NONE;
+            g_hoveredIndex = -1; g_closeHovered = false; g_minHovered = false; g_scrollbarHovered = false;
+            g_hoveredCharset = -1; g_zoomInHovered = false; g_zoomOutHovered = false;
+            g_spoofToggleHovered = false; g_spoofCharsetHovered = false; g_spoofModeHovered = false;
+            g_textSubstitutionHovered = false;
+            g_textSubstitutionModeHovered = false;
+            g_codepageRedirectHovered = false;
+            g_codepageRedirectPresetHovered = false;
+            g_metricHovered = METRIC_NONE;
+            if (dirtyTitle) InvalidateUiRect(hWnd, GetTitleAreaRect(), 1);
+            if (dirtyScrollbar) InvalidateUiRect(hWnd, GetScrollbarAreaRect(), 2);
+            if (dirtyCharset) InvalidateUiRect(hWnd, GetCharsetAreaRect(), 1);
+            if (dirtySpoof) InvalidateUiRect(hWnd, GetSpoofAreaRect(), 1);
+            if (dirtyTextSub) InvalidateUiRect(hWnd, GetTextSubAreaRect(), 1);
+            if (dirtyMetrics) InvalidateUiRect(hWnd, GetMetricsAreaRect(), 1);
+            InvalidateListItem(hWnd, oldHovered);
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+
+        if (HandleTitleButtonClick(hWnd, x, y) ||
+            HandleCharsetClick(hWnd, x, y) ||
+            HandleSpoofBarClick(hWnd, x, y) ||
+            HandleTextSubstitutionClick(hWnd, x, y) ||
+            HandleMetricClick(hWnd, x, y) ||
+            HandleScrollbarClick(hWnd, x, y)) {
+            return 0;
+        }
+
+        // List click
+        int ci = ListIndexFromPoint(y);
+        if (ci >= 0)
+            SetSelectedIndex(hWnd, ci, false);
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_scrollbarDragging) {
+            g_scrollbarDragging = false;
+            ReleaseCapture();
+            InvalidateUiRect(hWnd, GetScrollbarAreaRect(), 2);
+        }
+        return 0;
+
+    case WM_LBUTTONDBLCLK: {
+        int y = GET_Y_LPARAM(lParam);
+        int di = ListIndexFromPoint(y);
+        if (di >= 0) {
+            SetSelectedIndex(hWnd, di, false);
+            ApplySelectedFont();
+            InvalidateListAndScrollbar(hWnd);
+        }
+        return 0;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdcEdit = (HDC)wParam;
+        SetTextColor(hdcEdit, COL_TEXT);
+        SetBkColor(hdcEdit, COL_SEARCH_BG);
+        static HBRUSH editBrush = CreateSolidBrush(COL_SEARCH_BG);
+        return (LRESULT)editBrush;
+    }
+
+    case WM_HOTKEY:
+        if ((int)wParam == HOTKEY_TOGGLE_PICKER ||
+            (int)wParam == HOTKEY_TOGGLE_PICKER_ALT_SHIFT ||
+            (int)wParam == HOTKEY_TOGGLE_PICKER_F8) {
+            g_visible = !g_visible;
+            ShowWindow(hWnd, g_visible ? SW_RESTORE : SW_HIDE);
+            if (g_visible) {
+                SetForegroundWindow(hWnd);
+                SetFocus(g_hSearchEdit);
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = MIN_WIDTH;
+        mmi->ptMinTrackSize.y = MIN_HEIGHT;
+        return 0;
+    }
+
+    case WM_SIZE: {
+        if (wParam == SIZE_MINIMIZED) break;
+        RECT cr;
+        GetClientRect(hWnd, &cr);
+        WINDOW_WIDTH = cr.right;
+        WINDOW_HEIGHT = cr.bottom;
+        ReleasePaintBuffer();
+        RecalcLayout();
+        ClampScroll();
+        InvalidateRect(hWnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_ERASEBKGND: return 1;
+    case WM_DESTROY:
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER);
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_ALT_SHIFT);
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_F8);
+        ReleasePaintBuffer();
+        ClearPickerFontCache();
+        if (g_editFont) {
+            DeleteObject(g_editFont);
+            g_editFont = NULL;
+        }
+        g_hWnd = NULL;
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
