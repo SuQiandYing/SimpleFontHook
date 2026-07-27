@@ -1,0 +1,178 @@
+static bool IsUnityWindow(HWND window) {
+    if (!window) return false;
+    wchar_t className[128] = {};
+    if (!GetClassNameW(window, className, _countof(className))) return false;
+    return _wcsicmp(className, L"UnityWndClass") == 0 ||
+        wcsstr(className, L"Unity") != NULL;
+}
+
+static bool IsTargetUnityWindow(HWND window) {
+    if (!IsUnityWindow(window)) return false;
+    DWORD processId = 0;
+    return GetWindowThreadProcessId(window, &processId) != 0 &&
+        processId == GetCurrentProcessId();
+}
+
+static BOOL WINAPI NewShowWindow(HWND window, int command) {
+    if (IsReplacementEnabled() &&
+        !InterlockedCompareExchange(&g_fontReady, 0, 0) &&
+        command != SW_HIDE && IsTargetUnityWindow(window)) {
+        InterlockedExchange(&g_deferredShowCommand, (LONG)command);
+        return g_originalShowWindow(window, SW_HIDE);
+    }
+    return g_originalShowWindow(window, command);
+}
+
+static BOOL WINAPI NewSetWindowPos(HWND window, HWND insertAfter, int x, int y,
+    int width, int height, UINT flags) {
+    if (IsReplacementEnabled() &&
+        !InterlockedCompareExchange(&g_fontReady, 0, 0) &&
+        (flags & SWP_SHOWWINDOW) != 0 && IsTargetUnityWindow(window)) {
+        flags &= ~SWP_SHOWWINDOW;
+        BOOL result = g_originalSetWindowPos(window, insertAfter, x, y,
+            width, height, flags);
+        g_originalShowWindow(window, SW_HIDE);
+        return result;
+    }
+    return g_originalSetWindowPos(window, insertAfter, x, y, width, height, flags);
+}
+
+static void RevealUnityWindow() {
+    if (InterlockedExchange(&g_fontReady, 1) != 0) return;
+    HWND window = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(&g_applyWindow, NULL, NULL));
+    if (window && g_originalShowWindow) {
+        LONG command = InterlockedCompareExchange(&g_deferredShowCommand,
+            SW_SHOWDEFAULT, SW_SHOWDEFAULT);
+        if (command == SW_HIDE) command = SW_SHOW;
+        g_originalShowWindow(window, (int)command);
+        Utils::Trace("[DEBUG][CatSystemUnity] Unity window revealed after uniform font apply hwnd=%p command=%ld",
+            window, command);
+    }
+}
+
+struct WindowSearchContext {
+    HWND unityWindow;
+    DWORD unityThreadId;
+};
+
+static BOOL CALLBACK FindGameWindowCallback(HWND window, LPARAM value) {
+    WindowSearchContext* context = reinterpret_cast<WindowSearchContext*>(value);
+    DWORD processId = 0;
+    DWORD threadId = GetWindowThreadProcessId(window, &processId);
+    if (!context || !threadId || processId != GetCurrentProcessId()) return TRUE;
+
+    wchar_t className[128] = {};
+    GetClassNameW(window, className, _countof(className));
+    if (_wcsicmp(className, L"FontPickerOverlay") == 0 ||
+        _wcsicmp(className, L"ConsoleWindowClass") == 0) {
+        return TRUE;
+    }
+    if (IsUnityWindow(window)) {
+        context->unityWindow = window;
+        context->unityThreadId = threadId;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND FindGameWindow(DWORD* threadId) {
+    if (threadId) *threadId = 0;
+    WindowSearchContext context = {};
+    EnumWindows(FindGameWindowCallback, reinterpret_cast<LPARAM>(&context));
+    if (threadId) *threadId = context.unityThreadId;
+    return context.unityWindow;
+}
+
+static bool PostApplyMessage() {
+    if (Utils::IsShuttingDown() || !g_applyMessage || !IsReplacementEnabled()) return false;
+    DWORD threadId = 0;
+    HWND window = FindGameWindow(&threadId);
+    InterlockedExchange(&g_applyWindowThreadId, (LONG)threadId);
+    InterlockedExchangePointer(&g_applyWindow, window);
+    if (window && !InterlockedCompareExchange(&g_fontReady, 0, 0) &&
+        g_originalShowWindow) {
+        g_originalShowWindow(window, SW_HIDE);
+    }
+    return window && threadId && PostMessageW(window, g_applyMessage, 0, 0) != FALSE;
+}
+
+static LRESULT WINAPI NewDispatchMessageW(const MSG* message) {
+    HWND applyWindow = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(&g_applyWindow, NULL, NULL));
+    DWORD applyThreadId = (DWORD)InterlockedCompareExchange(
+        &g_applyWindowThreadId, 0, 0);
+    if (message && g_applyMessage && message->message == g_applyMessage &&
+        message->hwnd == applyWindow && applyThreadId &&
+        GetCurrentThreadId() == applyThreadId &&
+        GetWindowThreadProcessId(message->hwnd, NULL) == applyThreadId) {
+        if (InterlockedCompareExchange(&g_applyActive, 1, 0) == 0) {
+            ApplyFontOnUnityThread();
+            InterlockedExchange(&g_applyActive, 0);
+        }
+        return 0;
+    }
+    return g_originalDispatchMessageW(message);
+}
+
+static unsigned __stdcall ApplyThread(void*) {
+    InterlockedExchange(&g_applyThread.threadId, (LONG)GetCurrentThreadId());
+    Sleep(250);
+    while (!Utils::IsShuttingDown() &&
+        InterlockedCompareExchange(&g_dispatchHookInstalled, 0, 0) != 0) {
+        PostApplyMessage();
+        Sleep(100);
+    }
+    return 0;
+}
+
+static bool InstallInOpenDetourTransaction() {
+    if (Utils::IsShuttingDown() || !Config::EnableCatSystemUnityHook ||
+        !LooksLikeEngineRoot()) return false;
+    g_applyMessage = RegisterWindowMessageW(L"SimpleFontHook.CatSystemUnity.ApplyFont.v1");
+    if (!g_applyMessage) g_applyMessage = WM_APP + 0x3A1;
+
+    LONG result = DetourAttach(&(PVOID&)g_originalDispatchMessageW, NewDispatchMessageW);
+    if (result != NO_ERROR) {
+        Utils::Trace("[DEBUG][CatSystemUnity] DispatchMessageW hook failed error=%ld", result);
+        return false;
+    }
+    LONG showResult = DetourAttach(&(PVOID&)g_originalShowWindow, NewShowWindow);
+    LONG positionResult = DetourAttach(&(PVOID&)g_originalSetWindowPos, NewSetWindowPos);
+    if (showResult == NO_ERROR && positionResult == NO_ERROR) {
+        InterlockedExchange(&g_windowVisibilityHookInstalled, 1);
+    } else {
+        Utils::Trace("[DEBUG][CatSystemUnity] Unity window suppression hook incomplete show=%ld setWindowPos=%ld",
+            showResult, positionResult);
+    }
+    InterlockedExchange(&g_dispatchHookInstalled, 1);
+    Utils::Trace("[DEBUG][CatSystemUnity] DispatchMessageW hook attached applyMessage=0x%X visibilityGate=%d",
+        g_applyMessage, g_windowVisibilityHookInstalled ? 1 : 0);
+    return true;
+}
+
+static void StartApplyThread() {
+    if (Utils::IsShuttingDown() || !g_dispatchHookInstalled) return;
+    if (!StartHookWorkerThread(&g_applyThread, ApplyThread, NULL,
+        "unity-il2cpp-apply") && !Utils::IsShuttingDown()) {
+        Utils::Trace("[DEBUG][CatSystemUnity] failed to start apply thread");
+    }
+}
+
+static bool StopApplyThread(bool waitForExit) {
+    InterlockedExchange(&g_dispatchHookInstalled, 0);
+    InterlockedExchange(&g_windowVisibilityHookInstalled, 0);
+    InterlockedExchange(&g_applyThreadStarted, 0);
+    InterlockedExchange(&g_applyActive, 0);
+    InterlockedExchangePointer(&g_applyWindow, NULL);
+    InterlockedExchange(&g_applyWindowThreadId, 0);
+    return StopHookWorkerThread(&g_applyThread, waitForExit, 2000,
+        "unity-il2cpp-apply");
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (Utils::IsShuttingDown() || !g_dispatchHookInstalled) return;
+    (void)version;
+    PostApplyMessage();
+}
+

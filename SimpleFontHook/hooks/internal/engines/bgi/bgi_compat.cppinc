@@ -1,0 +1,19 @@
+namespace BgiCompat {
+
+#ifndef _WIN64
+
+namespace {
+
+#include "bgi_compat_state.cppinc"
+#include "bgi_font_metrics.cppinc"
+#include "bgi_import_detection.cppinc"
+#include "bgi_cache_detection.cppinc"
+#include "bgi_cache_hooks.cppinc"
+
+} // namespace
+
+#endif
+
+#include "bgi_runtime.cppinc"
+
+} // namespace BgiCompat

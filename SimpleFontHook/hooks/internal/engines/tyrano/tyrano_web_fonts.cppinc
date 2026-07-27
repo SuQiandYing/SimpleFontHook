@@ -1,0 +1,167 @@
+// TyranoScript 5 renders text through Electron/Chromium. Its bundled @font-face
+// sources bypass the GDI and DirectWrite font-creation paths, so replace the
+// underlying web-font files instead.
+
+#include "tyrano_state.cppinc"
+#include "tyrano_bridge.cppinc"
+#include "tyrano_asar_parser.cppinc"
+#include "tyrano_asar_overlay.cppinc"
+#include "tyrano_detection.cppinc"
+
+static bool TyranoIsBundledFontPath(const wchar_t* fileName, std::wstring* fullPathOut) {
+    if (!fileName || !fileName[0]) return false;
+
+    std::wstring fullPath = EngineCommon::FullPath(fileName);
+    std::wstring normalized = EngineCommon::NormalizePath(fullPath);
+    std::wstring fontRoot = EngineCommon::NormalizePath(
+        TyranoBuildRootPath(L"resources\\app\\data\\others\\font"));
+    if (fontRoot.empty() || normalized.size() <= fontRoot.size() ||
+        normalized.compare(0, fontRoot.size(), fontRoot) != 0 ||
+        normalized[fontRoot.size()] != L'\\') {
+        return false;
+    }
+
+    if (fullPathOut) *fullPathOut = fullPath;
+    return true;
+}
+
+static bool TyranoIsCompressedWebFont(const std::wstring& path) {
+    return EngineCommon::HasExtension(path, L".woff") || EngineCommon::HasExtension(path, L".woff2");
+}
+
+static bool TyranoIsSfntWebFont(const std::wstring& path) {
+    return EngineCommon::HasExtension(path, L".ttf") || EngineCommon::HasExtension(path, L".otf") ||
+        EngineCommon::HasExtension(path, L".ttc");
+}
+
+static bool TyranoCopyReplacementFontBytes(std::vector<BYTE>& bytes) {
+    bytes.clear();
+    if (!TyranoReplacementEnabled()) return false;
+
+    LONG version = Config::ConfigVersion;
+    std::wstring face = Config::ForcedFontNameW;
+    std::lock_guard<std::mutex> lock(g_tyranoFontBytesMutex);
+
+    if (g_tyranoFontBytesVersion != version || g_tyranoFontBytesFace != face) {
+        g_tyranoFontBytesVersion = version;
+        g_tyranoFontBytesFace = face;
+        g_tyranoFontBytesAttempted = false;
+        g_tyranoFontBytes.clear();
+    }
+
+    if (!g_tyranoFontBytesAttempted) {
+        g_tyranoFontBytesAttempted = true;
+        std::vector<BYTE> exported;
+        if (EngineCommon::ExportConfiguredFontToMemory(exported)) {
+            g_tyranoFontBytes.swap(exported);
+            TyranoTraceLimited("replacement-font-ready version=%ld face='%s' bytes=%lu",
+                version, EngineCommon::WideToUtf8(face).c_str(), (DWORD)g_tyranoFontBytes.size());
+        } else {
+            TyranoTraceLimited("replacement-font-failed version=%ld face='%s'",
+                version, EngineCommon::WideToUtf8(face).c_str());
+        }
+    }
+
+    if (g_tyranoFontBytes.empty()) return false;
+    bytes = g_tyranoFontBytes;
+    return true;
+}
+
+static bool TyranoShouldHideCompressedWebFontW(const wchar_t* fileName) {
+    if (!fileName || !fileName[0]) return false;
+    const wchar_t* extension = PathFindExtensionW(fileName);
+    if (!extension || (_wcsicmp(extension, L".woff") != 0 &&
+        _wcsicmp(extension, L".woff2") != 0)) {
+        return false;
+    }
+
+    std::wstring fullPath;
+    if (!TyranoIsBundledFontPath(fileName, &fullPath) ||
+        !TyranoIsCompressedWebFont(fullPath)) {
+        return false;
+    }
+    if (!TyranoReplacementEnabled()) return false;
+
+    std::vector<BYTE> replacement;
+    if (!TyranoCopyReplacementFontBytes(replacement)) return false;
+    TyranoTraceLimited("compressed-font-hidden request='%s'",
+        EngineCommon::WideToUtf8(fullPath).c_str());
+    return true;
+}
+
+static bool TyranoShouldRedirectSfntWebFontW(const wchar_t* fileName, std::wstring* fullPathOut) {
+    if (!fileName || !fileName[0]) return false;
+    const wchar_t* extension = PathFindExtensionW(fileName);
+    if (!extension || (_wcsicmp(extension, L".ttf") != 0 &&
+        _wcsicmp(extension, L".otf") != 0 &&
+        _wcsicmp(extension, L".ttc") != 0)) {
+        return false;
+    }
+
+    std::wstring fullPath;
+    if (!TyranoIsBundledFontPath(fileName, &fullPath) || !TyranoIsSfntWebFont(fullPath)) {
+        return false;
+    }
+    if (!TyranoReplacementEnabled()) return false;
+    if (fullPathOut) *fullPathOut = fullPath;
+    return true;
+}
+
+static HANDLE TyranoTryOpenRedirectedFontFileW(const wchar_t* fileName, DWORD desiredAccess,
+    DWORD creationDisposition) {
+    if (!EngineCommon::IsReadOnlyOpen(desiredAccess, creationDisposition)) return INVALID_HANDLE_VALUE;
+
+    std::wstring fullPath;
+    if (!TyranoShouldRedirectSfntWebFontW(fileName, &fullPath)) return INVALID_HANDLE_VALUE;
+
+    std::vector<BYTE> bytes;
+    if (!TyranoCopyReplacementFontBytes(bytes)) return INVALID_HANDLE_VALUE;
+    HANDLE file = EngineCommon::CreateTemporaryReadHandle(bytes.data(), bytes.size());
+    if (file == INVALID_HANDLE_VALUE) {
+        TyranoTraceLimited("font-redirect-failed request='%s' err=%lu bytes=%lu",
+            EngineCommon::WideToUtf8(fullPath).c_str(), GetLastError(), (DWORD)bytes.size());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    TyranoTraceLimited("font-redirect version=%ld request='%s' face='%s' bytes=%lu",
+        Config::ConfigVersion, EngineCommon::WideToUtf8(fullPath).c_str(),
+        EngineCommon::WideToUtf8(Config::ForcedFontNameW).c_str(), (DWORD)bytes.size());
+    return file;
+}
+
+static bool TyranoTryGetRedirectedFontAttributesW(const wchar_t* fileName,
+    WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    std::wstring fullPath;
+    if (!TyranoShouldRedirectSfntWebFontW(fileName, &fullPath)) return false;
+
+    std::vector<BYTE> bytes;
+    if (!TyranoCopyReplacementFontBytes(bytes)) return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA localData = {};
+    localData.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    ULONGLONG size = (ULONGLONG)bytes.size();
+    localData.nFileSizeHigh = (DWORD)(size >> 32);
+    localData.nFileSizeLow = (DWORD)size;
+    GetSystemTimeAsFileTime(&localData.ftCreationTime);
+    localData.ftLastAccessTime = localData.ftCreationTime;
+    localData.ftLastWriteTime = localData.ftCreationTime;
+
+    if (data) *data = localData;
+    if (attrs) *attrs = localData.dwFileAttributes;
+    TyranoTraceLimited("font-attrs-redirect request='%s' bytes=%lu",
+        EngineCommon::WideToUtf8(fullPath).c_str(), (DWORD)bytes.size());
+    return true;
+}
+
+static void TyranoNotifyConfigChanged(LONG version) {
+    if (!Config::EnableTyranoHook || !TyranoLooksLikeEngineRoot()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_tyranoFontBytesMutex);
+        g_tyranoFontBytesVersion = LONG_MIN;
+        g_tyranoFontBytesFace.clear();
+        g_tyranoFontBytesAttempted = false;
+        g_tyranoFontBytes.clear();
+    }
+    TyranoTraceLimited("config-changed version=%ld face='%s' hot-reload=css-bridge",
+        version, EngineCommon::WideToUtf8(Config::ForcedFontNameW).c_str());
+}

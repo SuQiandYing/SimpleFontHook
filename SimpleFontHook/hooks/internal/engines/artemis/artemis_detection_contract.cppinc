@@ -1,0 +1,9 @@
+struct ArtemisPfsLayoutEvidence {
+    bool parsedArchive;
+    bool modernTable;
+    bool legacyScript;
+};
+
+static const ArtemisPfsLayoutEvidence& ArtemisProbePfsLayout();
+static bool ArtemisReadPfsResource(const std::wstring& resourceName,
+    std::vector<BYTE>& bytes, std::wstring* sourceLabel);

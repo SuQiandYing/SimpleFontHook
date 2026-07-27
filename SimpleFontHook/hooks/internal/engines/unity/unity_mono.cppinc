@@ -1,0 +1,14 @@
+// Unity Mono games need a managed-runtime bridge: their TMP and UI.Text paths
+// do not pass through GDI, and they do not expose IL2CPP metadata or exports.
+namespace UnityMono {
+
+#include "unity_mono_state.cppinc"
+#include "unity_mono_runtime.cppinc"
+#include "unity_mono_source.cppinc"
+#include "unity_mono_legacy.cppinc"
+#include "unity_mono_modern.cppinc"
+#include "unity_mono_apply.cppinc"
+#include "unity_mono_jit.cppinc"
+#include "unity_mono_window.cppinc"
+
+} // namespace UnityMono

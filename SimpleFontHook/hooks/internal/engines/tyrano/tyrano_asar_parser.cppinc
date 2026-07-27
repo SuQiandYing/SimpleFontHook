@@ -1,0 +1,264 @@
+// Minimal ASAR header JSON parser. It indexes file offsets without depending on
+// Electron or a general-purpose JSON library.
+
+class TyranoAsarJsonParser {
+public:
+    TyranoAsarJsonParser(const char* begin, size_t size) : current_(begin), end_(begin + size) {}
+
+    bool Parse(std::unordered_map<std::wstring, TyranoAsarEntry>& entries,
+        ULONGLONG dataOffset) {
+        entries_ = &entries;
+        dataOffset_ = dataOffset;
+        SkipWhitespace();
+        if (!ParseRoot()) return false;
+        SkipWhitespace();
+        return current_ == end_;
+    }
+
+private:
+    const char* current_;
+    const char* end_;
+    std::unordered_map<std::wstring, TyranoAsarEntry>* entries_ = nullptr;
+    ULONGLONG dataOffset_ = 0;
+
+    void SkipWhitespace() {
+        while (current_ < end_ && (*current_ == ' ' || *current_ == '\r' ||
+            *current_ == '\n' || *current_ == '\t')) ++current_;
+    }
+
+    bool Consume(char expected) {
+        SkipWhitespace();
+        if (current_ >= end_ || *current_ != expected) return false;
+        ++current_;
+        return true;
+    }
+
+    static int HexValue(char value) {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+
+    static void AppendUtf8(std::string& out, unsigned int codepoint) {
+        if (codepoint <= 0x7F) {
+            out.push_back((char)codepoint);
+        } else if (codepoint <= 0x7FF) {
+            out.push_back((char)(0xC0 | (codepoint >> 6)));
+            out.push_back((char)(0x80 | (codepoint & 0x3F)));
+        } else if (codepoint <= 0xFFFF) {
+            out.push_back((char)(0xE0 | (codepoint >> 12)));
+            out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (codepoint & 0x3F)));
+        } else {
+            out.push_back((char)(0xF0 | (codepoint >> 18)));
+            out.push_back((char)(0x80 | ((codepoint >> 12) & 0x3F)));
+            out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
+            out.push_back((char)(0x80 | (codepoint & 0x3F)));
+        }
+    }
+
+    bool ParseString(std::string& out) {
+        out.clear();
+        if (!Consume('"')) return false;
+        while (current_ < end_) {
+            unsigned char raw = (unsigned char)*current_++;
+            if (raw == '"') return true;
+            if (raw != '\\') {
+                out.push_back((char)raw);
+                continue;
+            }
+            if (current_ >= end_) return false;
+            char escaped = *current_++;
+            switch (escaped) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u': {
+                if (end_ - current_ < 4) return false;
+                unsigned int codepoint = 0;
+                for (int i = 0; i < 4; ++i) {
+                    int digit = HexValue(current_[i]);
+                    if (digit < 0) return false;
+                    codepoint = (codepoint << 4) | (unsigned int)digit;
+                }
+                current_ += 4;
+                if (codepoint >= 0xD800 && codepoint <= 0xDBFF &&
+                    end_ - current_ >= 6 && current_[0] == '\\' && current_[1] == 'u') {
+                    unsigned int low = 0;
+                    bool validLow = true;
+                    for (int i = 0; i < 4; ++i) {
+                        int digit = HexValue(current_[2 + i]);
+                        if (digit < 0) { validLow = false; break; }
+                        low = (low << 4) | (unsigned int)digit;
+                    }
+                    if (validLow && low >= 0xDC00 && low <= 0xDFFF) {
+                        current_ += 6;
+                        codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                    }
+                }
+                AppendUtf8(out, codepoint);
+                break;
+            }
+            default: return false;
+            }
+        }
+        return false;
+    }
+
+    bool ParseUnsigned(ULONGLONG& value) {
+        SkipWhitespace();
+        if (current_ >= end_) return false;
+        if (*current_ == '"') {
+            std::string text;
+            if (!ParseString(text) || text.empty()) return false;
+            value = 0;
+            for (char digit : text) {
+                if (digit < '0' || digit > '9') return false;
+                if (value > (ULLONG_MAX - (unsigned)(digit - '0')) / 10) return false;
+                value = value * 10 + (unsigned)(digit - '0');
+            }
+            return true;
+        }
+        const char* start = current_;
+        value = 0;
+        while (current_ < end_ && *current_ >= '0' && *current_ <= '9') {
+            if (value > (ULLONG_MAX - (unsigned)(*current_ - '0')) / 10) return false;
+            value = value * 10 + (unsigned)(*current_ - '0');
+            ++current_;
+        }
+        return current_ != start;
+    }
+
+    bool ParseBool(bool& value) {
+        SkipWhitespace();
+        if (end_ - current_ >= 4 && memcmp(current_, "true", 4) == 0) {
+            current_ += 4;
+            value = true;
+            return true;
+        }
+        if (end_ - current_ >= 5 && memcmp(current_, "false", 5) == 0) {
+            current_ += 5;
+            value = false;
+            return true;
+        }
+        return false;
+    }
+
+    bool SkipValue() {
+        SkipWhitespace();
+        if (current_ >= end_) return false;
+        if (*current_ == '"') {
+            std::string ignored;
+            return ParseString(ignored);
+        }
+        if (*current_ == '{') {
+            ++current_;
+            SkipWhitespace();
+            if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+            for (;;) {
+                std::string key;
+                if (!ParseString(key) || !Consume(':') || !SkipValue()) return false;
+                SkipWhitespace();
+                if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+                if (!Consume(',')) return false;
+            }
+        }
+        if (*current_ == '[') {
+            ++current_;
+            SkipWhitespace();
+            if (current_ < end_ && *current_ == ']') { ++current_; return true; }
+            for (;;) {
+                if (!SkipValue()) return false;
+                SkipWhitespace();
+                if (current_ < end_ && *current_ == ']') { ++current_; return true; }
+                if (!Consume(',')) return false;
+            }
+        }
+        if (end_ - current_ >= 4 && memcmp(current_, "true", 4) == 0) { current_ += 4; return true; }
+        if (end_ - current_ >= 5 && memcmp(current_, "false", 5) == 0) { current_ += 5; return true; }
+        if (end_ - current_ >= 4 && memcmp(current_, "null", 4) == 0) { current_ += 4; return true; }
+        while (current_ < end_ && *current_ != ',' && *current_ != '}' &&
+            *current_ != ']' && !isspace((unsigned char)*current_)) ++current_;
+        return true;
+    }
+
+    bool ParseFilesObject(const std::wstring& prefix) {
+        if (!Consume('{')) return false;
+        SkipWhitespace();
+        if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+        for (;;) {
+            std::string key;
+            if (!ParseString(key) || !Consume(':')) return false;
+            std::wstring path = prefix;
+            if (!path.empty()) path += L"\\";
+            path += TyranoUtf8ToWide(key);
+            if (!ParseNode(path)) return false;
+            SkipWhitespace();
+            if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+            if (!Consume(',')) return false;
+        }
+    }
+
+    bool ParseNode(const std::wstring& path) {
+        if (!Consume('{')) return false;
+        bool hasFiles = false;
+        bool hasOffset = false;
+        bool hasSize = false;
+        bool unpacked = false;
+        ULONGLONG offset = 0;
+        ULONGLONG size = 0;
+        SkipWhitespace();
+        if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+        for (;;) {
+            std::string key;
+            if (!ParseString(key) || !Consume(':')) return false;
+            if (key == "files") {
+                hasFiles = true;
+                if (!ParseFilesObject(path)) return false;
+            } else if (key == "offset") {
+                hasOffset = ParseUnsigned(offset);
+                if (!hasOffset) return false;
+            } else if (key == "size") {
+                hasSize = ParseUnsigned(size);
+                if (!hasSize) return false;
+            } else if (key == "unpacked") {
+                if (!ParseBool(unpacked)) return false;
+            } else if (!SkipValue()) {
+                return false;
+            }
+            SkipWhitespace();
+            if (current_ < end_ && *current_ == '}') { ++current_; break; }
+            if (!Consume(',')) return false;
+        }
+        if (!hasFiles && hasOffset && hasSize && !unpacked && !path.empty() && entries_) {
+            (*entries_)[TyranoNormalizeRelativePath(path)] = {
+                dataOffset_ + offset, size, false
+            };
+        }
+        return true;
+    }
+
+    bool ParseRoot() {
+        if (!Consume('{')) return false;
+        SkipWhitespace();
+        if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+        for (;;) {
+            std::string key;
+            if (!ParseString(key) || !Consume(':')) return false;
+            if (key == "files") {
+                if (!ParseFilesObject(L"")) return false;
+            } else if (!SkipValue()) {
+                return false;
+            }
+            SkipWhitespace();
+            if (current_ < end_ && *current_ == '}') { ++current_; return true; }
+            if (!Consume(',')) return false;
+        }
+    }
+};

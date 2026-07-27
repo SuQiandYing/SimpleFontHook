@@ -1,0 +1,69 @@
+static bool MonoCopyMaterialFloatProperty(void* sourceMaterial,
+    void* targetMaterial, const wchar_t* propertyName) {
+    if (!sourceMaterial || !targetMaterial || !propertyName ||
+        !g_monoBindings.materialHasProperty ||
+        !g_monoBindings.materialGetFloat ||
+        !g_monoBindings.materialSetFloat) return false;
+    void* managedName = MonoString(std::wstring(propertyName));
+    if (!managedName || !g_monoApi.gcHandleNew || !g_monoApi.gcHandleGetTarget) return false;
+    uint32_t nameRoot = g_monoApi.gcHandleNew(managedName, 1);
+    if (!nameRoot) return false;
+    managedName = g_monoApi.gcHandleGetTarget(nameRoot);
+    bool copied = false;
+    void* hasParams[1] = { managedName };
+    void* boxedHas = NULL;
+    bool sourceHas = false;
+    bool sourceHasRead = MonoInvoke(g_monoBindings.materialHasProperty,
+        sourceMaterial, hasParams, &boxedHas, "Material.HasProperty(source)") &&
+        MonoReadBool(boxedHas, &sourceHas);
+    boxedHas = NULL;
+    bool targetHas = false;
+    bool targetHasRead = MonoInvoke(g_monoBindings.materialHasProperty,
+        targetMaterial, hasParams, &boxedHas, "Material.HasProperty(target)") &&
+        MonoReadBool(boxedHas, &targetHas);
+    if (sourceHasRead && targetHasRead && sourceHas && targetHas) {
+        void* boxedValue = NULL;
+        float value = 0.0f;
+        if (MonoInvoke(g_monoBindings.materialGetFloat, sourceMaterial,
+            hasParams, &boxedValue, "Material.GetFloat") &&
+            MonoReadFloat(boxedValue, &value)) {
+            void* setParams[2] = { managedName, &value };
+            copied = MonoInvoke(g_monoBindings.materialSetFloat,
+                targetMaterial, setParams, NULL, "Material.SetFloat");
+        }
+    }
+    MonoFreeHandle(nameRoot);
+    return copied;
+}
+
+static size_t MonoSyncSdfMaterialMetrics(void* sourceMaterial,
+    void* targetMaterial) {
+    static const wchar_t* properties[] = {
+        L"_GradientScale",
+        L"_TextureWidth",
+        L"_TextureHeight",
+        L"_ScaleRatioA",
+        L"_ScaleRatioB",
+        L"_ScaleRatioC",
+        L"_WeightNormal",
+        L"_WeightBold",
+        L"_PerspectiveFilter",
+    };
+    size_t copied = 0;
+    for (const wchar_t* property : properties) {
+        if (MonoCopyMaterialFloatProperty(sourceMaterial, targetMaterial, property))
+            ++copied;
+    }
+    return copied;
+}
+
+static void* MonoCreateMaterial(void* texture, void* skipAsset,
+    uint32_t* temporaryRoot) {
+    if (temporaryRoot) *temporaryRoot = 0;
+    if (!texture || !g_monoBindings.setMaterialMainTexture) return NULL;
+    void* templateMaterial = MonoFindTemplateMaterial(skipAsset);
+    if (!templateMaterial) return NULL;
+    return MonoCloneMaterialWithTexture(templateMaterial, texture,
+        temporaryRoot, true);
+}
+

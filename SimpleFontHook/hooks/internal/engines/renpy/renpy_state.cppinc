@@ -1,0 +1,42 @@
+typedef int(__cdecl* PyIsInitializedFn)();
+typedef int(__cdecl* PyPendingCallbackFn)(void*);
+typedef int(__cdecl* PyAddPendingCallFn)(PyPendingCallbackFn callback, void* argument);
+typedef int(__cdecl* PyRunSimpleStringFn)(const char* code);
+
+static volatile LONG g_engineProbe = -1;
+static volatile LONG g_prepared = 0;
+static volatile LONG g_stopRequested = 0;
+static volatile LONG g_pendingQueued = 0;
+static volatile LONG g_appliedVersion = LONG_MIN;
+static volatile LONG g_traceCount = 0;
+
+static HANDLE g_workerThread = NULL;
+static HANDLE g_wakeEvent = NULL;
+static HMODULE g_pythonModule = NULL;
+static PyIsInitializedFn g_pyIsInitialized = NULL;
+static PyAddPendingCallFn g_pyAddPendingCall = NULL;
+static PyRunSimpleStringFn g_pyRunSimpleString = NULL;
+
+static std::mutex g_stateMutex;
+static LONG g_requestedVersion = LONG_MIN;
+static bool g_requestedEnabled = false;
+static bool g_requestedRefresh = false;
+static std::wstring g_requestedFace;
+static LONG g_readyVersion = LONG_MIN;
+static bool g_readyEnabled = false;
+static bool g_readyRefresh = false;
+static std::string g_readyFontName;
+static std::string g_readyVirtualPath;
+static std::wstring g_readySourcePath;
+
+static void TraceLimited(const char* format, ...) {
+    LONG hit = InterlockedIncrement(&g_traceCount);
+    if (hit > 128) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][RenPy] %s", message);
+}

@@ -1,0 +1,114 @@
+static bool ApplyFontOnUnityThread() {
+    if (!IsReplacementEnabled()) return false;
+    LONG applyAttempts = InterlockedIncrement(&g_applyAttempts);
+    LONG version = Config::ConfigVersion;
+    if (!ResolveBindings() || !CreateReplacementFontAsset(version)) {
+        if (InterlockedExchange(&g_lastFailureVersion, version) != version) {
+            Utils::Trace("[DEBUG][CatSystemUnity] apply deferred version=%ld face='%s' runtime/font asset not ready",
+                version, EngineCommon::WideToUtf8(Config::ForcedFontNameW).c_str());
+        }
+        if (applyAttempts >= 100 &&
+            !InterlockedCompareExchange(&g_fontReady, 0, 0)) {
+            Utils::Trace("[DEBUG][CatSystemUnity] revealing Unity window after font initialization timeout attempts=%ld",
+                applyAttempts);
+            RevealUnityWindow();
+        }
+        return false;
+    }
+    void* replacementFontAsset = RootedTarget(
+        g_replacementFontAssetHandle, g_replacementFontAsset);
+    void* tmpTextTypeObject = RootedTarget(
+        g_bindings.tmpTextTypeHandle, g_bindings.tmpTextTypeObject);
+    if (!replacementFontAsset || !tmpTextTypeObject) return false;
+    g_replacementFontAsset = replacementFontAsset;
+    g_bindings.tmpTextTypeObject = tmpTextTypeObject;
+
+    void* replacementMaterial = NULL;
+    if (!GetFontAssetMaterial(replacementFontAsset, &replacementMaterial) ||
+        !replacementMaterial) {
+        return false;
+    }
+    if (!RootManagedObject(replacementMaterial, &g_replacementMaterial,
+        &g_replacementMaterialHandle, "replacement TMP material")) {
+        return false;
+    }
+    replacementMaterial = RootedTarget(
+        g_replacementMaterialHandle, g_replacementMaterial);
+    if (!replacementMaterial) return false;
+    g_replacementMaterial = replacementMaterial;
+    InstallSynchronousTextSetterHooks();
+
+    void* findParameters[1] = { tmpTextTypeObject };
+    void* result = NULL;
+    if (!Invoke(g_bindings.findAllObjects, NULL, findParameters, &result,
+        "Resources.FindObjectsOfTypeAll") || !result) {
+        return false;
+    }
+
+    Il2CppArrayLayout* texts = NULL;
+    size_t textCount = 0;
+    if (!GetManagedObjectArray(result, &texts, &textCount, "TMP_Text[]")) return false;
+    size_t changed = 0;
+    for (size_t i = 0; i < textCount; ++i) {
+        void* text = texts->vector[i];
+        if (!text) continue;
+
+        void* textClass = g_api.objectGetClass(text);
+        const void* getTextFont = textClass
+            ? g_api.classGetMethodFromName(textClass, "get_font", 0)
+            : NULL;
+        const void* setTextFont = textClass
+            ? g_api.classGetMethodFromName(textClass, "set_font", 1)
+            : NULL;
+        const void* setTextSharedMaterial = textClass
+            ? g_api.classGetMethodFromName(textClass, "set_fontSharedMaterial", 1)
+            : NULL;
+        const void* forceMeshUpdate = textClass
+            ? g_api.classGetMethodFromName(textClass, "ForceMeshUpdate", 2)
+            : NULL;
+        if (!getTextFont) getTextFont = g_bindings.getTextFont;
+        if (!setTextFont) setTextFont = g_bindings.setTextFont;
+        if (!setTextSharedMaterial)
+            setTextSharedMaterial = g_bindings.setTextSharedMaterial;
+        if (!forceMeshUpdate) forceMeshUpdate = g_bindings.forceMeshUpdate;
+
+        void* originalFont = NULL;
+        if (!Invoke(getTextFont, text, NULL, &originalFont, "TMP_Text.get_font"))
+            continue;
+        if (!originalFont || originalFont == replacementFontAsset) continue;
+
+        void* fontParameters[1] = { replacementFontAsset };
+        if (!Invoke(setTextFont, text, fontParameters, NULL, "TMP_Text.set_font"))
+            continue;
+
+        void* materialParameters[1] = { replacementMaterial };
+        if (!Invoke(setTextSharedMaterial, text, materialParameters, NULL,
+            "TMP_Text.set_fontSharedMaterial")) {
+            void* restoreFontParameters[1] = { originalFont };
+            Invoke(setTextFont, text, restoreFontParameters, NULL,
+                "TMP_Text.set_font(rollback)");
+            continue;
+        }
+
+        bool ignoreActiveState = true;
+        bool forceTextReparsing = true;
+        void* meshParameters[2] = { &ignoreActiveState, &forceTextReparsing };
+        Invoke(forceMeshUpdate, text, meshParameters, NULL, "TMP_Text.ForceMeshUpdate");
+        ++changed;
+    }
+
+    LONG previousTraceVersion = InterlockedExchange(&g_lastAppliedTraceVersion, version);
+    if (changed || previousTraceVersion != version) {
+        Utils::Trace("[DEBUG][CatSystemUnity] TMP replacement applied version=%ld face='%s' objects=%llu changed=%llu uniformMaterial=1 transientColorsReset=1",
+            version, EngineCommon::WideToUtf8(g_replacementFace).c_str(),
+            (unsigned long long)textCount, (unsigned long long)changed);
+    }
+    if (!InterlockedCompareExchange(&g_fontReady, 0, 0) &&
+        (changed > 0 || applyAttempts >= 100)) {
+        if (applyAttempts >= 100 && changed == 0) {
+            Utils::Trace("[DEBUG][CatSystemUnity] revealing Unity window after timeout without text replacement");
+        }
+        RevealUnityWindow();
+    }
+    return true;
+}

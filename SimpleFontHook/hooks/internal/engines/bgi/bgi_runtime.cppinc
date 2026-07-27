@@ -1,0 +1,374 @@
+#ifndef _WIN64
+
+namespace {
+
+static bool HasBgiIdentity() {
+    static volatile LONG cached = -1;
+    LONG value = InterlockedCompareExchange(&cached, -1, -1);
+    if (value != -1) return value != 0;
+
+    static const char* const moduleMarkers[] = {
+        "Buriko General Interpreter",
+        "BURIKO ARC",
+    };
+    static const char* const archiveMagics[] = {
+        "BURIKO ARC",
+    };
+    const bool moduleMarker = EngineCommon::MainModuleContainsAnyAscii(
+        moduleMarkers, _countof(moduleMarkers));
+    const bool archiveFormat = EngineCommon::AnyRootFileStartsWithAnyAscii(
+        L"*.arc", archiveMagics, _countof(archiveMagics));
+    const bool detected = EngineIdentityPolicy::Confirm({
+        moduleMarker || archiveFormat, false, false, false });
+    InterlockedExchange(&cached, detected ? 1 : 0);
+    Utils::Trace("[DEBUG][BGI] identity result=%d module-marker=%d buriko-archive=%d",
+        detected ? 1 : 0, moduleMarker ? 1 : 0, archiveFormat ? 1 : 0);
+    return detected;
+}
+
+static bool TryGetNormalizationForHdc(HDC hdc, MetricNormalizationEntry* entry) {
+    if (!hdc || !entry || InterlockedCompareExchange(&g_active, 0, 0) == 0 ||
+        IsPickerThread() || GetMapMode(hdc) != MM_TEXT) {
+        return false;
+    }
+
+    HFONT font = reinterpret_cast<HFONT>(orgGetCurrentObject(hdc, OBJ_FONT));
+    ReplacementFontInfo replacementInfo = {};
+    if (!font || !::TryGetReplacementInfo(font, &replacementInfo) ||
+        replacementInfo.configVersion != Config::ConfigVersion) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_metricNormalizationMutex);
+    for (auto it = g_metricNormalizationEntries.rbegin(); it != g_metricNormalizationEntries.rend(); ++it) {
+        if (it->configVersion == replacementInfo.configVersion &&
+            ::SameSourceLogFont(it->sourceLogfont, replacementInfo.sourceLogfont)) {
+            *entry = *it;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+static void InstallInOpenDetourTransaction() {
+    if (!Config::EnableBgiHook) return;
+    if (!HasBgiIdentity()) return;
+
+    BYTE* imageBase = nullptr;
+    size_t imageSize = 0;
+    IMAGE_NT_HEADERS32* nt = nullptr;
+    ImportProfile imports;
+    if (!ReadMainModulePe(&imageBase, &imageSize, &nt) ||
+        !InspectImports(imageBase, imageSize, nt, &imports)) {
+        Utils::Trace("[DEBUG][BGI] PE import inspection skipped");
+        return;
+    }
+
+    const bool matched = EngineIdentityPolicy::ConfirmCapability(
+        true, MatchesLegacyGlyphRasterPipeline(imports));
+    Utils::Trace("[DEBUG][BGI] raster pipeline font=%d output=%d select=%d getObject=%d dc=%d dib=%d enum=%d matched=%d",
+        imports.hasFontFactory ? 1 : 0,
+        imports.hasRasterOutput ? 1 : 0,
+        imports.hasSelectObject ? 1 : 0,
+        imports.hasGetObject ? 1 : 0,
+        imports.hasCompatibleDc ? 1 : 0,
+        imports.hasDibSection ? 1 : 0,
+        imports.hasFontEnumeration ? 1 : 0,
+        matched ? 1 : 0);
+    if (!matched) return;
+
+    g_installConfigVersion = Config::ConfigVersion;
+    size_t attachedLayouts = 0;
+    if (Config::BgiClearGlyphCacheOnSwitch) {
+        g_cacheLayouts = FindCacheLayouts(imageBase, imageSize, nt, imports);
+        for (size_t i = 0; i < g_cacheLayouts.size(); ++i) {
+            const LONG result = DetourAttach(reinterpret_cast<PVOID*>(&g_cacheLayouts[i].original), kCacheHooks[i]);
+            if (result == NO_ERROR) ++attachedLayouts;
+            Utils::Trace("[DEBUG][BGI] cache hook attach index=%zu target=%p result=%ld",
+                i, g_cacheLayouts[i].target, result);
+        }
+    }
+
+    const size_t patchedImports = Config::BgiPatchGdiImports ? PatchGdiImports(imports) : 0;
+    InterlockedExchange(&g_active, (attachedLayouts || patchedImports) ? 1 : 0);
+    Utils::Trace("[DEBUG][BGI] compatibility active discoveredLayouts=%zu attachedLayouts=%zu patchedImports=%zu",
+        g_cacheLayouts.size(), attachedLayouts, patchedImports);
+}
+
+static bool NormalizeReplacementFontMetrics(const LOGFONTW& sourceLogfont, LOGFONTW& replacementLogfont) {
+    if (InterlockedCompareExchange(&g_active, 0, 0) == 0 || IsPickerThread() ||
+        !Config::EnableFontHook || !Config::EnableFaceNameReplace ||
+        sourceLogfont.lfHeight == 0 || replacementLogfont.lfHeight == 0 ||
+        sourceLogfont.lfEscapement != 0 || replacementLogfont.lfEscapement != 0 ||
+        sourceLogfont.lfOrientation != 0 || replacementLogfont.lfOrientation != 0) {
+        return false;
+    }
+
+    const LONG configVersion = Config::ConfigVersion;
+    const LOGFONTW requestedReplacementLogfont = replacementLogfont;
+    const LONG requestedHeight = replacementLogfont.lfHeight;
+    const LONG requestedWidth = replacementLogfont.lfWidth;
+    if (Config::EnableDebugLog) {
+        Utils::Trace("[DEBUG][BGI][MetricProbe] normalize source='%S' h=%ld w=%ld target='%S' h=%ld w=%ld version=%ld",
+            sourceLogfont.lfFaceName, sourceLogfont.lfHeight, sourceLogfont.lfWidth,
+            replacementLogfont.lfFaceName, replacementLogfont.lfHeight, replacementLogfont.lfWidth,
+            configVersion);
+    }
+
+    MetricNormalizationEntry cachedEntry = {};
+    if (TryGetNormalizationFromCache(sourceLogfont, replacementLogfont, configVersion, &cachedEntry)) {
+        replacementLogfont.lfHeight = cachedEntry.normalizedHeight;
+        replacementLogfont.lfWidth = cachedEntry.normalizedWidth;
+        return replacementLogfont.lfHeight != requestedHeight || replacementLogfont.lfWidth != requestedWidth;
+    }
+
+    FontProbeMetrics sourceProbe = {};
+    FontProbeMetrics replacementProbe = {};
+    if (!MeasureFontProbe(sourceLogfont, &sourceProbe) ||
+        !MeasureFontProbe(replacementLogfont, &replacementProbe)) {
+        return false;
+    }
+
+    MetricNormalizationEntry entry = {};
+    entry.configVersion = configVersion;
+    entry.sourceLogfont = sourceLogfont;
+    entry.requestedReplacementLogfont = requestedReplacementLogfont;
+    entry.normalizedHeight = requestedHeight;
+    entry.normalizedWidth = requestedWidth;
+
+    LOGFONTW normalizedLogfont = replacementLogfont;
+    FontProbeMetrics normalizedProbe = replacementProbe;
+    const LONG sourceHeight = AbsLogFontValue(sourceLogfont.lfHeight);
+    const LONG replacementHeight = AbsLogFontValue(requestedHeight);
+    LONG desiredInkHeight = 0;
+
+    if (sourceProbe.inkGlyphCount >= 3 && replacementProbe.inkGlyphCount >= 3 &&
+        IsReasonableProbeRatio(sourceHeight, replacementHeight)) {
+        desiredInkHeight = std::max<LONG>(1,
+            ScaleMetricRounded(sourceProbe.InkHeight(), replacementHeight, sourceHeight));
+        if (IsReasonableProbeRatio(desiredInkHeight, replacementProbe.InkHeight())) {
+            const LONG minimumHeight = std::max<LONG>(1, (replacementHeight + 3) / 4);
+            const LONG maximumHeight = ClampToLong(std::min<LONGLONG>(
+                std::numeric_limits<LONG>::max(), static_cast<LONGLONG>(replacementHeight) * 4));
+            const LONG estimatedHeight = ScaleWidthForProbe(replacementHeight, desiredInkHeight,
+                replacementProbe.InkHeight(), minimumHeight, maximumHeight);
+
+            std::vector<LONG> candidates;
+            AddUniqueCandidate(candidates, replacementHeight, minimumHeight, maximumHeight);
+            for (int delta = -kMetricSearchRadius; delta <= kMetricSearchRadius; ++delta) {
+                const LONG candidate = ClampToLong(std::max<LONGLONG>(minimumHeight,
+                    std::min<LONGLONG>(maximumHeight, static_cast<LONGLONG>(estimatedHeight) + delta)));
+                AddUniqueCandidate(candidates, candidate, minimumHeight, maximumHeight);
+            }
+
+            LONGLONG bestScore = std::numeric_limits<LONGLONG>::max();
+            LONG bestHeight = replacementHeight;
+            FontProbeMetrics bestProbe = replacementProbe;
+            for (LONG candidate : candidates) {
+                LOGFONTW trialLogfont = replacementLogfont;
+                trialLogfont.lfHeight = WithLogFontSign(candidate, requestedHeight);
+                FontProbeMetrics trialProbe = {};
+                if (!MeasureFontProbe(trialLogfont, &trialProbe) || trialProbe.inkGlyphCount < 3 ||
+                    !IsReasonableProbeRatio(desiredInkHeight, trialProbe.InkHeight())) {
+                    continue;
+                }
+                const LONGLONG inkDifference = trialProbe.InkHeight() > desiredInkHeight
+                    ? static_cast<LONGLONG>(trialProbe.InkHeight()) - desiredInkHeight
+                    : static_cast<LONGLONG>(desiredInkHeight) - trialProbe.InkHeight();
+                const LONGLONG estimateDifference = candidate > estimatedHeight
+                    ? static_cast<LONGLONG>(candidate) - estimatedHeight
+                    : static_cast<LONGLONG>(estimatedHeight) - candidate;
+                const LONGLONG score = inkDifference * 1000000 + estimateDifference;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestHeight = candidate;
+                    bestProbe = trialProbe;
+                }
+            }
+
+            normalizedLogfont.lfHeight = WithLogFontSign(bestHeight, requestedHeight);
+            normalizedProbe = bestProbe;
+        }
+    }
+
+    LONG desiredProbeWidth = 0;
+    if (sourceLogfont.lfWidth > 0 && requestedWidth > 0 && sourceProbe.totalWidth > 0 &&
+        normalizedProbe.totalWidth > 0 &&
+        static_cast<LONGLONG>(sourceProbe.totalWidth) * requestedWidth <=
+            std::numeric_limits<LONG>::max() * static_cast<LONGLONG>(sourceLogfont.lfWidth)) {
+        desiredProbeWidth = static_cast<LONG>(
+            (static_cast<LONGLONG>(sourceProbe.totalWidth) * requestedWidth + sourceLogfont.lfWidth / 2) /
+            sourceLogfont.lfWidth);
+        if (IsReasonableProbeRatio(desiredProbeWidth, normalizedProbe.totalWidth)) {
+            const LONG minimumWidth = std::max<LONG>(1, (requestedWidth + 3) / 4);
+            const LONG maximumWidth = ClampToLong(std::min<LONGLONG>(
+                std::numeric_limits<LONG>::max(), static_cast<LONGLONG>(requestedWidth) * 4));
+            LONG normalizedWidth = ScaleWidthForProbe(requestedWidth, desiredProbeWidth,
+                normalizedProbe.totalWidth, minimumWidth, maximumWidth);
+            if (normalizedWidth != requestedWidth) {
+                LOGFONTW trialLogfont = normalizedLogfont;
+                trialLogfont.lfWidth = normalizedWidth;
+                FontProbeMetrics trialProbe = {};
+                if (MeasureFontProbe(trialLogfont, &trialProbe) &&
+                    IsReasonableProbeRatio(desiredProbeWidth, trialProbe.totalWidth)) {
+                    normalizedWidth = ScaleWidthForProbe(normalizedWidth, desiredProbeWidth,
+                        trialProbe.totalWidth, minimumWidth, maximumWidth);
+                }
+            }
+            normalizedLogfont.lfWidth = normalizedWidth;
+        }
+    }
+
+    FontProbeMetrics finalProbe = normalizedProbe;
+    if ((normalizedLogfont.lfHeight != requestedHeight || normalizedLogfont.lfWidth != requestedWidth) &&
+        !MeasureFontProbe(normalizedLogfont, &finalProbe)) {
+        finalProbe = normalizedProbe;
+    }
+
+    entry.normalizedHeight = normalizedLogfont.lfHeight;
+    entry.normalizedWidth = normalizedLogfont.lfWidth;
+    if (desiredInkHeight > 0 && sourceProbe.inkGlyphCount >= 3 && finalProbe.inkGlyphCount >= 3) {
+        entry.logicalMetrics.height = std::max<LONG>(1,
+            ScaleMetricRounded(sourceProbe.textMetric.tmHeight, replacementHeight, sourceHeight));
+        entry.logicalMetrics.ascent = std::max<LONG>(1,
+            ScaleMetricRounded(sourceProbe.textMetric.tmAscent, replacementHeight, sourceHeight));
+        entry.logicalMetrics.descent = std::max<LONG>(0,
+            entry.logicalMetrics.height - entry.logicalMetrics.ascent);
+        entry.logicalMetrics.internalLeading = std::max<LONG>(0,
+            ScaleMetricRounded(sourceProbe.textMetric.tmInternalLeading, replacementHeight, sourceHeight));
+        entry.logicalMetrics.externalLeading = std::max<LONG>(0,
+            ScaleMetricRounded(sourceProbe.textMetric.tmExternalLeading, replacementHeight, sourceHeight));
+
+        const LONG desiredTop = ScaleMetricRounded(sourceProbe.inkTop, replacementHeight, sourceHeight);
+        const LONG desiredBottom = ScaleMetricRounded(sourceProbe.inkBottom, replacementHeight, sourceHeight);
+        entry.topYOffset = AnchoredInkDelta(desiredTop, desiredBottom, 0,
+            finalProbe.inkTop, finalProbe.inkBottom, 0);
+        entry.baselineYOffset = AnchoredInkDelta(desiredTop, desiredBottom,
+            entry.logicalMetrics.ascent, finalProbe.inkTop, finalProbe.inkBottom,
+            finalProbe.textMetric.tmAscent);
+        entry.bottomYOffset = AnchoredInkDelta(desiredTop, desiredBottom,
+            entry.logicalMetrics.height, finalProbe.inkTop, finalProbe.inkBottom,
+            finalProbe.textMetric.tmHeight);
+        entry.hasVerticalMetrics = true;
+    }
+
+    CacheNormalization(entry);
+    replacementLogfont = normalizedLogfont;
+
+    const bool changed = replacementLogfont.lfHeight != requestedHeight ||
+        replacementLogfont.lfWidth != requestedWidth;
+    if ((changed || entry.topYOffset != 0) &&
+        InterlockedIncrement(&g_metricNormalizationTraceCount) <= 32) {
+        Utils::Trace("[DEBUG][BGI] normalized font metrics request=%ldx%ld normalized=%ldx%ld sourceWidth=%ld desiredWidth=%ld targetWidth=%ld sourceInk=%ld..%ld targetInk=%ld..%ld y(top/base/bottom)=%ld/%ld/%ld",
+            requestedWidth, requestedHeight, replacementLogfont.lfWidth, replacementLogfont.lfHeight,
+            sourceProbe.totalWidth, desiredProbeWidth, finalProbe.totalWidth,
+            sourceProbe.inkTop, sourceProbe.inkBottom, finalProbe.inkTop, finalProbe.inkBottom,
+            entry.topYOffset, entry.baselineYOffset, entry.bottomYOffset);
+    }
+    return changed;
+}
+
+static bool ShouldCreateAnsiFontThroughWide() {
+    return InterlockedCompareExchange(&g_active, 0, 0) != 0 && !IsPickerThread() &&
+        Config::EnableFontHook && Config::EnableFaceNameReplace;
+}
+
+static void AdjustTextOutPosition(HDC hdc, int* y) {
+    if (!y) return;
+    MetricNormalizationEntry entry = {};
+    if (!TryGetNormalizationForHdc(hdc, &entry) || !entry.hasVerticalMetrics) return;
+
+    const UINT alignment = GetTextAlign(hdc);
+    if (alignment == GDI_ERROR || (alignment & TA_UPDATECP) != 0) return;
+
+    LONG offset = entry.topYOffset;
+    if ((alignment & TA_BASELINE) == TA_BASELINE) offset = entry.baselineYOffset;
+    else if ((alignment & TA_BOTTOM) == TA_BOTTOM) offset = entry.bottomYOffset;
+    *y = static_cast<int>(ClampToLong(static_cast<LONGLONG>(*y) + offset));
+}
+
+static bool BeginTextOutput(HDC hdc, int* y) {
+    if (InterlockedCompareExchange(&g_active, 0, 0) == 0 || IsPickerThread()) return false;
+    ++g_textOutputDepth;
+    if (g_textOutputDepth == 1) AdjustTextOutPosition(hdc, y);
+    return true;
+}
+
+static void EndTextOutput(bool entered) {
+    if (entered && g_textOutputDepth > 0) --g_textOutputDepth;
+}
+
+static void AdjustTextExtentForHdc(HDC hdc, LPSIZE size) {
+    if (!size) return;
+    MetricNormalizationEntry entry = {};
+    if (TryGetNormalizationForHdc(hdc, &entry) && entry.hasVerticalMetrics) {
+        size->cy = entry.logicalMetrics.height;
+    }
+}
+
+static void AdjustTextMetricForHdc(HDC hdc, LPTEXTMETRICA metric) {
+    if (!metric) return;
+    MetricNormalizationEntry entry = {};
+    if (!TryGetNormalizationForHdc(hdc, &entry) || !entry.hasVerticalMetrics) return;
+    metric->tmHeight = entry.logicalMetrics.height;
+    metric->tmAscent = entry.logicalMetrics.ascent;
+    metric->tmDescent = entry.logicalMetrics.descent;
+    metric->tmInternalLeading = entry.logicalMetrics.internalLeading;
+    metric->tmExternalLeading = entry.logicalMetrics.externalLeading;
+}
+
+static void AdjustTextMetricForHdc(HDC hdc, LPTEXTMETRICW metric) {
+    if (!metric) return;
+    MetricNormalizationEntry entry = {};
+    if (!TryGetNormalizationForHdc(hdc, &entry) || !entry.hasVerticalMetrics) return;
+    metric->tmHeight = entry.logicalMetrics.height;
+    metric->tmAscent = entry.logicalMetrics.ascent;
+    metric->tmDescent = entry.logicalMetrics.descent;
+    metric->tmInternalLeading = entry.logicalMetrics.internalLeading;
+    metric->tmExternalLeading = entry.logicalMetrics.externalLeading;
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (InterlockedCompareExchange(&g_active, 0, 0) != 0 && Config::BgiClearGlyphCacheOnSwitch) {
+        Utils::Trace("[DEBUG][BGI] config version=%ld; glyph caches will refresh on their render thread", version);
+    }
+}
+
+#else
+
+static void InstallInOpenDetourTransaction() {
+}
+
+static bool NormalizeReplacementFontMetrics(const LOGFONTW&, LOGFONTW&) {
+    return false;
+}
+
+static bool ShouldCreateAnsiFontThroughWide() {
+    return false;
+}
+
+static void AdjustTextOutPosition(HDC, int*) {
+}
+
+static bool BeginTextOutput(HDC, int*) {
+    return false;
+}
+
+static void EndTextOutput(bool) {
+}
+
+static void AdjustTextExtentForHdc(HDC, LPSIZE) {
+}
+
+static void AdjustTextMetricForHdc(HDC, LPTEXTMETRICA) {
+}
+
+static void AdjustTextMetricForHdc(HDC, LPTEXTMETRICW) {
+}
+
+static void NotifyConfigChanged(LONG) {
+}
+
+#endif

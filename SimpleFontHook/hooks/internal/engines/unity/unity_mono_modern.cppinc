@@ -1,0 +1,290 @@
+static bool MonoPopulateModernFontAsset(void* asset,
+    const std::wstring& characters, bool* allCharactersAdded) {
+    if (allCharactersAdded) *allCharactersAdded = false;
+    if (!asset || characters.empty() ||
+        (!g_monoBindings.tryAddCharacters &&
+            !g_monoBindings.tryAddCharactersWithMissing)) return false;
+    void* managedCharacters = MonoString(characters);
+    if (!managedCharacters) return false;
+    uint8_t includeFontFeatures = 0;
+    void* result = NULL;
+    std::wstring missingCharacters;
+    if (g_monoBindings.tryAddCharactersWithMissing) {
+        void* managedMissing = NULL;
+        void* params[3] = {
+            managedCharacters, &managedMissing, &includeFontFeatures
+        };
+        if (!MonoInvoke(g_monoBindings.tryAddCharactersWithMissing, asset, params,
+            &result, "TMP_FontAsset.TryAddCharacters(string,out string,bool)")) {
+            return false;
+        }
+        missingCharacters = MonoReadString(managedMissing);
+    } else {
+        void* oneParam[1] = { managedCharacters };
+        void* twoParams[2] = { managedCharacters, &includeFontFeatures };
+        void** params = g_monoBindings.tryAddCharactersParamCount == 1
+            ? oneParam : twoParams;
+        if (!MonoInvoke(g_monoBindings.tryAddCharacters, asset, params, &result,
+            g_monoBindings.tryAddCharactersParamCount == 1
+                ? "TMP_FontAsset.TryAddCharacters(string)"
+                : "TMP_FontAsset.TryAddCharacters(string,bool)")) return false;
+    }
+    bool complete = false;
+    if (!MonoReadBool(result, &complete)) return false;
+    if (!complete && g_monoBindings.tryAddCharactersWithMissing) {
+        Utils::Trace("[DEBUG][UnityMono] TMP glyph population incomplete requestedCodeUnits=%llu missingCodeUnits=%llu missing=%s",
+            (unsigned long long)characters.size(),
+            (unsigned long long)missingCharacters.size(),
+            MonoDescribeCodePoints(missingCharacters, 32).c_str());
+    }
+    if (allCharactersAdded) *allCharactersAdded = complete;
+    return true;
+}
+
+static bool MonoEnsureModernMaterialAtlas(void* asset, void* material) {
+    if (!asset || !material) return false;
+    if (!g_monoBindings.getTmpAtlasTexture ||
+        !g_monoBindings.getMaterialMainTexture ||
+        !g_monoBindings.setMaterialMainTexture) return true;
+    void* atlasTexture = NULL;
+    if (!MonoInvoke(g_monoBindings.getTmpAtlasTexture, asset, NULL,
+        &atlasTexture, "TMP_FontAsset.get_atlasTexture") || !atlasTexture) {
+        return false;
+    }
+    void* mainTexture = NULL;
+    if (!MonoInvoke(g_monoBindings.getMaterialMainTexture, material, NULL,
+        &mainTexture, "Material.get_mainTexture")) return false;
+    if (mainTexture != atlasTexture) {
+        void* textureParams[1] = { atlasTexture };
+        if (!MonoInvoke(g_monoBindings.setMaterialMainTexture, material,
+            textureParams, NULL, "Material.set_mainTexture")) return false;
+        void* repairedTexture = NULL;
+        if (!MonoInvoke(g_monoBindings.getMaterialMainTexture, material, NULL,
+            &repairedTexture, "Material.get_mainTexture") ||
+            repairedTexture != atlasTexture) return false;
+        Utils::Trace("[DEBUG][UnityMono] TMP material atlas repaired material=%p old=%p atlas=%p",
+            material, mainTexture, atlasTexture);
+    }
+    return true;
+}
+
+static bool MonoCreateModernFontAsset(const std::wstring& characters,
+    void** outputAsset, void** outputMaterial, bool* allCharactersAdded) {
+    if (outputAsset) *outputAsset = NULL;
+    if (outputMaterial) *outputMaterial = NULL;
+    if (allCharactersAdded) *allCharactersAdded = false;
+    if (!outputAsset || !outputMaterial || !g_monoSourceFont ||
+        (!g_monoBindings.createTmpFontAsset &&
+            !g_monoBindings.createTmpFontAssetDetailed)) return false;
+    void* rootedSource = g_monoSourceFontHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle) : NULL;
+    if (!rootedSource) {
+        Utils::Trace("[DEBUG][UnityMono] TMP asset creation skipped: source font root is null");
+        return false;
+    }
+    g_monoSourceFont = rootedSource;
+    bool traceFactoryAttempts = InterlockedExchange(
+        &g_monoLastFactoryTraceVersion, Config::ConfigVersion) != Config::ConfigVersion;
+    if (traceFactoryAttempts) {
+        MonoTraceFontState(g_monoSourceFont, "before-tmp-factory");
+        Utils::Trace("[DEBUG][UnityMono] TMP source Unity alive=%d object=%p",
+            MonoUnityObjectIsAlive(g_monoSourceFont) ? 1 : 0, g_monoSourceFont);
+    }
+    void* asset = NULL;
+    int selectedPopulationMode = 1;
+    if (g_monoBindings.createTmpFontAssetDetailed) {
+        struct FactoryProfile {
+            int renderMode;
+            int populationMode;
+        };
+        static const FactoryProfile profiles[] = {
+            { 4165, 1 },
+            { 4134, 1 },
+            { 4165, 0 },
+            { 4134, 0 },
+            { 4117, 1 },
+        };
+        for (const FactoryProfile& profile : profiles) {
+            int samplingPointSize = 90;
+            int atlasPadding = 9;
+            int renderMode = profile.renderMode;
+            int atlasWidth = 1024;
+            int atlasHeight = 1024;
+            int atlasPopulationMode = profile.populationMode;
+            uint8_t enableMultiAtlas = 1;
+            void* detailedParams[8] = {
+                g_monoSourceFont, &samplingPointSize, &atlasPadding, &renderMode,
+                &atlasWidth, &atlasHeight, &atlasPopulationMode,
+                &enableMultiAtlas
+            };
+            bool invoked = MonoInvoke(g_monoBindings.createTmpFontAssetDetailed, NULL,
+                detailedParams, &asset,
+                "TMP_FontAsset.CreateFontAsset(Font,int,int,GlyphRenderMode,int,int,AtlasPopulationMode,bool)");
+            if (asset) {
+                selectedPopulationMode = profile.populationMode;
+                break;
+            }
+            if (traceFactoryAttempts) {
+                Utils::Trace("[DEBUG][UnityMono] TMP detailed factory returned null invoked=%d renderMode=%d populationMode=%d",
+                    invoked ? 1 : 0, profile.renderMode, profile.populationMode);
+            }
+        }
+    }
+    if (!asset && g_monoBindings.createTmpFontAsset) {
+        void* params[1] = { g_monoSourceFont };
+        MonoInvoke(g_monoBindings.createTmpFontAsset, NULL, params,
+            &asset, "TMP_FontAsset.CreateFontAsset(Font)");
+        if (!asset && traceFactoryAttempts) {
+            Utils::Trace("[DEBUG][UnityMono] TMP short factory returned null");
+        }
+    }
+    if (!asset) return false;
+    uint32_t assetRoot = g_monoApi.gcHandleNew(asset, 1);
+    if (!assetRoot) return false;
+    if (!MonoKeepUnityObjectAlive(asset, "TMPro.TMP_FontAsset")) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    int dynamicPopulationMode = selectedPopulationMode;
+    bool populationModeSet = false;
+    if (g_monoBindings.setAtlasPopulationMode) {
+        void* populationParams[1] = { &dynamicPopulationMode };
+        populationModeSet = MonoInvoke(g_monoBindings.setAtlasPopulationMode, asset,
+            populationParams, NULL, "TMP_FontAsset.set_atlasPopulationMode");
+    }
+    if (!populationModeSet && g_monoBindings.atlasPopulationModeField) {
+        populationModeSet = MonoSetIntField(asset,
+            g_monoBindings.atlasPopulationModeField, dynamicPopulationMode);
+    }
+    if (g_monoBindings.setMultiAtlasEnabled) {
+        uint8_t enabled = 1;
+        void* multiAtlasParams[1] = { &enabled };
+        MonoInvoke(g_monoBindings.setMultiAtlasEnabled, asset,
+            multiAtlasParams, NULL, "TMP_FontAsset.set_isMultiAtlasTexturesEnabled");
+    }
+    bool complete = false;
+    if (!MonoPopulateModernFontAsset(asset, characters, &complete)) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    void* material = NULL;
+    MonoGetAssetMaterial(asset, &material);
+    if (!material && g_monoBindings.getTmpAtlasTexture) {
+        void* texture = NULL;
+        if (MonoInvoke(g_monoBindings.getTmpAtlasTexture, asset, NULL,
+            &texture, "TMP_FontAsset.get_atlasTexture") && texture) {
+            uint32_t materialRoot = 0;
+            material = MonoCreateMaterial(texture, asset, &materialRoot);
+            if (material && !MonoSetAssetMaterial(asset, material)) material = NULL;
+            if (materialRoot) MonoFreeHandle(materialRoot);
+        }
+    }
+    if (!material) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    if (!MonoKeepUnityObjectAlive(material, "TMP font material")) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    if (!MonoEnsureModernMaterialAtlas(asset, material)) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    *outputAsset = asset;
+    *outputMaterial = material;
+    if (allCharactersAdded) *allCharactersAdded = complete;
+    MonoFreeHandle(assetRoot);
+    return true;
+}
+
+static bool MonoCreateReplacementFontAsset(LONG version, bool* glyphSetChanged) {
+    if (Utils::IsShuttingDown()) return false;
+    if (glyphSetChanged) *glyphSetChanged = false;
+    void* rootedAsset = g_monoReplacementFontAssetHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle) : NULL;
+    void* rootedMaterial = g_monoReplacementMaterialHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle) : NULL;
+    bool replacementMatches = rootedAsset && rootedMaterial &&
+        g_monoReplacementVersion == version &&
+        _wcsicmp(g_monoReplacementFace, Config::ForcedFontNameW) == 0;
+    bool reusable = replacementMatches;
+    DWORD now = GetTickCount();
+    DWORD previousScan = static_cast<DWORD>(InterlockedCompareExchange(
+        &g_monoLastCharacterScanTick, 0, 0));
+    if (reusable && previousScan &&
+        static_cast<DWORD>(now - previousScan) < 250) {
+        g_monoReplacementFontAsset = rootedAsset;
+        g_monoReplacementMaterial = rootedMaterial;
+        return true;
+    }
+    InterlockedExchange(&g_monoLastCharacterScanTick, static_cast<LONG>(now));
+    uint64_t characterHash = 0;
+    std::wstring characters = MonoCollectCharacters(&characterHash);
+    if (Utils::IsShuttingDown()) return false;
+    if (reusable) {
+        g_monoReplacementFontAsset = rootedAsset;
+        g_monoReplacementMaterial = rootedMaterial;
+        if (g_monoBindings.legacyTmp) {
+            if (characterHash == g_monoLegacyCharacterHash) return true;
+        } else {
+            if (characterHash == g_monoModernCharacterHash) return true;
+            void* currentSource = NULL;
+            bool complete = false;
+            if (MonoEnsureModernSourceFont(rootedAsset, version, &currentSource) &&
+                MonoPopulateModernFontAsset(rootedAsset, characters, &complete) &&
+                MonoEnsureModernMaterialAtlas(rootedAsset, rootedMaterial)) {
+                // Keep an incomplete population retryable. Caching its hash as
+                // complete would permanently hide missing glyphs in modern TMP.
+                g_monoModernCharacterHash = complete ? characterHash : 0;
+                if (glyphSetChanged) *glyphSetChanged = true;
+                Utils::Trace("[DEBUG][UnityMono] TMP glyph set expanded in place version=%ld codeUnits=%llu asset=%p complete=%d",
+                    version, (unsigned long long)characters.size(), rootedAsset,
+                    complete ? 1 : 0);
+                return true;
+            }
+            Utils::Trace("[DEBUG][UnityMono] TMP glyph expansion requires asset rebuild version=%ld codeUnits=%llu oldAsset=%p",
+                version, (unsigned long long)characters.size(), rootedAsset);
+            reusable = false;
+        }
+    }
+
+    // Character discovery invokes Resources.FindObjectsOfTypeAll twice and can
+    // span several seconds in this title. Create the transient Unity Font only
+    // after that scan so TMP can retain it before Unity unloads unused assets.
+    if (!MonoCreateSourceFont(version)) return false;
+
+    void* asset = NULL;
+    void* material = NULL;
+    bool complete = true;
+    bool created = g_monoBindings.legacyTmp
+        ? MonoCreateLegacyFontAsset(characters, &asset, &material)
+        : MonoCreateModernFontAsset(characters, &asset, &material, &complete);
+    if (!created || !asset || !material) return false;
+    uint32_t nextAssetHandle = g_monoApi.gcHandleNew(asset, 1);
+    if (!nextAssetHandle) return false;
+    uint32_t nextMaterialHandle = g_monoApi.gcHandleNew(material, 1);
+    if (!nextMaterialHandle) {
+        MonoFreeHandle(nextAssetHandle);
+        return false;
+    }
+    MonoReleaseRoot(&g_monoReplacementMaterial, &g_monoReplacementMaterialHandle);
+    MonoReleaseRoot(&g_monoReplacementFontAsset, &g_monoReplacementFontAssetHandle);
+    g_monoReplacementFontAsset = asset;
+    g_monoReplacementFontAssetHandle = nextAssetHandle;
+    g_monoReplacementMaterial = material;
+    g_monoReplacementMaterialHandle = nextMaterialHandle;
+    g_monoReplacementVersion = version;
+    g_monoLegacyCharacterHash = g_monoBindings.legacyTmp
+        ? (complete ? characterHash : 0) : 0;
+    g_monoModernCharacterHash = g_monoBindings.legacyTmp
+        ? 0 : (complete ? characterHash : 0);
+    wcsncpy_s(g_monoReplacementFace, Config::ForcedFontNameW, _TRUNCATE);
+    if (glyphSetChanged) *glyphSetChanged = true;
+    Utils::Trace("[DEBUG][UnityMono] TMP font ready version=%ld face='%s' mode=%s asset=%p material=%p glyphSet=%llu complete=%d",
+        version, MonoWideToUtf8(g_monoReplacementFace).c_str(),
+        g_monoBindings.legacyTmp ? "legacy-bitmap" : "dynamic",
+        asset, material, (unsigned long long)characters.size(), complete ? 1 : 0);
+    return true;
+}
+

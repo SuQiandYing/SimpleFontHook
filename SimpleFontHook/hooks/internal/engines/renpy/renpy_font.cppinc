@@ -1,0 +1,13 @@
+// Ren'Py renders text through its bundled FreeType/HarfBuzz extensions, so
+// GDI and DirectWrite hooks never see the fonts used by the game. Bridge the
+// selected font into Ren'Py's own font replacement and cache lifecycle.
+
+namespace RenPy {
+
+#include "renpy_state.cppinc"
+#include "renpy_detection.cppinc"
+#include "renpy_font_source.cppinc"
+#include "renpy_python_bridge.cppinc"
+#include "renpy_runtime.cppinc"
+
+} // namespace RenPy

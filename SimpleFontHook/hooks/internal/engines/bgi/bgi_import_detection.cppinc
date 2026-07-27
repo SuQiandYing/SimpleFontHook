@@ -1,0 +1,168 @@
+static bool IsImageRange(const BYTE* imageBase, size_t imageSize, const void* address, size_t length) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(imageBase);
+    const uintptr_t value = reinterpret_cast<uintptr_t>(address);
+    return value >= base && length <= imageSize && value - base <= imageSize - length;
+}
+
+static BYTE* ImageRva(BYTE* imageBase, size_t imageSize, DWORD rva, size_t length) {
+    if (rva > imageSize || length > imageSize - rva) return nullptr;
+    return imageBase + rva;
+}
+
+static DWORD ReadUnalignedDword(const BYTE* address) {
+    DWORD value = 0;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static LONG ReadUnalignedLong(const BYTE* address) {
+    LONG value = 0;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static bool IsTerminatedImageString(const BYTE* imageBase, size_t imageSize, const char* text) {
+    if (!IsImageRange(imageBase, imageSize, text, 1)) return false;
+    const char* imageEnd = reinterpret_cast<const char*>(imageBase + imageSize);
+    while (text < imageEnd) {
+        if (*text == '\0') return true;
+        ++text;
+    }
+    return false;
+}
+
+static const char* FindKnownGdiApi(const char* name) {
+    if (!name) return nullptr;
+    for (const char* known : kKnownGdiApis) {
+        if (strcmp(name, known) == 0) return known;
+    }
+    return nullptr;
+}
+
+static const char* FindKnownGdiApiByAddress(PVOID address) {
+    HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi32) return nullptr;
+    for (const char* known : kKnownGdiApis) {
+        if (reinterpret_cast<PVOID>(GetProcAddress(gdi32, known)) == address) return known;
+    }
+    return nullptr;
+}
+
+static void ClassifyImport(ImportProfile& profile, const char* name, PVOID* slot) {
+    if (!name || !slot) return;
+    profile.knownSlots.push_back({ name, slot });
+
+    if (strncmp(name, "CreateFont", 10) == 0) profile.hasFontFactory = true;
+    if (strcmp(name, "TextOutA") == 0 || strcmp(name, "TextOutW") == 0 ||
+        strcmp(name, "ExtTextOutA") == 0 || strcmp(name, "ExtTextOutW") == 0 ||
+        strcmp(name, "GetGlyphOutlineA") == 0 || strcmp(name, "GetGlyphOutlineW") == 0) {
+        profile.hasRasterOutput = true;
+        profile.rasterSlots.push_back(slot);
+    }
+    if (strcmp(name, "SelectObject") == 0) profile.hasSelectObject = true;
+    if (strcmp(name, "GetObjectA") == 0 || strcmp(name, "GetObjectW") == 0) profile.hasGetObject = true;
+    if (strcmp(name, "CreateCompatibleDC") == 0) profile.hasCompatibleDc = true;
+    if (strcmp(name, "CreateDIBSection") == 0) profile.hasDibSection = true;
+    if (strcmp(name, "EnumFontFamiliesExA") == 0 || strcmp(name, "EnumFontFamiliesExW") == 0)
+        profile.hasFontEnumeration = true;
+}
+
+static bool ReadMainModulePe(BYTE** imageBase, size_t* imageSize, IMAGE_NT_HEADERS32** ntHeaders) {
+    if (!imageBase || !imageSize || !ntHeaders) return false;
+    HMODULE module = GetModuleHandleW(nullptr);
+    MODULEINFO moduleInfo = {};
+    if (!module || !GetModuleInformation(GetCurrentProcess(), module, &moduleInfo, sizeof(moduleInfo)) ||
+        !moduleInfo.lpBaseOfDll || moduleInfo.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+    BYTE* base = reinterpret_cast<BYTE*>(moduleInfo.lpBaseOfDll);
+    const size_t mappedSize = moduleInfo.SizeOfImage;
+
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!IsImageRange(base, mappedSize, dos, sizeof(*dos)) ||
+        dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        static_cast<size_t>(dos->e_lfanew) > mappedSize - sizeof(IMAGE_NT_HEADERS32)) {
+        return false;
+    }
+    IMAGE_NT_HEADERS32* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    if (!IsImageRange(base, mappedSize, nt, sizeof(*nt)) ||
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER) ||
+        nt->OptionalHeader.SizeOfImage > mappedSize) {
+        return false;
+    }
+
+    const BYTE* sectionTable = reinterpret_cast<const BYTE*>(&nt->OptionalHeader) +
+        nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(nt->FileHeader.NumberOfSections) *
+        sizeof(IMAGE_SECTION_HEADER);
+    if (!IsImageRange(base, mappedSize, sectionTable, sectionBytes)) {
+        return false;
+    }
+
+    *imageBase = base;
+    *imageSize = mappedSize;
+    *ntHeaders = nt;
+    return true;
+}
+
+static bool InspectImports(BYTE* imageBase, size_t imageSize, IMAGE_NT_HEADERS32* nt, ImportProfile* profile) {
+    if (!imageBase || !nt || !profile) return false;
+    const IMAGE_DATA_DIRECTORY& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!directory.VirtualAddress || directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return false;
+
+    BYTE* importDirectory = ImageRva(imageBase, imageSize, directory.VirtualAddress, directory.Size);
+    if (!importDirectory) return false;
+    IMAGE_IMPORT_DESCRIPTOR* descriptors = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(importDirectory);
+
+    const size_t maxDescriptors = directory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    for (size_t descriptorIndex = 0; descriptorIndex < maxDescriptors; ++descriptorIndex) {
+        IMAGE_IMPORT_DESCRIPTOR* descriptor = descriptors + descriptorIndex;
+        if (descriptor->Name == 0 && descriptor->FirstThunk == 0) break;
+        if (!descriptor->FirstThunk) continue;
+
+        for (size_t thunkIndex = 0; ; ++thunkIndex) {
+            const uint64_t thunkByteOffset = static_cast<uint64_t>(thunkIndex) * sizeof(IMAGE_THUNK_DATA32);
+            const uint64_t slotRva = static_cast<uint64_t>(descriptor->FirstThunk) + thunkByteOffset;
+            if (slotRva > std::numeric_limits<DWORD>::max()) break;
+            IMAGE_THUNK_DATA32* slotThunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+                ImageRva(imageBase, imageSize, static_cast<DWORD>(slotRva), sizeof(IMAGE_THUNK_DATA32)));
+            if (!slotThunk) break;
+            if (slotThunk->u1.Function == 0) break;
+
+            const char* knownName = nullptr;
+            if (descriptor->OriginalFirstThunk) {
+                const uint64_t nameRva = static_cast<uint64_t>(descriptor->OriginalFirstThunk) + thunkByteOffset;
+                if (nameRva > std::numeric_limits<DWORD>::max()) break;
+                IMAGE_THUNK_DATA32* currentNameThunk = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+                    ImageRva(imageBase, imageSize, static_cast<DWORD>(nameRva), sizeof(IMAGE_THUNK_DATA32)));
+                if (!currentNameThunk) break;
+                if (!IMAGE_SNAP_BY_ORDINAL32(currentNameThunk->u1.Ordinal)) {
+                    IMAGE_IMPORT_BY_NAME* importName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(ImageRva(
+                        imageBase, imageSize, currentNameThunk->u1.AddressOfData, sizeof(WORD) + 1));
+                    if (importName &&
+                        IsTerminatedImageString(imageBase, imageSize, importName->Name)) {
+                        knownName = FindKnownGdiApi(reinterpret_cast<const char*>(importName->Name));
+                    }
+                }
+            }
+            if (!knownName) {
+                knownName = FindKnownGdiApiByAddress(reinterpret_cast<PVOID>(
+                    static_cast<uintptr_t>(slotThunk->u1.Function)));
+            }
+            if (knownName) {
+                ClassifyImport(*profile, knownName, reinterpret_cast<PVOID*>(&slotThunk->u1.Function));
+            }
+        }
+    }
+    return !profile->knownSlots.empty();
+}
+
+static bool MatchesLegacyGlyphRasterPipeline(const ImportProfile& profile) {
+    const bool supportingEvidence = profile.hasCompatibleDc || profile.hasDibSection ||
+        profile.hasGetObject || profile.hasFontEnumeration;
+    return profile.hasFontFactory && profile.hasRasterOutput && profile.hasSelectObject &&
+        supportingEvidence;
+}

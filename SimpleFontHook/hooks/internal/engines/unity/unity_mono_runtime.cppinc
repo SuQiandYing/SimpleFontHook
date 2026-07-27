@@ -1,0 +1,713 @@
+static bool MonoLooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_monoEngineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    bool hasUnityPlayer = EngineCommon::IsFile(
+        EngineCommon::BuildRootPath(L"UnityPlayer.dll"));
+    bool hasGameAssembly = EngineCommon::IsFile(
+        EngineCommon::BuildRootPath(L"GameAssembly.dll"));
+    bool hasLegacyMono = EngineCommon::IsFile(
+        EngineCommon::BuildRootPath(L"Mono\\EmbedRuntime\\mono.dll"));
+    bool hasBleedingEdgeMono = EngineCommon::IsFile(EngineCommon::BuildRootPath(
+        L"MonoBleedingEdge\\EmbedRuntime\\mono-2.0-bdwgc.dll"));
+    bool frameworkContract = EngineIdentityPolicy::ConfirmFrameworkContract(
+        hasUnityPlayer && !hasGameAssembly, hasLegacyMono || hasBleedingEdgeMono);
+    bool detected = EngineIdentityPolicy::Confirm({
+        false, false, false, false, frameworkContract });
+    InterlockedExchange(&g_monoEngineProbe, detected ? 1 : 0);
+    if (detected) {
+        Utils::Trace("[DEBUG][UnityMono] engine detected unityPlayer=1 mono=%d renderer=TextMeshPro/UI.Text",
+            (hasLegacyMono ? 1 : 2));
+    }
+    return detected;
+}
+
+template<typename T>
+static bool MonoResolveExport(HMODULE module, const char* name, T* output, bool required = true) {
+    if (!output) return false;
+    *output = reinterpret_cast<T>(module ? GetProcAddress(module, name) : NULL);
+    if (!*output && required) {
+        Utils::Trace("[DEBUG][UnityMono] missing Mono export %s", name);
+    }
+    return *output != NULL || !required;
+}
+
+static HMODULE FindLoadedMonoModule() {
+    HMODULE module = GetModuleHandleW(L"mono-2.0-bdwgc.dll");
+    if (module) return module;
+    module = GetModuleHandleW(L"mono.dll");
+    if (module) return module;
+    module = GetModuleHandleW(L"mono-2.0-sgen.dll");
+    if (module) return module;
+    return GetModuleHandleW(L"mono-2.0.dll");
+}
+
+static bool MonoResolveApi() {
+    if (Utils::IsShuttingDown()) return false;
+    if (g_monoApi.module && g_monoApi.domain) return true;
+    HMODULE module = FindLoadedMonoModule();
+    if (!module) return false;
+
+    MonoApi api = {};
+    api.module = module;
+    bool ok = true;
+    MonoResolveExport(module, "mono_get_root_domain", &api.getRootDomain, false);
+    MonoResolveExport(module, "mono_domain_get", &api.domainGet, false);
+    ok = MonoResolveExport(module, "mono_thread_current", &api.threadCurrent) && ok;
+    ok = MonoResolveExport(module, "mono_thread_attach", &api.threadAttach) && ok;
+    ok = MonoResolveExport(module, "mono_assembly_foreach", &api.assemblyForeach) && ok;
+    ok = MonoResolveExport(module, "mono_domain_assembly_open", &api.domainAssemblyOpen) && ok;
+    ok = MonoResolveExport(module, "mono_assembly_get_image", &api.assemblyGetImage) && ok;
+    ok = MonoResolveExport(module, "mono_image_get_name", &api.imageGetName) && ok;
+    ok = MonoResolveExport(module, "mono_class_from_name", &api.classFromName) && ok;
+    ok = MonoResolveExport(module, "mono_class_get_parent", &api.classGetParent) && ok;
+    MonoResolveExport(module, "mono_class_get_name", &api.classGetName, false);
+    MonoResolveExport(module, "mono_class_get_namespace", &api.classGetNamespace, false);
+    ok = MonoResolveExport(module, "mono_class_get_method_from_name", &api.classGetMethodFromName) && ok;
+    MonoResolveExport(module, "mono_class_get_methods", &api.classGetMethods, false);
+    MonoResolveExport(module, "mono_method_get_name", &api.methodGetName, false);
+    MonoResolveExport(module, "mono_method_signature", &api.methodSignature, false);
+    MonoResolveExport(module, "mono_signature_get_param_count", &api.signatureGetParamCount, false);
+    MonoResolveExport(module, "mono_signature_get_params", &api.signatureGetParams, false);
+    MonoResolveExport(module, "mono_type_get_name", &api.typeGetName, false);
+    ok = MonoResolveExport(module, "mono_class_get_field_from_name", &api.classGetFieldFromName) && ok;
+    ok = MonoResolveExport(module, "mono_class_get_type", &api.classGetType) && ok;
+    ok = MonoResolveExport(module, "mono_class_get_element_class", &api.classGetElementClass) && ok;
+    ok = MonoResolveExport(module, "mono_type_get_object", &api.typeGetObject) && ok;
+    ok = MonoResolveExport(module, "mono_object_get_class", &api.objectGetClass) && ok;
+    ok = MonoResolveExport(module, "mono_object_new", &api.objectNew) && ok;
+    ok = MonoResolveExport(module, "mono_runtime_object_init", &api.runtimeObjectInit) && ok;
+    ok = MonoResolveExport(module, "mono_runtime_invoke", &api.runtimeInvoke) && ok;
+    ok = MonoResolveExport(module, "mono_object_unbox", &api.objectUnbox) && ok;
+    MonoResolveExport(module, "mono_object_to_string", &api.objectToString, false);
+    ok = MonoResolveExport(module, "mono_string_new_utf16", &api.stringNewUtf16) && ok;
+    ok = MonoResolveExport(module, "mono_string_to_utf16", &api.stringToUtf16) && ok;
+    MonoResolveExport(module, "mono_free", &api.freeMemory, false);
+    if (!api.freeMemory) MonoResolveExport(module, "g_free", &api.freeMemory, false);
+    ok = MonoResolveExport(module, "mono_array_new", &api.arrayNew) && ok;
+    MonoResolveExport(module, "mono_array_length", &api.arrayLength, false);
+    ok = MonoResolveExport(module, "mono_array_addr_with_size", &api.arrayAddrWithSize) && ok;
+    ok = MonoResolveExport(module, "mono_array_element_size", &api.arrayElementSize) && ok;
+    ok = MonoResolveExport(module, "mono_value_box", &api.valueBox) && ok;
+    ok = MonoResolveExport(module, "mono_field_get_value", &api.fieldGetValue) && ok;
+    ok = MonoResolveExport(module, "mono_field_set_value", &api.fieldSetValue) && ok;
+    ok = MonoResolveExport(module, "mono_gchandle_new", &api.gcHandleNew) && ok;
+    ok = MonoResolveExport(module, "mono_gchandle_get_target", &api.gcHandleGetTarget) && ok;
+    ok = MonoResolveExport(module, "mono_gchandle_free", &api.gcHandleFree) && ok;
+    MonoResolveExport(module, "mono_gc_wbarrier_set_arrayref", &api.gcWbarrierSetArrayRef, false);
+    MonoResolveExport(module, "mono_compile_method", &api.compileMethod, false);
+    if (!ok) return false;
+
+    void* domain = api.getRootDomain ? api.getRootDomain() : NULL;
+    if (!domain && api.domainGet) domain = api.domainGet();
+    if (!domain) return false;
+    api.domain = domain;
+    g_monoApi = api;
+    // Route managed invocations through a narrow font-assignment gate.  The
+    // regular object scan remains the fallback for runtimes that do not expose
+    // a detour-safe mono_runtime_invoke entry point.
+    MonoInstallRuntimeInvokeHook();
+    if (!g_monoApi.threadCurrent()) g_monoApi.threadAttach(domain);
+    Utils::Trace("[DEBUG][UnityMono] Mono API resolved module=%p domain=%p", module, domain);
+    return true;
+}
+
+static void MonoEnsureAttached() {
+    if (Utils::IsShuttingDown()) return;
+    if (!g_monoApi.domain || !g_monoApi.threadAttach) return;
+    if (!g_monoApi.threadCurrent || !g_monoApi.threadCurrent())
+        g_monoApi.threadAttach(g_monoApi.domain);
+}
+
+static bool MonoImageNameEquals(const char* actual, const char* wanted) {
+    if (!actual || !wanted) return false;
+    if (_stricmp(actual, wanted) == 0) return true;
+    const char* actualBase = strrchr(actual, '/');
+    if (!actualBase) actualBase = strrchr(actual, '\\');
+    const char* wantedBase = strrchr(wanted, '/');
+    if (!wantedBase) wantedBase = strrchr(wanted, '\\');
+    actualBase = actualBase ? actualBase + 1 : actual;
+    wantedBase = wantedBase ? wantedBase + 1 : wanted;
+    return _stricmp(actualBase, wantedBase) == 0;
+}
+
+struct MonoFindImageContext {
+    const char* wanted;
+    void* image;
+};
+
+static void __cdecl MonoFindImageCallback(void* assembly, void* userData) {
+    MonoFindImageContext* context = reinterpret_cast<MonoFindImageContext*>(userData);
+    if (!context || context->image || !assembly) return;
+    void* image = g_monoApi.assemblyGetImage(assembly);
+    if (image && MonoImageNameEquals(g_monoApi.imageGetName(image), context->wanted))
+        context->image = image;
+}
+
+static void* MonoFindImage(const char* name) {
+    if (!name || !g_monoApi.domain) return NULL;
+    MonoFindImageContext context = { name, NULL };
+    if (g_monoApi.assemblyForeach)
+        g_monoApi.assemblyForeach(MonoFindImageCallback, &context);
+    if (context.image) return context.image;
+
+    wchar_t managedPath[MAX_PATH] = {};
+    if (!GetModuleFileNameW(NULL, managedPath, _countof(managedPath))) return NULL;
+    PathRemoveExtensionW(managedPath);
+    if (wcscat_s(managedPath, L"_Data\\Managed") != 0) return NULL;
+    wchar_t wideName[MAX_PATH] = {};
+    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, wideName, _countof(wideName)))
+        return NULL;
+    wchar_t filePath[MAX_PATH] = {};
+    wcsncpy_s(filePath, managedPath, _TRUNCATE);
+    PathAppendW(filePath, wideName);
+    char utf8Path[MAX_PATH * 4] = {};
+    WideCharToMultiByte(CP_UTF8, 0, filePath, -1, utf8Path, _countof(utf8Path), NULL, NULL);
+    void* assembly = g_monoApi.domainAssemblyOpen(g_monoApi.domain, utf8Path);
+    return assembly ? g_monoApi.assemblyGetImage(assembly) : NULL;
+}
+
+static void* MonoFindClass(void* image, const char* namespaze, const char* name) {
+    return image && namespaze && name ? g_monoApi.classFromName(image, namespaze, name) : NULL;
+}
+
+static void* MonoFindMethod(void* klass, const char* name, int paramCount) {
+    for (void* current = klass; current; current = g_monoApi.classGetParent(current)) {
+        void* method = g_monoApi.classGetMethodFromName(current, name, paramCount);
+        if (method) return method;
+    }
+    return NULL;
+}
+
+static bool MonoFirstParamMatches(const char* actual, const char* wanted,
+    bool exact) {
+    if (!actual || !wanted) return false;
+    return exact ? _stricmp(actual, wanted) == 0 : strstr(actual, wanted) != NULL;
+}
+
+static void* MonoFindMethodWithParamInternal(void* klass, const char* name,
+    int paramCount, int paramIndex, const char* typeName, bool exact) {
+    if (!klass || !name || !g_monoApi.classGetMethods ||
+        !g_monoApi.methodGetName || !g_monoApi.methodSignature ||
+        !g_monoApi.signatureGetParamCount || !g_monoApi.signatureGetParams ||
+        !g_monoApi.typeGetName || paramIndex < 0 || paramIndex >= paramCount ||
+        (exact && !typeName)) return NULL;
+    for (void* current = klass; current; current = g_monoApi.classGetParent(current)) {
+        void* iterator = NULL;
+        while (void* method = g_monoApi.classGetMethods(current, &iterator)) {
+            const char* methodName = g_monoApi.methodGetName(method);
+            if (!methodName || strcmp(methodName, name) != 0) continue;
+            void* signature = g_monoApi.methodSignature(method);
+            if (!signature || g_monoApi.signatureGetParamCount(signature) != paramCount)
+                continue;
+            void* parameterIterator = NULL;
+            void* parameterType = NULL;
+            for (int i = 0; i <= paramIndex; ++i)
+                parameterType = g_monoApi.signatureGetParams(signature, &parameterIterator);
+            const char* parameterTypeName = parameterType
+                ? g_monoApi.typeGetName(parameterType) : NULL;
+            bool matches = !typeName ||
+                MonoFirstParamMatches(parameterTypeName, typeName, exact);
+            if (parameterTypeName && g_monoApi.freeMemory)
+                g_monoApi.freeMemory(const_cast<char*>(parameterTypeName));
+            if (matches)
+                return method;
+        }
+    }
+    return NULL;
+}
+
+static void* MonoFindMethodWithFirstParam(void* klass, const char* name,
+    int paramCount, const char* typeNamePart) {
+    return MonoFindMethodWithParamInternal(klass, name, paramCount, 0,
+        typeNamePart, false);
+}
+
+static void* MonoFindMethodWithExactFirstParam(void* klass, const char* name,
+    int paramCount, const char* typeName) {
+    return MonoFindMethodWithParamInternal(klass, name, paramCount, 0,
+        typeName, true);
+}
+
+static void* MonoFindMethodWithExactParam(void* klass, const char* name,
+    int paramCount, int paramIndex, const char* typeName) {
+    return MonoFindMethodWithParamInternal(klass, name, paramCount, paramIndex,
+        typeName, true);
+}
+
+static void* MonoFindField(void* klass, const char* name) {
+    for (void* current = klass; current; current = g_monoApi.classGetParent(current)) {
+        void* field = g_monoApi.classGetFieldFromName(current, name);
+        if (field) return field;
+    }
+    return NULL;
+}
+
+static std::wstring MonoReadString(void* stringObject);
+static std::string MonoWideToUtf8(const std::wstring& text);
+
+static bool MonoInvoke(void* method, void* object, void** params, void** result,
+    const char* label) {
+    if (result) *result = NULL;
+    if (Utils::IsShuttingDown() || !method || !g_monoApi.runtimeInvoke) return false;
+    MonoEnsureAttached();
+    void* exception = NULL;
+    void* value = g_monoApi.runtimeInvoke(method, object, params, &exception);
+    // A nested window message can start Unity shutdown while managed code is
+    // executing. Do not inspect exceptions or issue another Mono call after that.
+    if (Utils::IsShuttingDown()) return false;
+    if (exception) {
+        std::string detail;
+        std::string typeName;
+        void* exceptionClass = g_monoApi.objectGetClass
+            ? g_monoApi.objectGetClass(exception) : NULL;
+        if (exceptionClass && g_monoApi.classGetName) {
+            const char* namespaze = g_monoApi.classGetNamespace
+                ? g_monoApi.classGetNamespace(exceptionClass) : NULL;
+            const char* name = g_monoApi.classGetName(exceptionClass);
+            if (namespaze && namespaze[0]) {
+                typeName = namespaze;
+                typeName += ".";
+            }
+            if (name) typeName += name;
+        }
+        if (g_monoApi.objectToString) {
+            void* formatException = NULL;
+            void* managedDetail = g_monoApi.objectToString(exception, &formatException);
+            if (managedDetail && !formatException)
+                detail = MonoWideToUtf8(MonoReadString(managedDetail));
+        }
+        if (detail.empty() && exceptionClass) {
+            void* getMessage = MonoFindMethod(exceptionClass, "get_Message", 0);
+            pMonoRuntimeInvoke directInvoke = g_monoOriginalRuntimeInvoke
+                ? g_monoOriginalRuntimeInvoke : g_monoApi.runtimeInvoke;
+            if (getMessage && directInvoke) {
+                void* messageException = NULL;
+                void* managedMessage = directInvoke(getMessage, exception, NULL,
+                    &messageException);
+                if (managedMessage && !messageException)
+                    detail = MonoWideToUtf8(MonoReadString(managedMessage));
+            }
+        }
+        if (detail.empty() && exceptionClass && g_monoApi.fieldGetValue) {
+            void* messageField = MonoFindField(exceptionClass, "message");
+            void* managedMessage = NULL;
+            if (messageField) {
+                g_monoApi.fieldGetValue(exception, messageField, &managedMessage);
+                if (managedMessage)
+                    detail = MonoWideToUtf8(MonoReadString(managedMessage));
+            }
+        }
+        Utils::Trace("[DEBUG][UnityMono] invoke failed method=%s exception=%p type=%s detail='%s'",
+            label ? label : "<unknown>", exception,
+            typeName.empty() ? "<unknown>" : typeName.c_str(),
+            detail.empty() ? "<unavailable>" : detail.c_str());
+        return false;
+    }
+    if (result) *result = value;
+    return true;
+}
+
+static size_t MonoArrayLength(void* array) {
+    if (!array) return 0;
+    if (g_monoApi.arrayLength) return (size_t)g_monoApi.arrayLength(array);
+    return (size_t)reinterpret_cast<MonoArrayLayout*>(array)->maxLength;
+}
+
+static void MonoFreeHandle(uint32_t handle) {
+    if (!handle || Utils::IsShuttingDown()) return;
+    auto freeHandle = g_monoApi.gcHandleFree;
+    if (freeHandle) freeHandle(handle);
+}
+
+static bool MonoRootObject(void* object, void** storage, uint32_t* handle, const char* label) {
+    if (Utils::IsShuttingDown() || !object || !storage || !handle ||
+        !g_monoApi.gcHandleNew) return false;
+    if (*handle && g_monoApi.gcHandleGetTarget(*handle) == object) {
+        *storage = object;
+        return true;
+    }
+    uint32_t next = g_monoApi.gcHandleNew(object, 1);
+    if (!next) {
+        Utils::Trace("[DEBUG][UnityMono] failed to root object label=%s object=%p",
+            label ? label : "<unknown>", object);
+        return false;
+    }
+    if (*handle) MonoFreeHandle(*handle);
+    *handle = next;
+    *storage = object;
+    return true;
+}
+
+static void MonoReleaseRoot(void** storage, uint32_t* handle) {
+    if (handle && *handle) MonoFreeHandle(*handle);
+    if (handle) *handle = 0;
+    if (storage) *storage = NULL;
+}
+
+static void* MonoString(const std::wstring& text) {
+    if (!g_monoApi.stringNewUtf16 || !g_monoApi.domain) return NULL;
+    return g_monoApi.stringNewUtf16(g_monoApi.domain,
+        reinterpret_cast<const uint16_t*>(text.c_str()), (int)text.size());
+}
+
+static std::wstring MonoReadString(void* stringObject) {
+    if (!stringObject || !g_monoApi.stringToUtf16) return L"";
+    uint16_t* chars = g_monoApi.stringToUtf16(stringObject);
+    if (!chars) return L"";
+    std::wstring value(reinterpret_cast<wchar_t*>(chars));
+    if (g_monoApi.freeMemory) g_monoApi.freeMemory(chars);
+    return value;
+}
+
+static bool MonoReadInt(void* boxed, int* value) {
+    if (!boxed || !value || !g_monoApi.objectUnbox) return false;
+    void* unboxed = g_monoApi.objectUnbox(boxed);
+    if (!unboxed) return false;
+    *value = *reinterpret_cast<int*>(unboxed);
+    return true;
+}
+
+static bool MonoReadFloat(void* boxed, float* value) {
+    if (!boxed || !value || !g_monoApi.objectUnbox) return false;
+    void* unboxed = g_monoApi.objectUnbox(boxed);
+    if (!unboxed) return false;
+    *value = *reinterpret_cast<float*>(unboxed);
+    return true;
+}
+
+static bool MonoReadBool(void* boxed, bool* value) {
+    if (!boxed || !value || !g_monoApi.objectUnbox) return false;
+    void* unboxed = g_monoApi.objectUnbox(boxed);
+    if (!unboxed) return false;
+    *value = *reinterpret_cast<const uint8_t*>(unboxed) != 0;
+    return true;
+}
+
+static bool MonoUnityObjectIsAlive(void* object) {
+    if (!object) return false;
+    if (!g_monoBindings.objectImplicit) return true;
+    void* params[1] = { object };
+    void* boxed = NULL;
+    bool alive = false;
+    return MonoInvoke(g_monoBindings.objectImplicit, NULL, params, &boxed,
+        "Object.op_Implicit") && MonoReadBool(boxed, &alive) && alive;
+}
+
+static bool MonoKeepUnityObjectAlive(void* object, const char* label) {
+    if (!object || !g_monoBindings.objectDontDestroyOnLoad) return object != NULL;
+    void* params[1] = { object };
+    if (!MonoInvoke(g_monoBindings.objectDontDestroyOnLoad, NULL, params, NULL,
+        "Object.DontDestroyOnLoad")) {
+        Utils::Trace("[DEBUG][UnityMono] failed to preserve Unity object label=%s object=%p",
+            label ? label : "<unknown>", object);
+        return false;
+    }
+    return true;
+}
+
+static bool MonoGetFontDynamic(void* font, bool* isDynamic) {
+    if (isDynamic) *isDynamic = false;
+    if (!font || !isDynamic || !g_monoBindings.fontGetDynamic) return false;
+    void* boxed = NULL;
+    return MonoInvoke(g_monoBindings.fontGetDynamic, font, NULL, &boxed,
+        "Font.get_dynamic") && MonoReadBool(boxed, isDynamic);
+}
+
+static bool MonoFontIsUsable(void* font) {
+    if (!font || !g_monoBindings.fontGetName ||
+        !MonoUnityObjectIsAlive(font)) return false;
+    void* name = NULL;
+    return MonoInvoke(g_monoBindings.fontGetName, font, NULL, &name,
+        "Font.get_name(liveness)") && name != NULL;
+}
+
+static bool MonoSetObjectField(void* object, void* field, void* value) {
+    if (!object || !field || !g_monoApi.fieldSetValue) return false;
+    // mono_field_set_value expects reference-type values as MonoObject*, while
+    // primitive/value-type fields use a pointer to their raw storage.
+    g_monoApi.fieldSetValue(object, field, value);
+    return true;
+}
+
+static bool MonoSetIntField(void* object, void* field, int value) {
+    if (!object || !field || !g_monoApi.fieldSetValue) return false;
+    g_monoApi.fieldSetValue(object, field, &value);
+    return true;
+}
+
+static bool MonoSetFloatField(void* object, void* field, float value) {
+    if (!object || !field || !g_monoApi.fieldSetValue) return false;
+    g_monoApi.fieldSetValue(object, field, &value);
+    return true;
+}
+
+static void* MonoGetObjectField(void* object, void* field) {
+    if (!object || !field || !g_monoApi.fieldGetValue) return NULL;
+    void* value = NULL;
+    g_monoApi.fieldGetValue(object, field, &value);
+    return value;
+}
+
+static void* MonoTypeObject(void* klass) {
+    if (!klass || !g_monoApi.classGetType || !g_monoApi.typeGetObject) return NULL;
+    return g_monoApi.typeGetObject(g_monoApi.domain, g_monoApi.classGetType(klass));
+}
+
+static void* MonoFindCoreClass(void* coreImage, void* textImage,
+    const char* namespaze, const char* name) {
+    void* klass = MonoFindClass(coreImage, namespaze, name);
+    if (!klass && textImage) klass = MonoFindClass(textImage, namespaze, name);
+    return klass;
+}
+
+static bool MonoResolveBindings() {
+    if (g_monoBindings.tmpTextTypeObject || g_monoBindings.uiTextTypeObject) {
+        MonoInstallTmpSetTextJitHook();
+        MonoInstallTmpSetFontJitHook();
+        MonoInstallCatSetFontJitHook();
+        MonoInstallCatInitializeMaterialJitHook();
+        return true;
+    }
+    if (!MonoResolveApi()) return false;
+    MonoEnsureAttached();
+
+    void* coreImage = MonoFindImage("UnityEngine.CoreModule.dll");
+    if (!coreImage) coreImage = MonoFindImage("UnityEngine.dll");
+    void* textImage = MonoFindImage("UnityEngine.TextRenderingModule.dll");
+    if (!textImage) textImage = coreImage;
+    void* uiImage = MonoFindImage("UnityEngine.UI.dll");
+    void* tmpImage = MonoFindImage("Unity.TextMeshPro.dll");
+    if (!tmpImage) tmpImage = MonoFindImage("Unity.TextMeshPro.Editor.dll");
+    void* gameImage = MonoFindImage("Assembly-CSharp.dll");
+    if (!coreImage || !textImage || !tmpImage) return false;
+
+    MonoBindings bindings = {};
+    bindings.fontClass = MonoFindClass(textImage, "UnityEngine", "Font");
+    bindings.objectClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Object");
+    bindings.characterInfoClass = MonoFindClass(textImage, "UnityEngine", "CharacterInfo");
+    bindings.resourcesClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Resources");
+    bindings.scriptableObjectClass = MonoFindCoreClass(coreImage, textImage,
+        "UnityEngine", "ScriptableObject");
+    bindings.materialClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Material");
+    bindings.textureClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Texture");
+    bindings.texture2DClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Texture2D");
+    bindings.shaderClass = MonoFindCoreClass(coreImage, textImage, "UnityEngine", "Shader");
+    bindings.tmpAssetClass = MonoFindClass(tmpImage, "TMPro", "TMP_Asset");
+    bindings.tmpFontAssetClass = MonoFindClass(tmpImage, "TMPro", "TMP_FontAsset");
+    bindings.tmpTextClass = MonoFindClass(tmpImage, "TMPro", "TMP_Text");
+    bindings.uiTextClass = uiImage ? MonoFindClass(uiImage, "UnityEngine.UI", "Text") : NULL;
+    bindings.catTextGameObjectClass = gameImage
+        ? MonoFindClass(gameImage, "CatSystem.Text", "TextMeshProTextGameObject")
+        : NULL;
+    bindings.faceInfoClass = MonoFindClass(tmpImage, "TMPro", "FaceInfo");
+    bindings.tmpGlyphClass = MonoFindClass(tmpImage, "TMPro", "TMP_Glyph");
+    bindings.kerningTableClass = MonoFindClass(tmpImage, "TMPro", "KerningTable");
+    if (!bindings.objectClass || !bindings.fontClass || !bindings.resourcesClass || !bindings.materialClass ||
+        !bindings.tmpFontAssetClass || !bindings.tmpTextClass ||
+        !bindings.characterInfoClass) {
+        return false;
+    }
+
+    bindings.createDynamicFont = MonoFindMethodWithExactFirstParam(
+        bindings.fontClass, "CreateDynamicFontFromOSFont", 2, "System.String");
+    bindings.dynamicFontArrayConstructor = MonoFindMethodWithExactFirstParam(
+        bindings.fontClass, ".ctor", 2, "System.String[]");
+    bindings.internalCreateFontFromPath = MonoFindMethod(bindings.fontClass,
+        "Internal_CreateFontFromPath", 2);
+    bindings.objectImplicit = MonoFindMethod(bindings.objectClass, "op_Implicit", 1);
+    bindings.objectDontDestroyOnLoad = MonoFindMethod(bindings.objectClass,
+        "DontDestroyOnLoad", 1);
+    bindings.fontGetDynamic = MonoFindMethod(bindings.fontClass, "get_dynamic", 0);
+    bindings.fontGetName = MonoFindMethod(bindings.fontClass, "get_name", 0);
+    bindings.fontSetName = MonoFindMethod(bindings.fontClass, "set_name", 1);
+    bindings.fontGetMaterial = MonoFindMethod(bindings.fontClass, "get_material", 0);
+    bindings.fontRequestCharacters = MonoFindMethod(bindings.fontClass,
+        "RequestCharactersInTexture", 2);
+    if (!bindings.fontRequestCharacters)
+        bindings.fontRequestCharacters = MonoFindMethod(bindings.fontClass,
+            "RequestCharactersInTexture", 1);
+    bindings.fontGetCharacterInfo = MonoFindMethod(bindings.fontClass,
+        "get_characterInfo", 0);
+    bindings.fontGetAscent = MonoFindMethod(bindings.fontClass, "get_ascent", 0);
+    bindings.fontGetFontSize = MonoFindMethod(bindings.fontClass, "get_fontSize", 0);
+    bindings.fontGetLineHeight = MonoFindMethod(bindings.fontClass, "get_lineHeight", 0);
+    bindings.findAllObjects = MonoFindMethod(bindings.resourcesClass,
+        "FindObjectsOfTypeAll", 1);
+    bindings.scriptableCreateInstance = bindings.scriptableObjectClass
+        ? MonoFindMethodWithExactFirstParam(bindings.scriptableObjectClass,
+            "CreateInstance", 1, "System.Type") : NULL;
+    if (!bindings.scriptableCreateInstance && bindings.scriptableObjectClass) {
+        // Some older Mono profiles do not expose enough signature metadata for
+        // overload selection. Preserve the previous param-count fallback there.
+        bindings.scriptableCreateInstance = MonoFindMethod(
+            bindings.scriptableObjectClass, "CreateInstance", 1);
+    }
+    bindings.createTmpFontAsset = MonoFindMethod(bindings.tmpFontAssetClass,
+        "CreateFontAsset", 1);
+    bindings.createTmpFontAssetDetailed = MonoFindMethodWithFirstParam(
+        bindings.tmpFontAssetClass, "CreateFontAsset", 8, "UnityEngine.Font");
+    bindings.tryAddCharactersWithMissing = MonoFindMethodWithFirstParam(
+        bindings.tmpFontAssetClass, "TryAddCharacters", 3, "System.String");
+    bindings.tryAddCharacters = MonoFindMethodWithFirstParam(
+        bindings.tmpFontAssetClass, "TryAddCharacters", 2, "System.String");
+    bindings.tryAddCharactersParamCount = bindings.tryAddCharacters ? 2 : 0;
+    if (!bindings.tryAddCharacters) {
+        bindings.tryAddCharacters = MonoFindMethodWithFirstParam(
+            bindings.tmpFontAssetClass, "TryAddCharacters", 1, "System.String");
+        bindings.tryAddCharactersParamCount = bindings.tryAddCharacters ? 1 : 0;
+    }
+    bindings.getTmpAtlasTexture = MonoFindMethod(bindings.tmpFontAssetClass,
+        "get_atlasTexture", 0);
+    bindings.setSourceFontFile = MonoFindMethod(bindings.tmpFontAssetClass,
+        "set_sourceFontFile", 1);
+    bindings.sourceFontFileField = MonoFindField(bindings.tmpFontAssetClass,
+        "m_SourceFontFile");
+    bindings.setAtlasPopulationMode = MonoFindMethod(bindings.tmpFontAssetClass,
+        "set_atlasPopulationMode", 1);
+    bindings.atlasPopulationModeField = MonoFindField(bindings.tmpFontAssetClass,
+        "m_AtlasPopulationMode");
+    bindings.setMultiAtlasEnabled = MonoFindMethod(bindings.tmpFontAssetClass,
+        "set_isMultiAtlasTexturesEnabled", 1);
+    bindings.getAssetMaterial = bindings.tmpAssetClass
+        ? MonoFindMethod(bindings.tmpAssetClass, "get_material", 0) : NULL;
+    bindings.setAssetMaterial = bindings.tmpAssetClass
+        ? MonoFindMethod(bindings.tmpAssetClass, "set_material", 1) : NULL;
+    bindings.assetMaterialField = MonoFindField(bindings.tmpFontAssetClass, "material");
+    bindings.fontAssetTypeField = MonoFindField(bindings.tmpFontAssetClass, "fontAssetType");
+    bindings.fontAtlasField = MonoFindField(bindings.tmpFontAssetClass, "atlas");
+    bindings.materialCopyConstructor = MonoFindMethodWithFirstParam(
+        bindings.materialClass, ".ctor", 1, "UnityEngine.Material");
+    bindings.materialHasProperty = MonoFindMethod(bindings.materialClass,
+        "HasProperty", 1);
+    bindings.materialGetFloat = MonoFindMethod(bindings.materialClass,
+        "GetFloat", 1);
+    bindings.materialSetFloat = MonoFindMethod(bindings.materialClass,
+        "SetFloat", 2);
+    bindings.getMaterialMainTexture = MonoFindMethod(bindings.materialClass,
+        "get_mainTexture", 0);
+    bindings.setMaterialMainTexture = MonoFindMethod(bindings.materialClass,
+        "set_mainTexture", 1);
+    bindings.shaderFind = bindings.shaderClass
+        ? MonoFindMethod(bindings.shaderClass, "Find", 1) : NULL;
+    bindings.materialShaderConstructor = NULL;
+    bindings.getTextureWidth = bindings.textureClass
+        ? MonoFindMethod(bindings.textureClass, "get_width", 0) : NULL;
+    bindings.getTextureHeight = bindings.textureClass
+        ? MonoFindMethod(bindings.textureClass, "get_height", 0) : NULL;
+    bindings.texture2DConstructor = bindings.texture2DClass
+        ? MonoFindMethodWithExactParam(bindings.texture2DClass, ".ctor", 4,
+            2, "UnityEngine.TextureFormat") : NULL;
+    bindings.textureGetFormat = bindings.texture2DClass
+        ? MonoFindMethod(bindings.texture2DClass, "get_format", 0) : NULL;
+    bindings.textureGetRawData = bindings.texture2DClass
+        ? MonoFindMethod(bindings.texture2DClass, "GetRawTextureData", 0) : NULL;
+    bindings.textureLoadRawData = bindings.texture2DClass
+        ? MonoFindMethodWithExactFirstParam(bindings.texture2DClass,
+            "LoadRawTextureData", 1, "System.Byte[]") : NULL;
+    bindings.textureApply = bindings.texture2DClass
+        ? MonoFindMethod(bindings.texture2DClass, "Apply", 0) : NULL;
+    bindings.tmpGetText = MonoFindMethod(bindings.tmpTextClass, "get_text", 0);
+    bindings.tmpGetFont = MonoFindMethod(bindings.tmpTextClass, "get_font", 0);
+    bindings.tmpGetSharedMaterial = MonoFindMethod(bindings.tmpTextClass,
+        "get_fontSharedMaterial", 0);
+    bindings.tmpGetMaterial = MonoFindMethod(bindings.tmpTextClass,
+        "get_fontMaterial", 0);
+    bindings.tmpSetText = MonoFindMethod(bindings.tmpTextClass, "set_text", 1);
+    bindings.tmpSetFont = MonoFindMethod(bindings.tmpTextClass, "set_font", 1);
+    bindings.tmpSetSharedMaterial = MonoFindMethod(bindings.tmpTextClass,
+        "set_fontSharedMaterial", 1);
+    bindings.tmpSetMaterial = MonoFindMethod(bindings.tmpTextClass, "set_fontMaterial", 1);
+    bindings.tmpForceMeshUpdate0 = MonoFindMethod(bindings.tmpTextClass,
+        "ForceMeshUpdate", 0);
+    bindings.tmpForceMeshUpdate1 = MonoFindMethod(bindings.tmpTextClass,
+        "ForceMeshUpdate", 1);
+    bindings.tmpForceMeshUpdate2 = MonoFindMethod(bindings.tmpTextClass,
+        "ForceMeshUpdate", 2);
+    if (bindings.uiTextClass) {
+        bindings.uiGetText = MonoFindMethod(bindings.uiTextClass, "get_text", 0);
+        bindings.uiGetFont = MonoFindMethod(bindings.uiTextClass, "get_font", 0);
+        bindings.uiSetFont = MonoFindMethod(bindings.uiTextClass, "set_font", 1);
+    }
+    if (bindings.catTextGameObjectClass) {
+        bindings.catGetTextMeshPro = MonoFindMethod(bindings.catTextGameObjectClass,
+            "get_textMeshPro", 0);
+        bindings.catInitializeMaterial = MonoFindMethod(bindings.catTextGameObjectClass,
+            "InitializeMaterial", 0);
+        bindings.catSetFont = MonoFindMethod(bindings.catTextGameObjectClass,
+            "SetFont", 1);
+    }
+    bindings.addFaceInfo = MonoFindMethod(bindings.tmpFontAssetClass, "AddFaceInfo", 1);
+    bindings.addGlyphInfo = MonoFindMethod(bindings.tmpFontAssetClass, "AddGlyphInfo", 1);
+    bindings.addKerningInfo = MonoFindMethod(bindings.tmpFontAssetClass, "AddKerningInfo", 1);
+    bindings.readFontDefinition = MonoFindMethod(bindings.tmpFontAssetClass,
+        "ReadFontDefinition", 0);
+    bindings.sortGlyphs = MonoFindMethod(bindings.tmpFontAssetClass, "SortGlyphs", 0);
+    bindings.characterInfoAdvance = MonoFindMethod(bindings.characterInfoClass,
+        "get_advance", 0);
+
+    bindings.tmpTextTypeObject = MonoTypeObject(bindings.tmpTextClass);
+    bindings.uiTextTypeObject = bindings.uiTextClass ? MonoTypeObject(bindings.uiTextClass) : NULL;
+    bindings.tmpFontAssetTypeObject = MonoTypeObject(bindings.tmpFontAssetClass);
+    bindings.legacyTmp = bindings.createTmpFontAsset == NULL &&
+        bindings.createTmpFontAssetDetailed == NULL &&
+        bindings.faceInfoClass && bindings.tmpGlyphClass && bindings.addFaceInfo &&
+        bindings.addGlyphInfo && bindings.fontGetCharacterInfo && bindings.fontRequestCharacters &&
+        bindings.fontAtlasField;
+    bool modernReady = (bindings.createTmpFontAsset || bindings.createTmpFontAssetDetailed) &&
+        (bindings.tryAddCharacters || bindings.tryAddCharactersWithMissing) &&
+        bindings.tmpSetFont &&
+        bindings.findAllObjects && bindings.tmpTextTypeObject;
+    bool legacyReady = bindings.legacyTmp && bindings.tmpSetFont &&
+        bindings.findAllObjects && bindings.tmpTextTypeObject;
+    if (!modernReady && !legacyReady) {
+        Utils::Trace("[DEBUG][UnityMono] binding failed modern=%d legacy=%d fontFactory=%d charInfo=%d glyphPopulate=%d tmpSetFont=%d findAll=%d",
+            modernReady ? 1 : 0, legacyReady ? 1 : 0,
+            bindings.createDynamicFont ? 1 : 0,
+            bindings.fontGetCharacterInfo ? 1 : 0,
+            bindings.tryAddCharacters ? 1 : 0,
+            bindings.tmpSetFont ? 1 : 0,
+            bindings.findAllObjects ? 1 : 0);
+        return false;
+    }
+    if (!MonoRootObject(bindings.tmpTextTypeObject, &bindings.tmpTextTypeObject,
+        &bindings.tmpTextTypeHandle, "TMP_Text System.Type")) return false;
+    if (bindings.uiTextTypeObject && !MonoRootObject(bindings.uiTextTypeObject,
+        &bindings.uiTextTypeObject, &bindings.uiTextTypeHandle, "UI.Text System.Type")) {
+        bindings.uiTextTypeObject = NULL;
+    }
+    if (!MonoRootObject(bindings.tmpFontAssetTypeObject,
+        &bindings.tmpFontAssetTypeObject, &bindings.tmpFontAssetTypeHandle,
+        "TMP_FontAsset System.Type")) return false;
+    g_monoBindings = bindings;
+    MonoInstallTmpSetTextJitHook();
+    MonoInstallTmpSetFontJitHook();
+    MonoInstallCatSetFontJitHook();
+    MonoInstallCatInitializeMaterialJitHook();
+    Utils::Trace("[DEBUG][UnityMono] bindings resolved mode=%s objectAlive=%d dontDestroy=%d fontFactory=%d fontArrayCtor=%d detailedFactory=%d pathFactory=%d fontDynamic=%d fontNameGet=%d fontNameSet=%d glyphPopulateArgs=%d missingGlyphs=%d uiText=%d materialClone=%d materialMetrics=%d/%d/%d atlasRepack=%d/%d/%d/%d/%d tmpGetMaterial=%d tmpGetSharedMaterial=%d",
+        bindings.legacyTmp ? "legacy-bitmap" : "modern",
+        bindings.objectImplicit ? 1 : 0,
+        bindings.objectDontDestroyOnLoad ? 1 : 0,
+        bindings.createDynamicFont ? 1 : 0,
+        bindings.dynamicFontArrayConstructor ? 1 : 0,
+        bindings.createTmpFontAssetDetailed ? 1 : 0,
+        bindings.internalCreateFontFromPath ? 1 : 0,
+        bindings.fontGetDynamic ? 1 : 0,
+        bindings.fontGetName ? 1 : 0,
+        bindings.fontSetName ? 1 : 0,
+        bindings.tryAddCharactersParamCount,
+        bindings.tryAddCharactersWithMissing ? 1 : 0,
+        bindings.uiTextClass ? 1 : 0,
+        bindings.materialCopyConstructor ? 1 : 0,
+        bindings.materialHasProperty ? 1 : 0,
+        bindings.materialGetFloat ? 1 : 0,
+        bindings.materialSetFloat ? 1 : 0,
+        bindings.texture2DConstructor ? 1 : 0,
+        bindings.textureGetFormat ? 1 : 0,
+        bindings.textureGetRawData ? 1 : 0,
+        bindings.textureLoadRawData ? 1 : 0,
+        bindings.textureApply ? 1 : 0,
+        bindings.tmpGetMaterial ? 1 : 0,
+        bindings.tmpGetSharedMaterial ? 1 : 0);
+    return true;
+}

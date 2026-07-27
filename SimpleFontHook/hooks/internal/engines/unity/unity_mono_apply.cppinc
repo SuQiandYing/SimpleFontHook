@@ -1,0 +1,303 @@
+static bool MonoForceTmpMeshUpdate(void* text) {
+    if (!text) return false;
+    uint8_t ignoreActive = 1;
+    uint8_t forceReparse = 1;
+    if (g_monoBindings.tmpForceMeshUpdate2) {
+        void* meshParams[2] = { &ignoreActive, &forceReparse };
+        return MonoInvoke(g_monoBindings.tmpForceMeshUpdate2, text, meshParams,
+            NULL, "TMP_Text.ForceMeshUpdate(bool,bool)");
+    }
+    if (g_monoBindings.tmpForceMeshUpdate1) {
+        void* meshParams[1] = { &ignoreActive };
+        return MonoInvoke(g_monoBindings.tmpForceMeshUpdate1, text, meshParams,
+            NULL, "TMP_Text.ForceMeshUpdate(bool)");
+    }
+    return g_monoBindings.tmpForceMeshUpdate0 &&
+        MonoInvoke(g_monoBindings.tmpForceMeshUpdate0, text, NULL,
+            NULL, "TMP_Text.ForceMeshUpdate()");
+}
+
+static void* MonoGetMaterialMainTexture(void* material) {
+    if (!material || !g_monoBindings.getMaterialMainTexture) return NULL;
+    void* texture = NULL;
+    return MonoInvoke(g_monoBindings.getMaterialMainTexture, material, NULL,
+        &texture, "Material.get_mainTexture") ? texture : NULL;
+}
+
+static void* MonoGetReplacementTexture(void* fontAsset, void* material) {
+    void* texture = NULL;
+    if (fontAsset && g_monoBindings.getTmpAtlasTexture &&
+        MonoInvoke(g_monoBindings.getTmpAtlasTexture, fontAsset, NULL,
+            &texture, "TMP_FontAsset.get_atlasTexture") && texture) {
+        return texture;
+    }
+    return MonoGetMaterialMainTexture(material);
+}
+
+static bool MonoClassIsOrDerived(void* klass, void* target) {
+    if (!klass || !target || !g_monoApi.classGetParent) return false;
+    for (void* current = klass; current; current = g_monoApi.classGetParent(current)) {
+        if (current == target) return true;
+    }
+    return false;
+}
+
+static bool MonoIsTmpTextObject(void* object) {
+    return object && g_monoApi.objectGetClass &&
+        MonoClassIsOrDerived(g_monoApi.objectGetClass(object),
+            g_monoBindings.tmpTextClass);
+}
+
+static bool MonoIsUiTextObject(void* object) {
+    return object && g_monoApi.objectGetClass && g_monoBindings.uiTextClass &&
+        MonoClassIsOrDerived(g_monoApi.objectGetClass(object),
+            g_monoBindings.uiTextClass);
+}
+
+static const char* MonoRuntimeMethodName(void* method) {
+    return method && g_monoApi.methodGetName
+        ? g_monoApi.methodGetName(method) : NULL;
+}
+
+static bool MonoRuntimeMethodIs(void* method, const char* wanted) {
+    const char* actual = MonoRuntimeMethodName(method);
+    return actual && wanted && strcmp(actual, wanted) == 0;
+}
+
+static bool MonoApplyTmpObjectImmediately(void* text, void* fontAsset,
+    void* material) {
+    if (!text || !fontAsset || !material || !MonoIsTmpTextObject(text)) return false;
+    void* textClass = g_monoApi.objectGetClass(text);
+    void* getFont = textClass ? MonoFindMethod(textClass, "get_font", 0) : NULL;
+    void* getSharedMaterial = textClass
+        ? MonoFindMethod(textClass, "get_fontSharedMaterial", 0) : NULL;
+    void* getMaterial = textClass
+        ? MonoFindMethod(textClass, "get_fontMaterial", 0) : NULL;
+    void* setFont = textClass ? MonoFindMethod(textClass, "set_font", 1) : NULL;
+    void* setSharedMaterial = textClass
+        ? MonoFindMethod(textClass, "set_fontSharedMaterial", 1) : NULL;
+    void* setMaterial = textClass
+        ? MonoFindMethod(textClass, "set_fontMaterial", 1) : NULL;
+    if (!getFont) getFont = g_monoBindings.tmpGetFont;
+    if (!getSharedMaterial) getSharedMaterial = g_monoBindings.tmpGetSharedMaterial;
+    if (!getMaterial) getMaterial = g_monoBindings.tmpGetMaterial;
+    if (!setFont) setFont = g_monoBindings.tmpSetFont;
+    if (!setSharedMaterial) setSharedMaterial = g_monoBindings.tmpSetSharedMaterial;
+    if (!setMaterial) setMaterial = g_monoBindings.tmpSetMaterial;
+
+    void* currentFont = NULL;
+    if (!getFont || !MonoInvoke(getFont, text, NULL, &currentFont,
+        "TMP_Text.get_font(immediate)")) return false;
+    void* sharedMaterial = NULL;
+    if (getSharedMaterial) {
+        MonoInvoke(getSharedMaterial, text, NULL, &sharedMaterial,
+            "TMP_Text.get_fontSharedMaterial(immediate)");
+    }
+    void* currentMaterial = NULL;
+    if (getMaterial && (!g_monoBindings.legacyTmp || sharedMaterial)) {
+        MonoInvoke(getMaterial, text, NULL, &currentMaterial,
+            "TMP_Text.get_fontMaterial(immediate)");
+    }
+    if (!currentMaterial) currentMaterial = sharedMaterial;
+    bool fontChanged = currentFont != fontAsset;
+    if (fontChanged) {
+        void* fontParams[1] = { fontAsset };
+        if (!setFont || !MonoInvoke(setFont, text, fontParams, NULL,
+            "TMP_Text.set_font(immediate)")) return false;
+    }
+    void* replacementTexture = MonoGetReplacementTexture(fontAsset, material);
+    bool materialSet = !replacementTexture || !setMaterial;
+    if (!materialSet && currentMaterial) {
+        materialSet = MonoGetMaterialMainTexture(currentMaterial) ==
+            replacementTexture;
+    }
+    if (!materialSet && currentMaterial) {
+        uint32_t temporaryRoot = 0;
+        void* clonedMaterial = MonoCloneMaterialWithTexture(
+            currentMaterial, replacementTexture, &temporaryRoot, false);
+        if (clonedMaterial) {
+            MonoSyncSdfMaterialMetrics(material, clonedMaterial);
+            void* materialParams[1] = { clonedMaterial };
+            materialSet = MonoInvoke(setMaterial, text, materialParams, NULL,
+                "TMP_Text.set_fontMaterial(immediate)");
+        }
+        if (temporaryRoot) MonoFreeHandle(temporaryRoot);
+    }
+    if (!materialSet && setSharedMaterial) {
+        void* materialParams[1] = { material };
+        materialSet = MonoInvoke(setSharedMaterial, text, materialParams, NULL,
+            "TMP_Text.set_fontSharedMaterial(immediate)");
+    }
+    if (!materialSet && fontChanged) {
+        void* rollbackParams[1] = { currentFont };
+        MonoInvoke(setFont, text, rollbackParams, NULL,
+            "TMP_Text.set_font(immediate-rollback)");
+        return false;
+    }
+    MonoForceTmpMeshUpdate(text);
+    return true;
+}
+
+static bool MonoApplyUiTextObjectImmediately(void* text, void* sourceFont) {
+    if (!text || !sourceFont || !MonoIsUiTextObject(text) ||
+        !g_monoBindings.uiSetFont) return false;
+    void* textClass = g_monoApi.objectGetClass(text);
+    void* getFont = textClass ? MonoFindMethod(textClass, "get_font", 0) : NULL;
+    void* setFont = textClass ? MonoFindMethod(textClass, "set_font", 1) : NULL;
+    if (!getFont) getFont = g_monoBindings.uiGetFont;
+    if (!setFont) setFont = g_monoBindings.uiSetFont;
+    void* currentFont = NULL;
+    if (!getFont || !MonoInvoke(getFont, text, NULL, &currentFont,
+        "UI.Text.get_font(immediate)")) return false;
+    if (currentFont == sourceFont) return true;
+    void* params[1] = { sourceFont };
+    return setFont && MonoInvoke(setFont, text, params, NULL,
+        "UI.Text.set_font(immediate)");
+}
+
+static bool MonoApplyTmpObjects(void* fontAsset, void* material,
+    bool forceMeshRefresh, size_t* objectCount, size_t* changedCount,
+    size_t* preservedMaterialCount, size_t* fallbackMaterialCount) {
+    if (objectCount) *objectCount = 0;
+    if (changedCount) *changedCount = 0;
+    if (preservedMaterialCount) *preservedMaterialCount = 0;
+    if (fallbackMaterialCount) *fallbackMaterialCount = 0;
+    std::vector<void*> texts;
+    std::vector<uint32_t> textRoots;
+    if (!MonoFindAllObjects(g_monoBindings.tmpTextTypeObject, texts, &textRoots)) return false;
+    if (objectCount) *objectCount = texts.size();
+    size_t changed = 0;
+    size_t preservedMaterials = 0;
+    size_t fallbackMaterials = 0;
+    void* replacementTexture = MonoGetReplacementTexture(fontAsset, material);
+    bool interrupted = false;
+    for (void* text : texts) {
+        if (Utils::IsShuttingDown()) {
+            interrupted = true;
+            break;
+        }
+        void* textClass = g_monoApi.objectGetClass(text);
+        void* getFont = textClass ? MonoFindMethod(textClass, "get_font", 0) : NULL;
+        void* getSharedMaterial = textClass
+            ? MonoFindMethod(textClass, "get_fontSharedMaterial", 0) : NULL;
+        void* getMaterial = textClass
+            ? MonoFindMethod(textClass, "get_fontMaterial", 0) : NULL;
+        void* setFont = textClass ? MonoFindMethod(textClass, "set_font", 1) : NULL;
+        void* setSharedMaterial = textClass
+            ? MonoFindMethod(textClass, "set_fontSharedMaterial", 1) : NULL;
+        void* setMaterial = textClass
+            ? MonoFindMethod(textClass, "set_fontMaterial", 1) : NULL;
+        if (!getFont) getFont = g_monoBindings.tmpGetFont;
+        if (!getSharedMaterial) getSharedMaterial = g_monoBindings.tmpGetSharedMaterial;
+        if (!getMaterial) getMaterial = g_monoBindings.tmpGetMaterial;
+        if (!setFont) setFont = g_monoBindings.tmpSetFont;
+        if (!setSharedMaterial) setSharedMaterial = g_monoBindings.tmpSetSharedMaterial;
+        if (!setMaterial) setMaterial = g_monoBindings.tmpSetMaterial;
+        void* currentFont = NULL;
+        if (!getFont || !MonoInvoke(getFont, text, NULL, &currentFont,
+            "TMP_Text.get_font")) continue;
+        bool fontChanged = currentFont != fontAsset;
+        if (!fontChanged && !forceMeshRefresh) continue;
+        void* sharedMaterial = NULL;
+        if ((fontChanged || forceMeshRefresh) && getSharedMaterial) {
+            MonoInvoke(getSharedMaterial, text, NULL, &sharedMaterial,
+                "TMP_Text.get_fontSharedMaterial");
+        }
+        void* currentMaterial = NULL;
+        if ((fontChanged || forceMeshRefresh) && getMaterial &&
+            (!g_monoBindings.legacyTmp || sharedMaterial)) {
+            MonoInvoke(getMaterial, text, NULL, &currentMaterial,
+                "TMP_Text.get_fontMaterial");
+        }
+        if (!currentMaterial) currentMaterial = sharedMaterial;
+        if (fontChanged) {
+            void* fontParams[1] = { fontAsset };
+            if (!setFont || !MonoInvoke(setFont, text, fontParams,
+                NULL, "TMP_Text.set_font")) continue;
+        }
+        bool materialSet = material == NULL;
+        bool preservedMaterial = false;
+        bool fallbackMaterial = false;
+        if (!materialSet && !fontChanged && currentMaterial && replacementTexture) {
+            materialSet = MonoGetMaterialMainTexture(currentMaterial) == replacementTexture;
+        }
+        if (!materialSet && currentMaterial && replacementTexture && setMaterial) {
+            uint32_t preservedRoot = 0;
+            void* clonedMaterial = MonoCloneMaterialWithTexture(
+                currentMaterial, replacementTexture, &preservedRoot, false);
+            if (clonedMaterial) {
+                MonoSyncSdfMaterialMetrics(material, clonedMaterial);
+                void* materialParams[1] = { clonedMaterial };
+                materialSet = MonoInvoke(setMaterial, text, materialParams,
+                    NULL, "TMP_Text.set_fontMaterial(preserved)");
+            }
+            if (preservedRoot) MonoFreeHandle(preservedRoot);
+            preservedMaterial = materialSet;
+        }
+        if (!materialSet && setMaterial) {
+            void* materialParams[1] = { material };
+            materialSet = MonoInvoke(setMaterial, text, materialParams,
+                NULL, "TMP_Text.set_fontMaterial(fallback)");
+            fallbackMaterial = materialSet;
+        }
+        if (!materialSet && setSharedMaterial) {
+            void* materialParams[1] = { material };
+            materialSet = MonoInvoke(setSharedMaterial, text, materialParams,
+                NULL, "TMP_Text.set_fontSharedMaterial(fallback)");
+            fallbackMaterial = materialSet;
+        }
+        if (!materialSet) {
+            if (fontChanged) {
+                void* rollbackParams[1] = { currentFont };
+                MonoInvoke(setFont, text, rollbackParams, NULL,
+                    "TMP_Text.set_font(rollback)");
+            }
+            continue;
+        }
+        if (preservedMaterial) ++preservedMaterials;
+        else if (fallbackMaterial) ++fallbackMaterials;
+        MonoForceTmpMeshUpdate(text);
+        ++changed;
+    }
+    MonoFreeObjectRoots(textRoots);
+    if (changedCount) *changedCount = changed;
+    if (preservedMaterialCount) *preservedMaterialCount = preservedMaterials;
+    if (fallbackMaterialCount) *fallbackMaterialCount = fallbackMaterials;
+    return !interrupted && !Utils::IsShuttingDown();
+}
+
+static bool MonoApplyUiTextObjects(void* sourceFont, size_t* objectCount,
+    size_t* changedCount) {
+    if (objectCount) *objectCount = 0;
+    if (changedCount) *changedCount = 0;
+    if (!g_monoBindings.uiTextTypeObject || !g_monoBindings.uiSetFont)
+        return true;
+    std::vector<void*> texts;
+    std::vector<uint32_t> textRoots;
+    if (!MonoFindAllObjects(g_monoBindings.uiTextTypeObject, texts, &textRoots)) return false;
+    if (objectCount) *objectCount = texts.size();
+    size_t changed = 0;
+    bool interrupted = false;
+    for (void* text : texts) {
+        if (Utils::IsShuttingDown()) {
+            interrupted = true;
+            break;
+        }
+        void* textClass = g_monoApi.objectGetClass(text);
+        void* getFont = textClass ? MonoFindMethod(textClass, "get_font", 0) : NULL;
+        void* setFont = textClass ? MonoFindMethod(textClass, "set_font", 1) : NULL;
+        if (!getFont) getFont = g_monoBindings.uiGetFont;
+        if (!setFont) setFont = g_monoBindings.uiSetFont;
+        void* currentFont = NULL;
+        if (!getFont || !MonoInvoke(getFont, text, NULL, &currentFont,
+            "UI.Text.get_font")) continue;
+        if (currentFont == sourceFont) continue;
+        void* params[1] = { sourceFont };
+        if (setFont && MonoInvoke(setFont, text, params, NULL, "UI.Text.set_font"))
+            ++changed;
+    }
+    MonoFreeObjectRoots(textRoots);
+    if (changedCount) *changedCount = changed;
+    return !interrupted && !Utils::IsShuttingDown();
+}
+

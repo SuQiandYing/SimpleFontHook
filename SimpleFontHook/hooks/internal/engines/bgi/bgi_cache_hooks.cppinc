@@ -1,0 +1,168 @@
+static bool IsWritableRange(void* address, size_t length) {
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (!address || VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+    const DWORD protection = memory.Protect & 0xFF;
+    const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+        protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+    if (!writable) return false;
+    const uintptr_t value = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    return value <= regionEnd && length <= regionEnd - value;
+}
+
+static bool ClearCacheInstance(size_t layoutIndex, void* instance, LONG version) {
+    if (layoutIndex >= g_cacheLayouts.size() || !instance) return false;
+    const CacheLayout& layout = g_cacheLayouts[layoutIndex];
+    volatile LONG* count = reinterpret_cast<volatile LONG*>(reinterpret_cast<BYTE*>(instance) + layout.countOffset);
+    PVOID volatile* head = reinterpret_cast<PVOID volatile*>(reinterpret_cast<BYTE*>(instance) + layout.headOffset);
+    if (!IsWritableRange(const_cast<LONG*>(count), sizeof(*count)) ||
+        !IsWritableRange(const_cast<PVOID*>(head), sizeof(*head))) {
+        return false;
+    }
+
+    const LONG oldCount = InterlockedExchange(count, 0);
+    InterlockedExchangePointer(head, nullptr);
+    const LONG traceIndex = InterlockedIncrement(&g_cacheClearTraceCount);
+    if (traceIndex <= 16) {
+        Utils::Trace("[DEBUG][BGI] glyph cache invalidated layout=%zu instance=%p oldCount=%ld version=%ld",
+            layoutIndex, instance, oldCount, version);
+    }
+    return true;
+}
+
+static void RefreshCacheEpoch(size_t layoutIndex, void* instance) {
+    if (!Config::BgiClearGlyphCacheOnSwitch || layoutIndex >= g_cacheLayouts.size() || !instance) return;
+    const LONG currentVersion = Config::ConfigVersion;
+    CacheInstanceEpoch* selected = nullptr;
+    bool newlyClaimed = false;
+
+    for (size_t i = 0; i < kInstanceEpochSlots; ++i) {
+        CacheInstanceEpoch& slot = g_instanceEpochs[layoutIndex][i];
+        PVOID observed = InterlockedCompareExchangePointer(&slot.instance, nullptr, nullptr);
+        if (observed == instance) {
+            selected = &slot;
+            break;
+        }
+    }
+
+    if (!selected) {
+        std::lock_guard<std::mutex> lock(g_instanceEpochMutex);
+        CacheInstanceEpoch* emptySlot = nullptr;
+        for (size_t i = 0; i < kInstanceEpochSlots; ++i) {
+            CacheInstanceEpoch& slot = g_instanceEpochs[layoutIndex][i];
+            PVOID observed = InterlockedCompareExchangePointer(&slot.instance, nullptr, nullptr);
+            if (observed == instance) {
+                selected = &slot;
+                break;
+            }
+            if (!observed && !emptySlot) emptySlot = &slot;
+        }
+        if (!selected && emptySlot) {
+            InterlockedExchange(&emptySlot->version, g_installConfigVersion);
+            InterlockedExchangePointer(&emptySlot->instance, instance);
+            selected = emptySlot;
+            newlyClaimed = true;
+        }
+    }
+    if (!selected) return;
+
+    if (newlyClaimed) {
+        const LONG traceIndex = InterlockedIncrement(&g_cacheObserveTraceCount);
+        if (traceIndex <= 16) {
+            Utils::Trace("[DEBUG][BGI] glyph cache instance observed layout=%zu instance=%p version=%ld",
+                layoutIndex, instance, currentVersion);
+        }
+    }
+
+    LONG observedVersion = InterlockedCompareExchange(&selected->version, 0, 0);
+    if (newlyClaimed && currentVersion == g_installConfigVersion) return;
+    if (observedVersion == currentVersion) return;
+
+    const LONG updating = std::numeric_limits<LONG>::min();
+    if (observedVersion == updating ||
+        InterlockedCompareExchange(&selected->version, updating, observedVersion) != observedVersion) {
+        return;
+    }
+    ClearCacheInstance(layoutIndex, instance, currentVersion);
+    InterlockedExchange(&selected->version, currentVersion);
+}
+
+static void* DispatchCacheLookup(size_t layoutIndex, void* instance, void* output, unsigned int glyph) {
+    RefreshCacheEpoch(layoutIndex, instance);
+    if (layoutIndex >= g_cacheLayouts.size() || !g_cacheLayouts[layoutIndex].original) return nullptr;
+    return g_cacheLayouts[layoutIndex].original(instance, output, glyph);
+}
+
+#define DEFINE_BGI_CACHE_HOOK(index) \
+    static void* __fastcall BgiCacheHook##index(void* instance, void*, void* output, unsigned int glyph) { \
+        return DispatchCacheLookup(index, instance, output, glyph); \
+    }
+
+DEFINE_BGI_CACHE_HOOK(0)
+DEFINE_BGI_CACHE_HOOK(1)
+DEFINE_BGI_CACHE_HOOK(2)
+DEFINE_BGI_CACHE_HOOK(3)
+DEFINE_BGI_CACHE_HOOK(4)
+DEFINE_BGI_CACHE_HOOK(5)
+DEFINE_BGI_CACHE_HOOK(6)
+DEFINE_BGI_CACHE_HOOK(7)
+
+#undef DEFINE_BGI_CACHE_HOOK
+
+static PVOID const kCacheHooks[kMaxCacheLayouts] = {
+    reinterpret_cast<PVOID>(BgiCacheHook0),
+    reinterpret_cast<PVOID>(BgiCacheHook1),
+    reinterpret_cast<PVOID>(BgiCacheHook2),
+    reinterpret_cast<PVOID>(BgiCacheHook3),
+    reinterpret_cast<PVOID>(BgiCacheHook4),
+    reinterpret_cast<PVOID>(BgiCacheHook5),
+    reinterpret_cast<PVOID>(BgiCacheHook6),
+    reinterpret_cast<PVOID>(BgiCacheHook7),
+};
+
+static PVOID HookForImport(const char* name) {
+    if (strcmp(name, "CreateFontA") == 0) return reinterpret_cast<PVOID>(newCreateFontA);
+    if (strcmp(name, "CreateFontW") == 0) return reinterpret_cast<PVOID>(newCreateFontW);
+    if (strcmp(name, "CreateFontIndirectA") == 0) return reinterpret_cast<PVOID>(newCreateFontIndirectA);
+    if (strcmp(name, "CreateFontIndirectW") == 0) return reinterpret_cast<PVOID>(newCreateFontIndirectW);
+    if (strcmp(name, "CreateFontIndirectExA") == 0) return reinterpret_cast<PVOID>(newCreateFontIndirectExA);
+    if (strcmp(name, "CreateFontIndirectExW") == 0) return reinterpret_cast<PVOID>(newCreateFontIndirectExW);
+    if (strcmp(name, "TextOutA") == 0) return reinterpret_cast<PVOID>(newTextOutA);
+    if (strcmp(name, "TextOutW") == 0) return reinterpret_cast<PVOID>(newTextOutW);
+    if (strcmp(name, "ExtTextOutA") == 0) return reinterpret_cast<PVOID>(newExtTextOutA);
+    if (strcmp(name, "ExtTextOutW") == 0) return reinterpret_cast<PVOID>(newExtTextOutW);
+    if (strcmp(name, "SelectObject") == 0) return reinterpret_cast<PVOID>(newSelectObject);
+    if (strcmp(name, "GetObjectA") == 0) return reinterpret_cast<PVOID>(newGetObjectA);
+    if (strcmp(name, "GetObjectW") == 0) return reinterpret_cast<PVOID>(newGetObjectW);
+    if (strcmp(name, "EnumFontFamiliesExA") == 0) return reinterpret_cast<PVOID>(newEnumFontFamiliesExA);
+    if (strcmp(name, "EnumFontFamiliesExW") == 0) return reinterpret_cast<PVOID>(newEnumFontFamiliesExW);
+    if (strcmp(name, "GetGlyphOutlineA") == 0) return reinterpret_cast<PVOID>(newGetGlyphOutlineA);
+    if (strcmp(name, "GetGlyphOutlineW") == 0) return reinterpret_cast<PVOID>(newGetGlyphOutlineW);
+    if (strcmp(name, "GetTextExtentPointA") == 0) return reinterpret_cast<PVOID>(newGetTextExtentPointA);
+    if (strcmp(name, "GetTextExtentPointW") == 0) return reinterpret_cast<PVOID>(newGetTextExtentPointW);
+    if (strcmp(name, "GetTextExtentPoint32A") == 0) return reinterpret_cast<PVOID>(newGetTextExtentPoint32A);
+    if (strcmp(name, "GetTextExtentPoint32W") == 0) return reinterpret_cast<PVOID>(newGetTextExtentPoint32W);
+    return nullptr;
+}
+
+static bool PatchImportSlot(PVOID* slot, PVOID replacement) {
+    if (!slot || !replacement || *slot == replacement) return false;
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProtection)) return false;
+    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(slot), replacement);
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(*slot), oldProtection, &ignored);
+    return true;
+}
+
+static size_t PatchGdiImports(const ImportProfile& imports) {
+    size_t patched = 0;
+    for (const ImportSlot& import : imports.knownSlots) {
+        PVOID hook = HookForImport(import.name);
+        if (hook && PatchImportSlot(import.slot, hook)) ++patched;
+    }
+    return patched;
+}

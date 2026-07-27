@@ -1,0 +1,531 @@
+static bool LooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_engineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    bool hasUnityPlayer = EngineCommon::IsFile(
+        EngineCommon::BuildRootPath(L"UnityPlayer.dll"));
+    bool hasGameAssembly = EngineCommon::IsFile(
+        EngineCommon::BuildRootPath(L"GameAssembly.dll"));
+
+    // The native adapter must not depend on managed interop assemblies. Unity's
+    // own player/runtime pair is enough to enter the IL2CPP binding path; the
+    // exported API and class lookup below provide the final compatibility gate.
+    bool frameworkContract = EngineIdentityPolicy::ConfirmFrameworkContract(
+        hasUnityPlayer, hasGameAssembly);
+    bool detected = EngineIdentityPolicy::Confirm({
+        false, false, false, false, frameworkContract });
+    InterlockedExchange(&g_engineProbe, detected ? 1 : 0);
+    if (detected) {
+        Utils::Trace("[DEBUG][CatSystemUnity] engine detected unityPlayer=%d gameAssembly=%d renderer=TextMeshPro",
+            hasUnityPlayer ? 1 : 0, hasGameAssembly ? 1 : 0);
+    }
+    return detected;
+}
+
+template<typename T>
+static bool ResolveExport(HMODULE module, const char* name, T* output, bool required = true) {
+    if (!output) return false;
+    *output = reinterpret_cast<T>(GetProcAddress(module, name));
+    if (!*output && required)
+        Utils::Trace("[DEBUG][CatSystemUnity] missing GameAssembly export %s", name);
+    return *output != NULL || !required;
+}
+
+static bool ResolveApi() {
+    if (g_api.module) return true;
+    HMODULE module = GetModuleHandleW(L"GameAssembly.dll");
+    if (!module) return false;
+
+    Il2CppApi api = {};
+    api.module = module;
+    bool ok = true;
+    ok = ResolveExport(module, "il2cpp_domain_get", &api.domainGet) && ok;
+    ok = ResolveExport(module, "il2cpp_thread_current", &api.threadCurrent) && ok;
+    ok = ResolveExport(module, "il2cpp_thread_attach", &api.threadAttach) && ok;
+    ok = ResolveExport(module, "il2cpp_domain_get_assemblies", &api.domainGetAssemblies) && ok;
+    ok = ResolveExport(module, "il2cpp_domain_assembly_open", &api.domainAssemblyOpen) && ok;
+    ok = ResolveExport(module, "il2cpp_assembly_get_image", &api.assemblyGetImage) && ok;
+    ok = ResolveExport(module, "il2cpp_image_get_name", &api.imageGetName) && ok;
+    ok = ResolveExport(module, "il2cpp_class_from_name", &api.classFromName) && ok;
+    ok = ResolveExport(module, "il2cpp_class_get_parent", &api.classGetParent) && ok;
+    ok = ResolveExport(module, "il2cpp_class_get_type", &api.classGetType) && ok;
+    ok = ResolveExport(module, "il2cpp_type_get_object", &api.typeGetObject) && ok;
+    ok = ResolveExport(module, "il2cpp_class_get_method_from_name", &api.classGetMethodFromName) && ok;
+    ok = ResolveExport(module, "il2cpp_class_get_methods", &api.classGetMethods) && ok;
+    ok = ResolveExport(module, "il2cpp_class_get_fields", &api.classGetFields) && ok;
+    ok = ResolveExport(module, "il2cpp_method_get_name", &api.methodGetName) && ok;
+    ok = ResolveExport(module, "il2cpp_method_get_param_count", &api.methodGetParamCount) && ok;
+    ok = ResolveExport(module, "il2cpp_method_get_param", &api.methodGetParam) && ok;
+    ok = ResolveExport(module, "il2cpp_type_get_name", &api.typeGetName) && ok;
+    ok = ResolveExport(module, "il2cpp_free", &api.freeMemory) && ok;
+    ok = ResolveExport(module, "il2cpp_runtime_invoke", &api.runtimeInvoke) && ok;
+    ok = ResolveExport(module, "il2cpp_string_new_utf16", &api.stringNewUtf16) && ok;
+    ok = ResolveExport(module, "il2cpp_object_new", &api.objectNew) && ok;
+    ok = ResolveExport(module, "il2cpp_object_get_class", &api.objectGetClass) && ok;
+    ok = ResolveExport(module, "il2cpp_object_unbox", &api.objectUnbox) && ok;
+    ok = ResolveExport(module, "il2cpp_array_length", &api.arrayLength) && ok;
+    ok = ResolveExport(module, "il2cpp_array_new", &api.arrayNew) && ok;
+    ok = ResolveExport(module, "il2cpp_resolve_icall", &api.resolveIcall) && ok;
+    ok = ResolveExport(module, "il2cpp_field_get_name", &api.fieldGetName) && ok;
+    ok = ResolveExport(module, "il2cpp_field_get_type", &api.fieldGetType) && ok;
+    ok = ResolveExport(module, "il2cpp_field_get_value", &api.fieldGetValue) && ok;
+    ok = ResolveExport(module, "il2cpp_field_set_value", &api.fieldSetValue) && ok;
+    ok = ResolveExport(module, "il2cpp_gchandle_new", &api.gcHandleNew) && ok;
+    ok = ResolveExport(module, "il2cpp_gchandle_get_target", &api.gcHandleGetTarget) && ok;
+    ok = ResolveExport(module, "il2cpp_gchandle_free", &api.gcHandleFree) && ok;
+    ResolveExport(module, "il2cpp_gc_wbarrier_set_field", &api.gcWbarrierSetField, false);
+    ResolveExport(module, "il2cpp_format_exception", &api.formatException, false);
+    if (!ok) return false;
+
+    void* domain = api.domainGet();
+    if (!domain) return false;
+    if (!api.threadCurrent()) api.threadAttach(domain);
+    g_api = api;
+    Utils::Trace("[DEBUG][CatSystemUnity] IL2CPP API resolved GameAssembly=%p", module);
+    return true;
+}
+
+static void* RootedTarget(uint32_t handle, void* fallback) {
+    if (!handle || !g_api.gcHandleGetTarget) return fallback;
+    return g_api.gcHandleGetTarget(handle);
+}
+
+static void ReleaseManagedRoot(void** storage, uint32_t* handle) {
+    if (handle && *handle && g_api.gcHandleFree) g_api.gcHandleFree(*handle);
+    if (handle) *handle = 0;
+    if (storage) *storage = NULL;
+}
+
+static bool RootManagedObject(void* object, void** storage, uint32_t* handle,
+    const char* label) {
+    if (!object || !storage || !handle || !g_api.gcHandleNew) return false;
+    if (*handle && RootedTarget(*handle, *storage) == object) {
+        *storage = object;
+        return true;
+    }
+
+    uint32_t nextHandle = g_api.gcHandleNew(object, false);
+    if (!nextHandle) {
+        Utils::Trace("[DEBUG][CatSystemUnity] failed to root managed object label=%s object=%p",
+            label ? label : "<unknown>", object);
+        return false;
+    }
+    if (*handle) g_api.gcHandleFree(*handle);
+    *handle = nextHandle;
+    *storage = object;
+    return true;
+}
+
+static bool ImageNameEquals(const char* actual, const char* wanted) {
+    if (!actual || !wanted) return false;
+    if (_stricmp(actual, wanted) == 0) return true;
+
+    char actualBase[MAX_PATH] = {};
+    char wantedBase[MAX_PATH] = {};
+    strncpy_s(actualBase, actual, _TRUNCATE);
+    strncpy_s(wantedBase, wanted, _TRUNCATE);
+    char* actualExt = strrchr(actualBase, '.');
+    char* wantedExt = strrchr(wantedBase, '.');
+    if (actualExt && _stricmp(actualExt, ".dll") == 0) *actualExt = '\0';
+    if (wantedExt && _stricmp(wantedExt, ".dll") == 0) *wantedExt = '\0';
+    return _stricmp(actualBase, wantedBase) == 0;
+}
+
+static const void* FindImage(const char* name) {
+    void* domain = g_api.domainGet();
+    if (!domain) return NULL;
+
+    const void* assembly = g_api.domainAssemblyOpen(domain, name);
+    if (assembly) {
+        const void* image = g_api.assemblyGetImage(assembly);
+        if (image) return image;
+    }
+
+    size_t count = 0;
+    const void** assemblies = g_api.domainGetAssemblies(domain, &count);
+    for (size_t i = 0; assemblies && i < count; ++i) {
+        const void* image = g_api.assemblyGetImage(assemblies[i]);
+        if (image && ImageNameEquals(g_api.imageGetName(image), name)) return image;
+    }
+    return NULL;
+}
+
+static const void* FindMethod(void* klass, const char* name, int paramCount,
+    const char* const* paramTypes = NULL) {
+    if (!klass || !name) return NULL;
+    if (!paramTypes) return g_api.classGetMethodFromName(klass, name, paramCount);
+
+    void* iterator = NULL;
+    const void* method = NULL;
+    while ((method = g_api.classGetMethods(klass, &iterator)) != NULL) {
+        const char* methodName = g_api.methodGetName(method);
+        if (!methodName || strcmp(methodName, name) != 0 ||
+            (int)g_api.methodGetParamCount(method) != paramCount) {
+            continue;
+        }
+
+        bool matches = true;
+        for (int i = 0; i < paramCount; ++i) {
+            const void* parameterType = g_api.methodGetParam(method, (unsigned int)i);
+            char* actualType = parameterType ? g_api.typeGetName(parameterType) : NULL;
+            if (!actualType || _stricmp(actualType, paramTypes[i]) != 0) matches = false;
+            if (actualType) g_api.freeMemory(actualType);
+            if (!matches) break;
+        }
+        if (matches) return method;
+    }
+    return NULL;
+}
+
+static const void* FindStringIntMethod(void* klass, const char* name) {
+    if (!klass || !name) return NULL;
+    void* iterator = NULL;
+    const void* method = NULL;
+    while ((method = g_api.classGetMethods(klass, &iterator)) != NULL) {
+        const char* methodName = g_api.methodGetName(method);
+        if (!methodName || strcmp(methodName, name) != 0 ||
+            g_api.methodGetParamCount(method) != 2) {
+            continue;
+        }
+
+        const void* firstParameter = g_api.methodGetParam(method, 0);
+        const void* secondParameter = g_api.methodGetParam(method, 1);
+        char* firstType = firstParameter ? g_api.typeGetName(firstParameter) : NULL;
+        char* secondType = secondParameter ? g_api.typeGetName(secondParameter) : NULL;
+        std::string firstLower = firstType ? firstType : "";
+        std::string secondLower = secondType ? secondType : "";
+        std::transform(firstLower.begin(), firstLower.end(), firstLower.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        std::transform(secondLower.begin(), secondLower.end(), secondLower.begin(),
+            [](unsigned char c) { return (char)std::tolower(c); });
+        bool firstIsArray = firstLower.find("[]") != std::string::npos ||
+            firstLower.find("array") != std::string::npos;
+        bool firstIsScalarString = !firstIsArray &&
+            (firstLower.find("string") != std::string::npos ||
+             firstLower.find("il2cppstring") != std::string::npos);
+        bool secondIsInt32 = secondLower.find("int32") != std::string::npos ||
+            secondLower == "int" || secondLower == "system.int";
+        if (firstIsScalarString && secondIsInt32) {
+            Utils::Trace("[DEBUG][CatSystemUnity] selected runtime method %s(%s, %s)",
+                name, firstType, secondType);
+            if (firstType) g_api.freeMemory(firstType);
+            if (secondType) g_api.freeMemory(secondType);
+            return method;
+        }
+        if (firstType) g_api.freeMemory(firstType);
+        if (secondType) g_api.freeMemory(secondType);
+    }
+    return NULL;
+}
+
+static const void* FindMethodInHierarchy(void* klass, const char* name, int paramCount) {
+    for (void* current = klass; current; current = g_api.classGetParent(current)) {
+        const void* method = g_api.classGetMethodFromName(current, name, paramCount);
+        if (method) return method;
+    }
+    return NULL;
+}
+
+static const void* FindReferenceFieldInHierarchy(void* klass, const char* wantedType) {
+    for (void* current = klass; current; current = g_api.classGetParent(current)) {
+        void* iterator = NULL;
+        const void* field = NULL;
+        while ((field = g_api.classGetFields(current, &iterator)) != NULL) {
+            char* typeName = g_api.typeGetName(g_api.fieldGetType(field));
+            bool typeMatches = typeName && _stricmp(typeName, wantedType) == 0;
+            if (typeName) g_api.freeMemory(typeName);
+            if (!typeMatches) continue;
+
+            const char* fieldName = g_api.fieldGetName(field);
+            if (fieldName && (_stricmp(fieldName, "material") == 0 ||
+                _stricmp(fieldName, "m_material") == 0)) {
+                return field;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void TraceMethodCandidates(void* klass, const char* name, int paramCount) {
+    if (!klass || !name || InterlockedCompareExchange(&g_bindingDiagnosticsLogged, 1, 0) != 0)
+        return;
+
+    bool foundCandidate = false;
+    void* iterator = NULL;
+    const void* method = NULL;
+    while ((method = g_api.classGetMethods(klass, &iterator)) != NULL) {
+        const char* methodName = g_api.methodGetName(method);
+        unsigned int count = g_api.methodGetParamCount(method);
+        if (!methodName || strcmp(methodName, name) != 0 || (int)count != paramCount)
+            continue;
+        foundCandidate = true;
+
+        char signature[1024] = {};
+        strcpy_s(signature, name);
+        strcat_s(signature, "(");
+        for (unsigned int i = 0; i < count; ++i) {
+            char* typeName = g_api.typeGetName(g_api.methodGetParam(method, i));
+            if (i) strcat_s(signature, ", ");
+            strcat_s(signature, typeName ? typeName : "<null>");
+            if (typeName) g_api.freeMemory(typeName);
+        }
+        strcat_s(signature, ")");
+        Utils::Trace("[DEBUG][CatSystemUnity] runtime candidate %s", signature);
+    }
+
+    if (foundCandidate) return;
+    iterator = NULL;
+    while ((method = g_api.classGetMethods(klass, &iterator)) != NULL) {
+        const char* methodName = g_api.methodGetName(method);
+        if (!methodName ||
+            (strstr(methodName, "Create") == NULL && strcmp(methodName, ".ctor") != 0)) {
+            continue;
+        }
+        Utils::Trace("[DEBUG][CatSystemUnity] retained Font method name=%s params=%u",
+            methodName, g_api.methodGetParamCount(method));
+    }
+}
+
+static bool ResolveBindings() {
+    if (g_bindings.tmpTextTypeObject) return true;
+    if (!ResolveApi()) return false;
+
+    const void* coreImage = FindImage("UnityEngine.CoreModule.dll");
+    const void* textRenderingImage = FindImage("UnityEngine.TextRenderingModule.dll");
+    const void* tmpImage = FindImage("Unity.TextMeshPro.dll");
+    const void* corlibImage = FindImage("mscorlib.dll");
+    if (!corlibImage) corlibImage = FindImage("System.Private.CoreLib.dll");
+    if (!corlibImage) corlibImage = FindImage("netstandard.dll");
+    if (!coreImage || !textRenderingImage || !tmpImage || !corlibImage) return false;
+
+    RuntimeBindings bindings = {};
+    bindings.fontClass = g_api.classFromName(textRenderingImage, "UnityEngine", "Font");
+    bindings.stringClass = g_api.classFromName(corlibImage, "System", "String");
+    bindings.resourcesClass = g_api.classFromName(coreImage, "UnityEngine", "Resources");
+    bindings.materialClass = g_api.classFromName(coreImage, "UnityEngine", "Material");
+    bindings.tmpAssetClass = g_api.classFromName(tmpImage, "TMPro", "TMP_Asset");
+    bindings.tmpFontAssetClass = g_api.classFromName(tmpImage, "TMPro", "TMP_FontAsset");
+    bindings.tmpTextClass = g_api.classFromName(tmpImage, "TMPro", "TMP_Text");
+    bindings.tmpSettingsClass = g_api.classFromName(tmpImage, "TMPro", "TMP_Settings");
+    if (!bindings.fontClass || !bindings.resourcesClass ||
+        !bindings.materialClass || !bindings.tmpAssetClass || !bindings.tmpFontAssetClass ||
+        !bindings.tmpTextClass || !bindings.tmpSettingsClass) {
+        return false;
+    }
+
+    static const char* createFontParams[] = { "System.String", "System.Int32" };
+    static const char* createTmpParams[] = { "UnityEngine.Font" };
+    static const char* createTmpDetailedParams[] = {
+        "UnityEngine.Font", "System.Int32", "System.Int32",
+        "UnityEngine.TextCore.LowLevel.GlyphRenderMode", "System.Int32",
+        "System.Int32", "TMPro.AtlasPopulationMode", "System.Boolean"
+    };
+    static const char* findObjectsParams[] = { "System.Type" };
+    static const char* materialCopyParams[] = { "UnityEngine.Material" };
+    bindings.createDynamicFont = FindMethod(bindings.fontClass,
+        "CreateDynamicFontFromOSFont", 2, createFontParams);
+    if (!bindings.createDynamicFont) {
+        bindings.createDynamicFont = FindStringIntMethod(bindings.fontClass,
+            "CreateDynamicFontFromOSFont");
+    }
+    if (g_api.resolveIcall && g_api.arrayNew && bindings.stringClass) {
+        static const char* dynamicFontIcallNames[] = {
+            "UnityEngine.Font::Internal_CreateDynamicFont",
+            "UnityEngine.Font::Internal_CreateDynamicFont(UnityEngine.Font,System.String[],System.Int32)"
+        };
+        for (const char* icallName : dynamicFontIcallNames) {
+            void* pointer = g_api.resolveIcall(icallName);
+            if (pointer) {
+                bindings.internalCreateDynamicFont =
+                    reinterpret_cast<pInternalCreateDynamicFont>(pointer);
+                Utils::Trace("[DEBUG][CatSystemUnity] resolved dynamic font icall name=%s pointer=%p",
+                    icallName, pointer);
+                break;
+            }
+        }
+        bindings.internalCreateFontFromPath =
+            reinterpret_cast<pInternalCreateFontFromPath>(
+                g_api.resolveIcall("UnityEngine.Font::Internal_CreateFontFromPath"));
+        bindings.getFontDynamic = reinterpret_cast<pFontGetDynamic>(
+            g_api.resolveIcall("UnityEngine.Font::get_dynamic"));
+    }
+    bindings.createTmpFontAsset = FindMethod(bindings.tmpFontAssetClass,
+        "CreateFontAsset", 1, createTmpParams);
+    bindings.createTmpFontAssetDetailed = FindMethod(bindings.tmpFontAssetClass,
+        "CreateFontAsset", 8, createTmpDetailedParams);
+    if (!bindings.createTmpFontAssetDetailed) {
+        bindings.createTmpFontAssetDetailed = g_api.classGetMethodFromName(
+            bindings.tmpFontAssetClass, "CreateFontAsset", 8);
+    }
+    bindings.getAtlasTexture = FindMethod(bindings.tmpFontAssetClass,
+        "get_atlasTexture", 0);
+    bindings.getAssetMaterial = FindMethod(bindings.tmpAssetClass,
+        "get_material", 0);
+    bindings.setAssetMaterial = FindMethod(bindings.tmpAssetClass,
+        "set_material", 1);
+    bindings.assetMaterialField = FindReferenceFieldInHierarchy(
+        bindings.tmpFontAssetClass, "UnityEngine.Material");
+    bindings.materialCopyConstructor = FindMethod(bindings.materialClass,
+        ".ctor", 1, materialCopyParams);
+    bindings.getMaterialMainTexture = FindMethod(bindings.materialClass,
+        "get_mainTexture", 0);
+    bindings.setMaterialMainTexture = FindMethod(bindings.materialClass,
+        "set_mainTexture", 1);
+    bindings.getMaterialShader = FindMethod(bindings.materialClass,
+        "get_shader", 0);
+    bindings.setMultiAtlasEnabled = FindMethod(bindings.tmpFontAssetClass,
+        "set_isMultiAtlasTexturesEnabled", 1);
+    bindings.getAssetFallbacks = FindMethod(bindings.tmpFontAssetClass,
+        "get_fallbackFontAssetTable", 0);
+    bindings.findAllObjects = FindMethod(bindings.resourcesClass,
+        "FindObjectsOfTypeAll", 1, findObjectsParams);
+    bindings.getTextFont = FindMethod(bindings.tmpTextClass, "get_font", 0);
+    bindings.setTextFont = FindMethod(bindings.tmpTextClass, "set_font", 1);
+    bindings.setTextSharedMaterial = FindMethod(
+        bindings.tmpTextClass, "set_fontSharedMaterial", 1);
+    bindings.forceMeshUpdate = FindMethod(bindings.tmpTextClass, "ForceMeshUpdate", 2);
+    bindings.getGlobalFallbacks = FindMethod(bindings.tmpSettingsClass,
+        "get_fallbackFontAssets", 0);
+    const void* tmpTextType = g_api.classGetType(bindings.tmpTextClass);
+    bindings.tmpTextTypeObject = tmpTextType ? g_api.typeGetObject(tmpTextType) : NULL;
+    const void* tmpFontAssetType = g_api.classGetType(bindings.tmpFontAssetClass);
+    bindings.tmpFontAssetTypeObject = tmpFontAssetType
+        ? g_api.typeGetObject(tmpFontAssetType)
+        : NULL;
+
+    bool hasTmpFontFactory = bindings.createTmpFontAsset ||
+        bindings.createTmpFontAssetDetailed;
+    bool hasAssetMaterial = bindings.getAssetMaterial || bindings.assetMaterialField;
+    bool hasMaterialSupport = hasAssetMaterial && bindings.getAtlasTexture &&
+        bindings.getMaterialMainTexture && bindings.setMaterialMainTexture &&
+        bindings.getMaterialShader && bindings.materialCopyConstructor &&
+        (bindings.setAssetMaterial || bindings.assetMaterialField);
+    bool hasUnityFontFactory = bindings.createDynamicFont ||
+        bindings.internalCreateFontFromPath ||
+        (bindings.internalCreateDynamicFont && bindings.getFontDynamic &&
+         bindings.stringClass && g_api.arrayNew);
+    if (!hasUnityFontFactory || !hasTmpFontFactory || !hasMaterialSupport ||
+        !bindings.setMultiAtlasEnabled || !bindings.getAssetFallbacks ||
+        !bindings.findAllObjects || !bindings.getTextFont ||
+        !bindings.setTextFont || !bindings.setTextSharedMaterial ||
+        !bindings.forceMeshUpdate || !bindings.getGlobalFallbacks ||
+        !bindings.tmpTextTypeObject) {
+        Utils::Trace("[DEBUG][CatSystemUnity] IL2CPP binding failed dynamicFont=%d dynamicFontIcall=%d pathIcall=%d getDynamic=%d stringClass=%d tmpAsset=%d tmpAssetDetailed=%d materialSupport=%d multiAtlas=%d assetFallback=%d findAll=%d getFont=%d setFont=%d setMaterial=%d forceMesh=%d globalFallback=%d type=%d",
+            bindings.createDynamicFont ? 1 : 0, bindings.internalCreateDynamicFont ? 1 : 0,
+            bindings.internalCreateFontFromPath ? 1 : 0,
+            bindings.getFontDynamic ? 1 : 0, bindings.stringClass ? 1 : 0,
+            bindings.createTmpFontAsset ? 1 : 0,
+            bindings.createTmpFontAssetDetailed ? 1 : 0, hasMaterialSupport ? 1 : 0,
+            bindings.setMultiAtlasEnabled ? 1 : 0, bindings.getAssetFallbacks ? 1 : 0,
+            bindings.findAllObjects ? 1 : 0, bindings.getTextFont ? 1 : 0,
+            bindings.setTextFont ? 1 : 0, bindings.setTextSharedMaterial ? 1 : 0,
+            bindings.forceMeshUpdate ? 1 : 0,
+            bindings.getGlobalFallbacks ? 1 : 0, bindings.tmpTextTypeObject ? 1 : 0);
+        if (!hasUnityFontFactory)
+            TraceMethodCandidates(bindings.fontClass, "CreateDynamicFontFromOSFont", 2);
+        if (!hasTmpFontFactory)
+            TraceMethodCandidates(bindings.tmpFontAssetClass, "CreateFontAsset", 8);
+        return false;
+    }
+
+    if (!RootManagedObject(bindings.tmpTextTypeObject,
+        &bindings.tmpTextTypeObject, &bindings.tmpTextTypeHandle, "TMP_Text System.Type")) {
+        return false;
+    }
+    if (!RootManagedObject(bindings.tmpFontAssetTypeObject,
+        &bindings.tmpFontAssetTypeObject, &bindings.tmpFontAssetTypeHandle,
+        "TMP_FontAsset System.Type")) {
+        ReleaseManagedRoot(&bindings.tmpTextTypeObject, &bindings.tmpTextTypeHandle);
+        return false;
+    }
+
+    g_bindings = bindings;
+    Utils::Trace("[DEBUG][CatSystemUnity] TextMeshPro bindings resolved dynamicFont=%d dynamicFontIcall=%d pathIcall=%d getDynamic=%d tmpFactory=%d tmpFactoryDetailed=%d",
+        bindings.createDynamicFont ? 1 : 0, bindings.internalCreateDynamicFont ? 1 : 0,
+        bindings.internalCreateFontFromPath ? 1 : 0,
+        bindings.getFontDynamic ? 1 : 0,
+        bindings.createTmpFontAsset ? 1 : 0,
+        bindings.createTmpFontAssetDetailed ? 1 : 0);
+    return true;
+}
+
+static bool Invoke(const void* method, void* object, void** params,
+    void** result, const char* label) {
+    if (result) *result = NULL;
+    if (!method) return false;
+    void* exception = NULL;
+    void* value = g_api.runtimeInvoke(method, object, params, &exception);
+    if (exception) {
+        char message[1024] = {};
+        if (g_api.formatException) g_api.formatException(exception, message, sizeof(message));
+        Utils::Trace("[DEBUG][CatSystemUnity] invoke failed method=%s exception='%s'",
+            label ? label : "<unknown>", message[0] ? message : "<unavailable>");
+        return false;
+    }
+    if (result) *result = value;
+    return true;
+}
+
+static bool GetManagedObjectArray(void* result, Il2CppArrayLayout** array,
+    size_t* count, const char* label) {
+    if (array) *array = NULL;
+    if (count) *count = 0;
+    if (!result || !array || !count) return false;
+
+    Il2CppArrayLayout* candidate = reinterpret_cast<Il2CppArrayLayout*>(result);
+    size_t apiLength = g_api.arrayLength(candidate);
+    bool boundsValid = !candidate->bounds ||
+        (candidate->bounds->lowerBound == 0 && candidate->bounds->length == apiLength);
+    if (apiLength != candidate->maxLength || !boundsValid || apiLength > 1000000) {
+        Utils::Trace("[DEBUG][CatSystemUnity] invalid managed array label=%s apiLength=%llu maxLength=%llu bounds=%p",
+            label ? label : "<unknown>", (unsigned long long)apiLength,
+            (unsigned long long)candidate->maxLength, candidate->bounds);
+        return false;
+    }
+    *array = candidate;
+    *count = apiLength;
+    return true;
+}
+
+static bool ResolveListMethods(void* list) {
+    if (!list) return false;
+    void* listClass = g_api.objectGetClass(list);
+    if (!listClass) return false;
+    if (listClass == g_cachedListClass && g_listAdd) return true;
+
+    g_cachedListClass = listClass;
+    g_listContains = g_api.classGetMethodFromName(listClass, "Contains", 1);
+    g_listAdd = g_api.classGetMethodFromName(listClass, "Add", 1);
+    return g_listAdd != NULL;
+}
+
+static bool AddUniqueFallback(void* list, void* fontAsset, bool* added = NULL) {
+    if (added) *added = false;
+    if (!list || !fontAsset || !ResolveListMethods(list)) return false;
+    void* parameters[1] = { fontAsset };
+    if (g_listContains) {
+        void* boxed = NULL;
+        if (Invoke(g_listContains, list, parameters, &boxed, "List.Contains") && boxed) {
+            bool* contains = reinterpret_cast<bool*>(g_api.objectUnbox(boxed));
+            if (contains && *contains) return true;
+        }
+    }
+    bool succeeded = Invoke(g_listAdd, list, parameters, NULL, "List.Add");
+    if (succeeded && added) *added = true;
+    return succeeded;
+}
+
+static bool IsReplacementEnabled() {
+    return !Utils::IsShuttingDown() && Config::EnableCatSystemUnityHook && Config::EnableFontHook &&
+        Config::EnableFaceNameReplace &&
+        (Config::ForcedFontNameW[0] != L'\0' || Config::ForcedFontNameA[0] != '\0');
+}
+
+static bool TraceFontCreateFailure(LONG version, const char* stage) {
+    if (InterlockedExchange(&g_lastDetailedFailureVersion, version) != version) {
+        Utils::Trace("[DEBUG][CatSystemUnity] font creation failed version=%ld stage=%s face='%s'",
+            version, stage ? stage : "<unknown>",
+            EngineCommon::WideToUtf8(Config::ForcedFontNameW).c_str());
+    }
+    return false;
+}

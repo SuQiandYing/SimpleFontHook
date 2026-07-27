@@ -1,0 +1,70 @@
+// Shared TyranoScript state and path/text helpers.
+
+static volatile LONG g_tyranoEngineProbe = -1;
+static volatile LONG g_tyranoTraceCount = 0;
+static std::mutex g_tyranoFontBytesMutex;
+static LONG g_tyranoFontBytesVersion = LONG_MIN;
+static std::wstring g_tyranoFontBytesFace;
+static bool g_tyranoFontBytesAttempted = false;
+static std::vector<BYTE> g_tyranoFontBytes;
+static bool TyranoReplacementEnabled();
+
+struct TyranoAsarEntry {
+    ULONGLONG absoluteOffset;
+    ULONGLONG size;
+    bool unpacked;
+};
+
+static std::mutex g_tyranoAsarMutex;
+static bool g_tyranoAsarIndexAttempted = false;
+static std::wstring g_tyranoAsarIndexPath;
+static ULONGLONG g_tyranoAsarIndexFileSize = 0;
+static ULONGLONG g_tyranoAsarDataOffset = 0;
+static DWORD g_tyranoAsarLastValidationTick = 0;
+static std::unordered_map<std::wstring, TyranoAsarEntry> g_tyranoAsarEntries;
+
+static void TyranoTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_tyranoTraceCount);
+    if (hit > 512) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][Tyrano] %s", message);
+}
+
+static std::wstring TyranoBuildRootPath(const wchar_t* relativePath) {
+    wchar_t path[MAX_PATH] = {};
+    wcscpy_s(path, EngineCommon::GameRoot().c_str());
+    PathAppendW(path, relativePath);
+    return path;
+}
+
+static std::wstring TyranoNormalizeRelativePath(std::wstring path) {
+    while (!path.empty() && (path.front() == L'\\' || path.front() == L'/')) path.erase(path.begin());
+    for (wchar_t& ch : path) {
+        if (ch == L'/') ch = L'\\';
+        ch = (wchar_t)towlower(ch);
+    }
+    return path;
+}
+
+static std::wstring TyranoUtf8ToWide(const std::string& value) {
+    if (value.empty()) return L"";
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        value.data(), (int)value.size(), NULL, 0);
+    if (count <= 0) {
+        count = MultiByteToWideChar(CP_ACP, 0, value.data(), (int)value.size(), NULL, 0);
+        if (count <= 0) return L"";
+        std::vector<wchar_t> buffer((size_t)count + 1, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, value.data(), (int)value.size(), buffer.data(), count);
+        return std::wstring(buffer.data(), (size_t)count);
+    }
+    std::vector<wchar_t> buffer((size_t)count + 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        value.data(), (int)value.size(), buffer.data(), count);
+    return std::wstring(buffer.data(), (size_t)count);
+}

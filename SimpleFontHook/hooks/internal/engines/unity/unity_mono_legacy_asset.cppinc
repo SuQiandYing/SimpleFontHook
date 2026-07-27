@@ -1,0 +1,325 @@
+static bool MonoInitializeLegacyKerningInfo(void* asset) {
+    if (!asset) return false;
+    bool hasKerningClass = g_monoBindings.kerningTableClass != NULL;
+    bool hasKerningSetter = g_monoBindings.addKerningInfo != NULL;
+    if (!hasKerningClass && !hasKerningSetter) return true;
+    if (!hasKerningClass || !hasKerningSetter) {
+        Utils::Trace("[DEBUG][UnityMono] legacy TMP kerning API incomplete class=%d setter=%d",
+            hasKerningClass ? 1 : 0, hasKerningSetter ? 1 : 0);
+        return false;
+    }
+
+    void* kerningInfo = g_monoApi.objectNew(g_monoApi.domain,
+        g_monoBindings.kerningTableClass);
+    uint32_t kerningRoot = kerningInfo
+        ? g_monoApi.gcHandleNew(kerningInfo, 1) : 0;
+    kerningInfo = kerningRoot
+        ? g_monoApi.gcHandleGetTarget(kerningRoot) : NULL;
+    if (!kerningInfo) {
+        if (kerningRoot) MonoFreeHandle(kerningRoot);
+        return false;
+    }
+    g_monoApi.runtimeObjectInit(kerningInfo);
+    void* params[1] = { kerningInfo };
+    bool initialized = MonoInvoke(g_monoBindings.addKerningInfo, asset,
+        params, NULL, "TMP_FontAsset.AddKerningInfo");
+    MonoFreeHandle(kerningRoot);
+    if (!initialized) {
+        Utils::Trace("[DEBUG][UnityMono] legacy TMP kerning table initialization failed asset=%p",
+            asset);
+    }
+    return initialized;
+}
+
+static void MonoTraceLegacyDefinitionState(void* asset, void* expectedMaterial) {
+    if (!asset) return;
+    void* fontInfo = MonoGetObjectField(asset,
+        MonoFindField(g_monoBindings.tmpFontAssetClass, "m_fontInfo"));
+    void* glyphs = MonoGetObjectField(asset,
+        MonoFindField(g_monoBindings.tmpFontAssetClass, "m_glyphInfoList"));
+    void* material = MonoGetObjectField(asset,
+        g_monoBindings.assetMaterialField);
+    if (!material) MonoGetAssetMaterial(asset, &material);
+    void* kerningInfo = MonoGetObjectField(asset,
+        MonoFindField(g_monoBindings.tmpFontAssetClass, "m_kerningInfo"));
+    void* kerningPairs = kerningInfo
+        ? MonoGetObjectField(kerningInfo,
+            MonoFindField(g_monoBindings.kerningTableClass, "kerningPairs"))
+        : NULL;
+    bool ready = fontInfo && glyphs && material && kerningInfo && kerningPairs;
+    Utils::Trace("[DEBUG][UnityMono] legacy TMP definition state ready=%d fontInfo=%p glyphs=%p material=%p expectedMaterial=%p materialGetter=%p materialSetter=%p materialField=%p kerning=%p pairs=%p",
+        ready ? 1 : 0, fontInfo, glyphs, material, expectedMaterial,
+        g_monoBindings.getAssetMaterial, g_monoBindings.setAssetMaterial,
+        g_monoBindings.assetMaterialField, kerningInfo, kerningPairs);
+}
+
+static void* MonoCreateLegacyFontAssetObject() {
+    void* asset = NULL;
+    if (g_monoBindings.scriptableCreateInstance &&
+        g_monoBindings.tmpFontAssetTypeObject) {
+        void* params[1] = { g_monoBindings.tmpFontAssetTypeObject };
+        MonoInvoke(g_monoBindings.scriptableCreateInstance, NULL, params,
+            &asset, "ScriptableObject.CreateInstance(TMP_FontAsset)");
+    }
+    if (asset) return asset;
+
+    // Preserve compatibility with runtimes where CreateInstance(Type) cannot
+    // be resolved. Unity versions that enforce ScriptableObject construction
+    // will reject this fallback through the managed exception path.
+    asset = g_monoApi.objectNew(g_monoApi.domain,
+        g_monoBindings.tmpFontAssetClass);
+    if (asset) g_monoApi.runtimeObjectInit(asset);
+    return asset;
+}
+
+static bool MonoCreateLegacyFontAsset(const std::wstring& characters,
+    void** outputAsset, void** outputMaterial) {
+    if (outputAsset) *outputAsset = NULL;
+    if (outputMaterial) *outputMaterial = NULL;
+    if (!outputAsset || !outputMaterial || characters.empty() ||
+        !g_monoBindings.legacyTmp || !g_monoSourceFont) return false;
+
+    void* managedCharacters = MonoString(characters);
+    if (!managedCharacters || !g_monoBindings.fontRequestCharacters) return false;
+    int sampleSize = 48;
+    void* requestParams[2] = { managedCharacters, &sampleSize };
+    if (!MonoInvoke(g_monoBindings.fontRequestCharacters, g_monoSourceFont,
+        requestParams, NULL, "Font.RequestCharactersInTexture")) return false;
+
+    void* characterArray = NULL;
+    if (!MonoInvoke(g_monoBindings.fontGetCharacterInfo, g_monoSourceFont,
+        NULL, &characterArray, "Font.get_characterInfo") || !characterArray) return false;
+    void* texture = NULL;
+    void* sourceMaterial = NULL;
+    if (!MonoGetFontTexture(g_monoSourceFont, &texture, &sourceMaterial)) return false;
+    int textureWidth = 0;
+    int textureHeight = 0;
+    if (!MonoGetTextureSize(texture, &textureWidth, &textureHeight)) return false;
+    std::vector<MonoGlyphMetric> metrics;
+    bool repackAtlas = false;
+    int atlasWidth = textureWidth;
+    int atlasHeight = textureHeight;
+    if (!MonoCollectGlyphMetrics(characterArray, textureWidth, textureHeight,
+        metrics, &repackAtlas, &atlasWidth, &atlasHeight))
+        return false;
+
+    void* asset = MonoCreateLegacyFontAssetObject();
+    if (!asset) return false;
+    uint32_t assetRoot = g_monoApi.gcHandleNew(asset, 1);
+    if (!assetRoot) return false;
+
+    void* atlasTexture = texture;
+    uint32_t atlasTextureRoot = 0;
+    bool gdiAtlas = false;
+    MonoLegacyFaceMetrics gdiFaceMetrics = {};
+    if (repackAtlas && !MonoCreateRepackedTexture(texture, textureWidth,
+        textureHeight, metrics, atlasWidth, atlasHeight,
+        &atlasTexture, &atlasTextureRoot)) {
+        Utils::Trace("[DEBUG][UnityMono] legacy TMP atlas repack unavailable source=%p sourceSize=%dx%d outputSize=%dx%d",
+            texture, textureWidth, textureHeight, atlasWidth, atlasHeight);
+        if (!MonoCreateGdiLegacyAtlas(characters, sampleSize, texture, metrics,
+            &atlasWidth, &atlasHeight, &gdiFaceMetrics, &atlasTexture,
+            &atlasTextureRoot)) {
+            Utils::Trace("[DEBUG][UnityMono] legacy TMP GDI atlas fallback failed face='%s'",
+                MonoWideToUtf8(Config::ForcedFontNameW).c_str());
+            MonoFreeHandle(assetRoot);
+            return false;
+        }
+        gdiAtlas = true;
+    }
+
+    if (g_monoBindings.fontAssetTypeField)
+        MonoSetIntField(asset, g_monoBindings.fontAssetTypeField, 2); // Bitmap.
+    bool atlasAssigned = g_monoBindings.fontAtlasField &&
+        MonoSetObjectField(asset, g_monoBindings.fontAtlasField, atlasTexture);
+    if (atlasTextureRoot) MonoFreeHandle(atlasTextureRoot);
+    if (!atlasAssigned) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+
+    void* faceInfo = g_monoApi.objectNew(g_monoApi.domain, g_monoBindings.faceInfoClass);
+    if (!faceInfo) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    g_monoApi.runtimeObjectInit(faceInfo);
+    uint32_t faceInfoRoot = g_monoApi.gcHandleNew(faceInfo, 1);
+    if (!faceInfoRoot) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    void* faceName = MonoString(Config::ForcedFontNameW);
+    uint32_t faceNameRoot = faceName ? g_monoApi.gcHandleNew(faceName, 1) : 0;
+    faceName = faceNameRoot ? g_monoApi.gcHandleGetTarget(faceNameRoot) : NULL;
+    if (!faceName) {
+        MonoFreeHandle(faceInfoRoot);
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    int ascent = sampleSize;
+    int descent = 0;
+    int lineHeight = sampleSize;
+    void* boxedValue = NULL;
+    if (gdiAtlas) {
+        ascent = gdiFaceMetrics.ascent;
+        descent = gdiFaceMetrics.descent;
+        lineHeight = gdiFaceMetrics.lineHeight;
+    } else {
+        if (g_monoBindings.fontGetAscent && MonoInvoke(g_monoBindings.fontGetAscent,
+            g_monoSourceFont, NULL, &boxedValue, "Font.get_ascent"))
+            MonoReadInt(boxedValue, &ascent);
+        if (g_monoBindings.fontGetLineHeight && MonoInvoke(
+            g_monoBindings.fontGetLineHeight, g_monoSourceFont, NULL,
+            &boxedValue, "Font.get_lineHeight"))
+            MonoReadInt(boxedValue, &lineHeight);
+        descent = ascent - lineHeight;
+    }
+    bool faceNameSet = MonoSetObjectField(faceInfo,
+        g_monoApi.classGetFieldFromName(g_monoBindings.faceInfoClass, "Name"),
+        faceName);
+    MonoFreeHandle(faceNameRoot);
+    if (!faceNameSet) {
+        MonoFreeHandle(faceInfoRoot);
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "PointSize"), (float)sampleSize);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "Scale"), 1.0f);
+    MonoSetIntField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "CharacterCount"), (int)metrics.size());
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "LineHeight"), (float)lineHeight);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "Baseline"), 0.0f);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "Ascender"), (float)ascent);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "CapHeight"), (float)ascent);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "Descender"), (float)descent);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "AtlasWidth"), (float)atlasWidth);
+    MonoSetFloatField(faceInfo, g_monoApi.classGetFieldFromName(
+        g_monoBindings.faceInfoClass, "AtlasHeight"), (float)atlasHeight);
+    if (g_monoBindings.addFaceInfo) {
+        void* faceParams[1] = { faceInfo };
+        if (!MonoInvoke(g_monoBindings.addFaceInfo, asset, faceParams,
+            NULL, "TMP_FontAsset.AddFaceInfo")) {
+            if (faceInfoRoot) MonoFreeHandle(faceInfoRoot);
+            MonoFreeHandle(assetRoot);
+            return false;
+        }
+    }
+    if (faceInfoRoot) MonoFreeHandle(faceInfoRoot);
+
+    void* glyphArray = g_monoApi.arrayNew(g_monoApi.domain,
+        g_monoBindings.tmpGlyphClass, metrics.size());
+    if (!glyphArray) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    uint32_t glyphArrayRoot = g_monoApi.gcHandleNew(glyphArray, 1);
+    if (!glyphArrayRoot) {
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    void* glyphIdField = MonoFindField(g_monoBindings.tmpGlyphClass, "id");
+    void* glyphXField = MonoFindField(g_monoBindings.tmpGlyphClass, "x");
+    void* glyphYField = MonoFindField(g_monoBindings.tmpGlyphClass, "y");
+    void* glyphWidthField = MonoFindField(g_monoBindings.tmpGlyphClass, "width");
+    void* glyphHeightField = MonoFindField(g_monoBindings.tmpGlyphClass, "height");
+    void* glyphXOffsetField = MonoFindField(g_monoBindings.tmpGlyphClass, "xOffset");
+    void* glyphYOffsetField = MonoFindField(g_monoBindings.tmpGlyphClass, "yOffset");
+    void* glyphXAdvanceField = MonoFindField(g_monoBindings.tmpGlyphClass, "xAdvance");
+    void* glyphScaleField = MonoFindField(g_monoBindings.tmpGlyphClass, "scale");
+    bool glyphsReady = true;
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        if (Utils::IsShuttingDown()) {
+            glyphsReady = false;
+            break;
+        }
+        void* glyph = g_monoApi.objectNew(g_monoApi.domain, g_monoBindings.tmpGlyphClass);
+        if (!glyph) {
+            glyphsReady = false;
+            break;
+        }
+        uint32_t glyphRoot = g_monoApi.gcHandleNew(glyph, 1);
+        if (!glyphRoot) {
+            glyphsReady = false;
+            break;
+        }
+        g_monoApi.runtimeObjectInit(glyph);
+        const MonoGlyphMetric& metric = metrics[i];
+        MonoSetIntField(glyph, glyphIdField, metric.id);
+        MonoSetFloatField(glyph, glyphXField, metric.x);
+        MonoSetFloatField(glyph, glyphYField, metric.y);
+        MonoSetFloatField(glyph, glyphWidthField, metric.width);
+        MonoSetFloatField(glyph, glyphHeightField, metric.height);
+        MonoSetFloatField(glyph, glyphXOffsetField, metric.xOffset);
+        MonoSetFloatField(glyph, glyphYOffsetField, metric.yOffset);
+        MonoSetFloatField(glyph, glyphXAdvanceField, metric.xAdvance);
+        MonoSetFloatField(glyph, glyphScaleField, 1.0f);
+        void* slot = g_monoApi.arrayAddrWithSize(glyphArray, (int)sizeof(void*), i);
+        if (slot) {
+            if (g_monoApi.gcWbarrierSetArrayRef) {
+                g_monoApi.gcWbarrierSetArrayRef(glyphArray,
+                    reinterpret_cast<void**>(slot), glyph);
+            } else {
+                *reinterpret_cast<void**>(slot) = glyph;
+            }
+        }
+        if (glyphRoot) MonoFreeHandle(glyphRoot);
+    }
+    if (!glyphsReady) {
+        MonoFreeHandle(glyphArrayRoot);
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    if (g_monoBindings.addGlyphInfo) {
+        void* glyphParams[1] = { glyphArray };
+        if (!MonoInvoke(g_monoBindings.addGlyphInfo, asset, glyphParams,
+            NULL, "TMP_FontAsset.AddGlyphInfo")) {
+            if (glyphArrayRoot) MonoFreeHandle(glyphArrayRoot);
+            MonoFreeHandle(assetRoot);
+            return false;
+        }
+    }
+    if (glyphArrayRoot) MonoFreeHandle(glyphArrayRoot);
+
+    // TMP 1.x rebuilds its character and kerning dictionaries in
+    // ReadFontDefinition. Compatible builds may dereference both the asset
+    // material and m_kerningInfo, so populate them before invoking it.
+    uint32_t materialRoot = 0;
+    void* material = MonoCreateMaterial(atlasTexture, asset, &materialRoot);
+    if (!material || !MonoSetAssetMaterial(asset, material)) {
+        if (materialRoot) MonoFreeHandle(materialRoot);
+        MonoFreeHandle(assetRoot);
+        return false;
+    }
+    bool kerningReady = MonoInitializeLegacyKerningInfo(asset);
+    MonoTraceLegacyDefinitionState(asset, material);
+    bool definitionReady = true;
+    if (g_monoBindings.readFontDefinition && kerningReady) {
+        definitionReady = MonoInvoke(g_monoBindings.readFontDefinition,
+            asset, NULL, NULL, "TMP_FontAsset.ReadFontDefinition");
+    } else if (g_monoBindings.readFontDefinition && !kerningReady) {
+        Utils::Trace("[DEBUG][UnityMono] legacy TMP definition rebuild skipped: prerequisite state unavailable asset=%p",
+            asset);
+    }
+    if (g_monoBindings.sortGlyphs)
+        MonoInvoke(g_monoBindings.sortGlyphs, asset, NULL, NULL,
+            "TMP_FontAsset.SortGlyphs");
+    if (!definitionReady) {
+        Utils::Trace("[DEBUG][UnityMono] legacy TMP definition rebuild failed; using manually populated glyph tables asset=%p",
+            asset);
+    }
+    if (materialRoot) MonoFreeHandle(materialRoot);
+    *outputAsset = asset;
+    *outputMaterial = material;
+    MonoFreeHandle(assetRoot);
+    (void)sourceMaterial;
+    return true;
+}

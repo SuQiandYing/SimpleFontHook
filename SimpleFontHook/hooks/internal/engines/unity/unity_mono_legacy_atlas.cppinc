@@ -1,0 +1,673 @@
+struct MonoRectValue {
+    float x;
+    float y;
+    float width;
+    float height;
+};
+
+struct MonoGlyphMetric {
+    int id;
+    float x;
+    float y;
+    float width;
+    float height;
+    float xOffset;
+    float yOffset;
+    float xAdvance;
+    int sourceX;
+    int sourceY;
+    int sourceWidth;
+    int sourceHeight;
+    bool sourceXReversed;
+    bool sourceYReversed;
+    bool packedFlipped;
+};
+
+struct MonoLegacyFaceMetrics {
+    int ascent;
+    int descent;
+    int lineHeight;
+};
+
+struct MonoGdiGlyphBitmap {
+    std::vector<uint8_t> pixels;
+    int width;
+    int height;
+};
+
+static bool MonoTryPackGlyphMetrics(std::vector<MonoGlyphMetric>& metrics,
+    int atlasWidth, int atlasHeight) {
+    const int padding = 1;
+    std::vector<size_t> order(metrics.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&metrics](size_t left, size_t right) {
+        const MonoGlyphMetric& a = metrics[left];
+        const MonoGlyphMetric& b = metrics[right];
+        if (a.height != b.height) return a.height > b.height;
+        return a.width > b.width;
+    });
+
+    int x = padding;
+    int y = padding;
+    int shelfHeight = 0;
+    for (size_t index : order) {
+        MonoGlyphMetric& metric = metrics[index];
+        int width = (int)std::lround(metric.width);
+        int height = (int)std::lround(metric.height);
+        if (width <= 0 || height <= 0 ||
+            width + padding * 2 > atlasWidth ||
+            height + padding * 2 > atlasHeight) return false;
+        if (x + width + padding > atlasWidth) {
+            x = padding;
+            y += shelfHeight + padding;
+            shelfHeight = 0;
+        }
+        if (y + height + padding > atlasHeight) return false;
+        metric.x = (float)x;
+        metric.y = (float)y;
+        x += width + padding;
+        shelfHeight = std::max(shelfHeight, height);
+    }
+    return true;
+}
+
+static bool MonoPackGlyphMetrics(std::vector<MonoGlyphMetric>& metrics,
+    int sourceWidth, int sourceHeight, int* outputWidth, int* outputHeight) {
+    if (outputWidth) *outputWidth = 0;
+    if (outputHeight) *outputHeight = 0;
+    if (metrics.empty() || sourceWidth <= 0 || sourceHeight <= 0 ||
+        !outputWidth || !outputHeight) return false;
+
+    int width = sourceWidth;
+    int height = sourceHeight;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (MonoTryPackGlyphMetrics(metrics, width, height)) {
+            *outputWidth = width;
+            *outputHeight = height;
+            return true;
+        }
+        if (width <= height) width *= 2;
+        else height *= 2;
+        if (width > 4096 || height > 4096) break;
+    }
+    return false;
+}
+
+static bool MonoGetTextureSize(void* texture, int* width, int* height) {
+    if (width) *width = 0;
+    if (height) *height = 0;
+    if (!texture || !width || !height) return false;
+    void* boxedWidth = NULL;
+    void* boxedHeight = NULL;
+    if (!MonoInvoke(g_monoBindings.getTextureWidth, texture, NULL,
+        &boxedWidth, "Texture.get_width") ||
+        !MonoInvoke(g_monoBindings.getTextureHeight, texture, NULL,
+            &boxedHeight, "Texture.get_height")) return false;
+    return MonoReadInt(boxedWidth, width) && MonoReadInt(boxedHeight, height) &&
+        *width > 0 && *height > 0;
+}
+
+static bool MonoCreateAlpha8Texture(void* sourceTexture,
+    const std::vector<uint8_t>& pixels, int width, int height,
+    void** outputTexture, uint32_t* outputRoot) {
+    if (outputTexture) *outputTexture = NULL;
+    if (outputRoot) *outputRoot = 0;
+    if (!sourceTexture || pixels.empty() || width <= 0 || height <= 0 ||
+        pixels.size() != (size_t)width * (size_t)height || !outputTexture ||
+        !outputRoot || !g_monoBindings.texture2DClass ||
+        !g_monoBindings.texture2DConstructor ||
+        !g_monoBindings.textureGetRawData ||
+        !g_monoBindings.textureLoadRawData || !g_monoBindings.textureApply ||
+        !g_monoApi.classGetElementClass) return false;
+
+    // Reuse the runtime's byte[] element class instead of depending on an
+    // additional mono_get_byte_class export that older Unity builds may omit.
+    void* sourcePixels = NULL;
+    if (!MonoInvoke(g_monoBindings.textureGetRawData, sourceTexture, NULL,
+        &sourcePixels, "Texture2D.GetRawTextureData(byte class)") || !sourcePixels)
+        return false;
+    uint32_t sourcePixelsRoot = g_monoApi.gcHandleNew(sourcePixels, 1);
+    sourcePixels = sourcePixelsRoot
+        ? g_monoApi.gcHandleGetTarget(sourcePixelsRoot) : NULL;
+    void* sourceArrayClass = sourcePixels
+        ? g_monoApi.objectGetClass(sourcePixels) : NULL;
+    void* elementClass = sourceArrayClass
+        ? g_monoApi.classGetElementClass(sourceArrayClass) : NULL;
+    int elementSize = sourceArrayClass
+        ? g_monoApi.arrayElementSize(sourceArrayClass) : 0;
+    if (!sourcePixels || !elementClass || elementSize != 1) {
+        if (sourcePixelsRoot) MonoFreeHandle(sourcePixelsRoot);
+        return false;
+    }
+
+    void* destinationPixels = g_monoApi.arrayNew(g_monoApi.domain,
+        elementClass, pixels.size());
+    uint32_t destinationPixelsRoot = destinationPixels
+        ? g_monoApi.gcHandleNew(destinationPixels, 1) : 0;
+    destinationPixels = destinationPixelsRoot
+        ? g_monoApi.gcHandleGetTarget(destinationPixelsRoot) : NULL;
+    void* destinationData = destinationPixels
+        ? g_monoApi.arrayAddrWithSize(destinationPixels, elementSize, 0) : NULL;
+    if (!destinationData) {
+        if (destinationPixelsRoot) MonoFreeHandle(destinationPixelsRoot);
+        MonoFreeHandle(sourcePixelsRoot);
+        return false;
+    }
+    memcpy(destinationData, pixels.data(), pixels.size());
+
+    void* texture = g_monoApi.objectNew(g_monoApi.domain,
+        g_monoBindings.texture2DClass);
+    uint32_t textureRoot = texture ? g_monoApi.gcHandleNew(texture, 1) : 0;
+    texture = textureRoot ? g_monoApi.gcHandleGetTarget(textureRoot) : NULL;
+    bool created = false;
+    if (texture) {
+        int textureFormat = 1; // TextureFormat.Alpha8.
+        uint8_t mipChain = 0;
+        void* constructorParams[4] = {
+            &width, &height, &textureFormat, &mipChain
+        };
+        created = MonoInvoke(g_monoBindings.texture2DConstructor, texture,
+            constructorParams, NULL,
+            "Texture2D..ctor(width,height,Alpha8,mipChain)");
+    }
+    if (created) {
+        void* loadRawParams[1] = { destinationPixels };
+        created = MonoInvoke(g_monoBindings.textureLoadRawData, texture,
+            loadRawParams, NULL, "Texture2D.LoadRawTextureData(GDI byte[])") &&
+            MonoInvoke(g_monoBindings.textureApply, texture, NULL,
+                NULL, "Texture2D.Apply(GDI atlas)");
+    }
+
+    MonoFreeHandle(destinationPixelsRoot);
+    MonoFreeHandle(sourcePixelsRoot);
+    if (!created) {
+        if (textureRoot) MonoFreeHandle(textureRoot);
+        return false;
+    }
+    MonoKeepUnityObjectAlive(texture, "legacy TMP GDI atlas");
+    *outputTexture = texture;
+    *outputRoot = textureRoot;
+    return true;
+}
+
+static bool MonoCreateGdiLegacyAtlas(const std::wstring& characters,
+    int sampleSize, void* sourceTexture, std::vector<MonoGlyphMetric>& metrics,
+    int* atlasWidth, int* atlasHeight, MonoLegacyFaceMetrics* faceMetrics,
+    void** outputTexture, uint32_t* outputRoot) {
+    metrics.clear();
+    if (atlasWidth) *atlasWidth = 0;
+    if (atlasHeight) *atlasHeight = 0;
+    if (faceMetrics) *faceMetrics = {};
+    if (outputTexture) *outputTexture = NULL;
+    if (outputRoot) *outputRoot = 0;
+    if (characters.empty() || sampleSize <= 0 || !sourceTexture ||
+        !atlasWidth || !atlasHeight || !faceMetrics || !outputTexture ||
+        !outputRoot || !orgCreateFontIndirectW || !orgSelectObject ||
+        !orgGetGlyphOutlineW || !orgGetTextMetricsW) return false;
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) return false;
+    LOGFONTW logfont = {};
+    logfont.lfHeight = -sampleSize;
+    logfont.lfWeight = FW_NORMAL;
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    logfont.lfOutPrecision = OUT_TT_PRECIS;
+    logfont.lfQuality = ANTIALIASED_QUALITY;
+    logfont.lfPitchAndFamily = DEFAULT_PITCH;
+    wcsncpy_s(logfont.lfFaceName, Config::ForcedFontNameW, _TRUNCATE);
+    HFONT font = orgCreateFontIndirectW(&logfont);
+    HGDIOBJ previousFont = font ? orgSelectObject(hdc, font) : NULL;
+    if (!font || !previousFont || previousFont == HGDI_ERROR) {
+        if (font) DeleteObject(font);
+        DeleteDC(hdc);
+        return false;
+    }
+
+    TEXTMETRICW textMetric = {};
+    if (!orgGetTextMetricsW(hdc, &textMetric)) {
+        orgSelectObject(hdc, previousFont);
+        DeleteObject(font);
+        DeleteDC(hdc);
+        return false;
+    }
+    faceMetrics->ascent = textMetric.tmAscent;
+    faceMetrics->descent = -textMetric.tmDescent;
+    faceMetrics->lineHeight = textMetric.tmHeight + textMetric.tmExternalLeading;
+
+    MAT2 matrix = {};
+    matrix.eM11.value = 1;
+    matrix.eM22.value = 1;
+    std::vector<MonoGdiGlyphBitmap> bitmaps;
+    bitmaps.reserve(characters.size());
+    metrics.reserve(characters.size());
+    size_t fallbackCount = 0;
+    size_t unsupportedCount = 0;
+    size_t nonZeroPixels = 0;
+    for (size_t i = 0; i < characters.size(); ++i) {
+        uint32_t codePoint = static_cast<uint16_t>(characters[i]);
+        if (codePoint >= 0xD800 && codePoint <= 0xDBFF &&
+            i + 1 < characters.size()) {
+            uint32_t low = static_cast<uint16_t>(characters[i + 1]);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                ++i;
+                ++unsupportedCount;
+                continue;
+            }
+        }
+        if (codePoint < 0x20 || (codePoint >= 0xD800 && codePoint <= 0xDFFF))
+            continue;
+
+        GLYPHMETRICS glyphMetrics = {};
+        UINT rasterCharacter = static_cast<UINT>(codePoint);
+        DWORD byteCount = orgGetGlyphOutlineW(hdc, rasterCharacter,
+            GGO_GRAY8_BITMAP, &glyphMetrics, 0, NULL, &matrix);
+        if (byteCount == GDI_ERROR) {
+            rasterCharacter = L'?';
+            byteCount = orgGetGlyphOutlineW(hdc, rasterCharacter,
+                GGO_GRAY8_BITMAP, &glyphMetrics, 0, NULL, &matrix);
+            ++fallbackCount;
+        }
+        if (byteCount == GDI_ERROR || byteCount > 16 * 1024 * 1024) continue;
+
+        int bitmapWidth = std::max<int>(1, glyphMetrics.gmBlackBoxX);
+        int bitmapHeight = std::max<int>(1, glyphMetrics.gmBlackBoxY);
+        MonoGdiGlyphBitmap bitmap = {};
+        bitmap.width = bitmapWidth;
+        bitmap.height = bitmapHeight;
+        bitmap.pixels.assign((size_t)bitmapWidth * (size_t)bitmapHeight, 0);
+        if (glyphMetrics.gmBlackBoxX && glyphMetrics.gmBlackBoxY) {
+            size_t stride = ((size_t)glyphMetrics.gmBlackBoxX + 3) & ~size_t(3);
+            size_t expectedBytes = stride * glyphMetrics.gmBlackBoxY;
+            if (byteCount < expectedBytes) continue;
+            std::vector<uint8_t> gray(byteCount);
+            if (orgGetGlyphOutlineW(hdc, rasterCharacter, GGO_GRAY8_BITMAP,
+                &glyphMetrics, byteCount, gray.data(), &matrix) == GDI_ERROR)
+                continue;
+            // GetGlyphOutline returns the visual top scanline first. Values are
+            // 0..64 and must be normalized before uploading to Alpha8.
+            for (int row = 0; row < bitmapHeight; ++row) {
+                for (int column = 0; column < bitmapWidth; ++column) {
+                    uint8_t coverage = std::min<uint8_t>(
+                        gray[(size_t)row * stride + column], 64);
+                    uint8_t alpha = static_cast<uint8_t>(
+                        ((unsigned)coverage * 255u + 32u) / 64u);
+                    bitmap.pixels[(size_t)row * bitmapWidth + column] = alpha;
+                    if (alpha) ++nonZeroPixels;
+                }
+            }
+        }
+
+        MonoGlyphMetric metric = {};
+        metric.id = static_cast<int>(codePoint);
+        metric.width = static_cast<float>(bitmapWidth);
+        metric.height = static_cast<float>(bitmapHeight);
+        metric.xOffset = static_cast<float>(glyphMetrics.gmptGlyphOrigin.x);
+        metric.yOffset = static_cast<float>(glyphMetrics.gmptGlyphOrigin.y);
+        metric.xAdvance = static_cast<float>(glyphMetrics.gmCellIncX);
+        metric.sourceWidth = bitmapWidth;
+        metric.sourceHeight = bitmapHeight;
+        metrics.push_back(metric);
+        bitmaps.push_back(bitmap);
+    }
+
+    wchar_t resolvedFace[LF_FACESIZE] = {};
+    if (orgGetTextFaceW) orgGetTextFaceW(hdc, LF_FACESIZE, resolvedFace);
+    orgSelectObject(hdc, previousFont);
+    DeleteObject(font);
+    DeleteDC(hdc);
+    if (metrics.empty() || metrics.size() != bitmaps.size() || !nonZeroPixels)
+        return false;
+
+    size_t requiredArea = 0;
+    for (const MonoGdiGlyphBitmap& bitmap : bitmaps)
+        requiredArea += (size_t)(bitmap.width + 2) * (size_t)(bitmap.height + 2);
+    int initialSize = 256;
+    while (initialSize < 4096 &&
+        (size_t)initialSize * (size_t)initialSize < requiredArea * 2)
+        initialSize *= 2;
+    if (!MonoPackGlyphMetrics(metrics, initialSize, initialSize,
+        atlasWidth, atlasHeight)) return false;
+
+    std::vector<uint8_t> atlas((size_t)*atlasWidth * (size_t)*atlasHeight, 0);
+    for (size_t i = 0; i < metrics.size(); ++i) {
+        const MonoGlyphMetric& metric = metrics[i];
+        const MonoGdiGlyphBitmap& bitmap = bitmaps[i];
+        int destinationX = (int)std::lround(metric.x);
+        int destinationTop = (int)std::lround(metric.y);
+        if (destinationX < 0 || destinationTop < 0 ||
+            destinationX + bitmap.width > *atlasWidth ||
+            destinationTop + bitmap.height > *atlasHeight) return false;
+        for (int row = 0; row < bitmap.height; ++row) {
+            int destinationY = *atlasHeight - 1 - (destinationTop + row);
+            size_t sourceOffset = (size_t)row * bitmap.width;
+            size_t destinationOffset = (size_t)destinationY * *atlasWidth +
+                destinationX;
+            memcpy(atlas.data() + destinationOffset,
+                bitmap.pixels.data() + sourceOffset, bitmap.width);
+        }
+    }
+
+    if (!MonoCreateAlpha8Texture(sourceTexture, atlas, *atlasWidth,
+        *atlasHeight, outputTexture, outputRoot)) return false;
+    Utils::Trace("[DEBUG][UnityMono] legacy TMP GDI atlas ready requested='%s' resolved='%s' sample=%d glyphs=%zu fallback=%zu unsupported=%zu size=%dx%d ascent=%d descent=%d lineHeight=%d nonZero=%zu",
+        MonoWideToUtf8(Config::ForcedFontNameW).c_str(),
+        MonoWideToUtf8(resolvedFace).c_str(), sampleSize, metrics.size(),
+        fallbackCount, unsupportedCount, *atlasWidth, *atlasHeight,
+        faceMetrics->ascent, faceMetrics->descent, faceMetrics->lineHeight,
+        nonZeroPixels);
+    return true;
+}
+
+static bool MonoCreateRepackedTexture(void* sourceTexture,
+    int sourceWidth, int sourceHeight,
+    const std::vector<MonoGlyphMetric>& metrics,
+    int outputWidth, int outputHeight,
+    void** outputTexture, uint32_t* outputRoot) {
+    if (outputTexture) *outputTexture = NULL;
+    if (outputRoot) *outputRoot = 0;
+    if (!sourceTexture || sourceWidth <= 0 || sourceHeight <= 0 ||
+        outputWidth <= 0 || outputHeight <= 0 || metrics.empty() || !outputTexture ||
+        !outputRoot || !g_monoBindings.texture2DClass ||
+        !g_monoBindings.texture2DConstructor ||
+        !g_monoBindings.textureGetFormat ||
+        !g_monoBindings.textureGetRawData ||
+        !g_monoBindings.textureLoadRawData || !g_monoBindings.textureApply ||
+        !g_monoApi.classGetElementClass) return false;
+
+    void* boxedFormat = NULL;
+    int textureFormat = 0;
+    if (!MonoInvoke(g_monoBindings.textureGetFormat, sourceTexture, NULL,
+        &boxedFormat, "Texture2D.get_format") ||
+        !MonoReadInt(boxedFormat, &textureFormat)) return false;
+
+    void* sourcePixels = NULL;
+    if (!MonoInvoke(g_monoBindings.textureGetRawData, sourceTexture, NULL,
+        &sourcePixels, "Texture2D.GetRawTextureData") || !sourcePixels) return false;
+    uint32_t sourcePixelsRoot = g_monoApi.gcHandleNew(sourcePixels, 1);
+    if (!sourcePixelsRoot) return false;
+    sourcePixels = g_monoApi.gcHandleGetTarget(sourcePixelsRoot);
+
+    size_t sourcePixelCount = (size_t)sourceWidth * (size_t)sourceHeight;
+    void* sourceArrayClass = sourcePixels
+        ? g_monoApi.objectGetClass(sourcePixels) : NULL;
+    int elementSize = sourceArrayClass
+        ? g_monoApi.arrayElementSize(sourceArrayClass) : 0;
+    void* elementClass = sourceArrayClass
+        ? g_monoApi.classGetElementClass(sourceArrayClass) : NULL;
+    size_t sourceByteCount = sourcePixels ? MonoArrayLength(sourcePixels) : 0;
+    if (!sourcePixels || !sourcePixelCount ||
+        sourceByteCount % sourcePixelCount != 0 ||
+        elementSize != 1 || !elementClass) {
+        MonoFreeHandle(sourcePixelsRoot);
+        return false;
+    }
+    size_t bytesPerPixel = sourceByteCount / sourcePixelCount;
+    if (bytesPerPixel == 0 || bytesPerPixel > 16) {
+        MonoFreeHandle(sourcePixelsRoot);
+        return false;
+    }
+
+    if (textureFormat == 1 && bytesPerPixel == 1) {
+        const uint8_t* sourceData = static_cast<const uint8_t*>(
+            g_monoApi.arrayAddrWithSize(sourcePixels, elementSize, 0));
+        if (!sourceData) {
+            MonoFreeHandle(sourcePixelsRoot);
+            return false;
+        }
+        size_t sampledGlyphs = 0;
+        size_t varyingGlyphs = 0;
+        for (const MonoGlyphMetric& metric : metrics) {
+            if (metric.sourceWidth * metric.sourceHeight <= 1 ||
+                metric.sourceX < 0 || metric.sourceY < 0 ||
+                metric.sourceX + metric.sourceWidth > sourceWidth ||
+                metric.sourceY + metric.sourceHeight > sourceHeight) continue;
+            uint8_t minimum = 255;
+            uint8_t maximum = 0;
+            for (int y = 0; y < metric.sourceHeight; ++y) {
+                size_t offset = (size_t)(metric.sourceY + y) * sourceWidth +
+                    metric.sourceX;
+                for (int x = 0; x < metric.sourceWidth; ++x) {
+                    uint8_t value = sourceData[offset + x];
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                }
+            }
+            ++sampledGlyphs;
+            if (minimum != maximum) ++varyingGlyphs;
+        }
+        size_t requiredVariation = sampledGlyphs >= 20
+            ? std::max<size_t>(2, sampledGlyphs / 20) : 1;
+        if (!sampledGlyphs || varyingGlyphs < requiredVariation) {
+            Utils::Trace("[DEBUG][UnityMono] legacy TMP CPU atlas rejected format=%d sampledGlyphs=%zu varyingGlyphs=%zu required=%zu; using native raster fallback",
+                textureFormat, sampledGlyphs, varyingGlyphs, requiredVariation);
+            MonoFreeHandle(sourcePixelsRoot);
+            return false;
+        }
+    }
+
+    size_t outputPixelCount = (size_t)outputWidth * (size_t)outputHeight;
+    size_t outputByteCount = outputPixelCount * bytesPerPixel;
+    void* destinationPixels = g_monoApi.arrayNew(g_monoApi.domain,
+        elementClass, outputByteCount);
+    uint32_t destinationPixelsRoot = destinationPixels
+        ? g_monoApi.gcHandleNew(destinationPixels, 1) : 0;
+    destinationPixels = destinationPixelsRoot
+        ? g_monoApi.gcHandleGetTarget(destinationPixelsRoot) : NULL;
+    if (!destinationPixels) {
+        MonoFreeHandle(sourcePixelsRoot);
+        if (destinationPixelsRoot) MonoFreeHandle(destinationPixelsRoot);
+        return false;
+    }
+
+    bool pixelsCopied = true;
+    for (const MonoGlyphMetric& metric : metrics) {
+        int glyphX = (int)std::lround(metric.x);
+        int glyphY = (int)std::lround(metric.y);
+        int glyphWidth = (int)std::lround(metric.width);
+        int glyphHeight = (int)std::lround(metric.height);
+        int destinationBottom = outputHeight - glyphY - glyphHeight;
+        if (glyphX < 0 || glyphY < 0 || glyphWidth <= 0 || glyphHeight <= 0 ||
+            glyphX + glyphWidth > outputWidth ||
+            destinationBottom < 0 || destinationBottom + glyphHeight > outputHeight) {
+            pixelsCopied = false;
+            break;
+        }
+        for (int dy = 0; dy < glyphHeight && pixelsCopied; ++dy) {
+            for (int dx = 0; dx < glyphWidth; ++dx) {
+                int rawX = metric.packedFlipped ? dy : dx;
+                int rawY = metric.packedFlipped ? dx : dy;
+                int sourceX = metric.sourceX + (metric.sourceXReversed
+                    ? metric.sourceWidth - 1 - rawX : rawX);
+                int sourceY = metric.sourceY + (metric.sourceYReversed
+                    ? metric.sourceHeight - 1 - rawY : rawY);
+                int destinationX = glyphX + dx;
+                int destinationY = destinationBottom + dy;
+                if (rawX < 0 || rawX >= metric.sourceWidth ||
+                    rawY < 0 || rawY >= metric.sourceHeight ||
+                    sourceX < 0 || sourceX >= sourceWidth ||
+                    sourceY < 0 || sourceY >= sourceHeight) {
+                    pixelsCopied = false;
+                    break;
+                }
+                size_t sourceIndex = ((size_t)sourceY * (size_t)sourceWidth +
+                    (size_t)sourceX) * bytesPerPixel;
+                size_t destinationIndex = ((size_t)destinationY *
+                    (size_t)outputWidth + (size_t)destinationX) * bytesPerPixel;
+                void* source = g_monoApi.arrayAddrWithSize(sourcePixels,
+                    elementSize, sourceIndex);
+                void* destination = g_monoApi.arrayAddrWithSize(destinationPixels,
+                    elementSize, destinationIndex);
+                if (!source || !destination) {
+                    pixelsCopied = false;
+                    break;
+                }
+                memcpy(destination, source, bytesPerPixel);
+            }
+        }
+    }
+    if (!pixelsCopied) {
+        MonoFreeHandle(destinationPixelsRoot);
+        MonoFreeHandle(sourcePixelsRoot);
+        return false;
+    }
+
+    void* texture = g_monoApi.objectNew(g_monoApi.domain,
+        g_monoBindings.texture2DClass);
+    uint32_t textureRoot = texture ? g_monoApi.gcHandleNew(texture, 1) : 0;
+    texture = textureRoot ? g_monoApi.gcHandleGetTarget(textureRoot) : NULL;
+    bool created = false;
+    if (texture) {
+        uint8_t mipChain = 0;
+        void* constructorParams[4] = {
+            &outputWidth, &outputHeight, &textureFormat, &mipChain
+        };
+        created = MonoInvoke(g_monoBindings.texture2DConstructor, texture,
+            constructorParams, NULL,
+            "Texture2D..ctor(width,height,format,mipChain)");
+    }
+    if (created) {
+        void* loadRawParams[1] = { destinationPixels };
+        created = MonoInvoke(g_monoBindings.textureLoadRawData, texture,
+            loadRawParams, NULL, "Texture2D.LoadRawTextureData(byte[])") &&
+            MonoInvoke(g_monoBindings.textureApply, texture, NULL,
+                NULL, "Texture2D.Apply");
+    }
+
+    MonoFreeHandle(destinationPixelsRoot);
+    MonoFreeHandle(sourcePixelsRoot);
+    if (!created) {
+        if (textureRoot) MonoFreeHandle(textureRoot);
+        return false;
+    }
+
+    MonoKeepUnityObjectAlive(texture, "legacy TMP repacked atlas");
+    Utils::Trace("[DEBUG][UnityMono] legacy TMP atlas repacked source=%p output=%p sourceSize=%dx%d outputSize=%dx%d format=%d bytesPerPixel=%zu glyphs=%zu",
+        sourceTexture, texture, sourceWidth, sourceHeight, outputWidth,
+        outputHeight, textureFormat, bytesPerPixel, metrics.size());
+    *outputTexture = texture;
+    *outputRoot = textureRoot;
+    return true;
+}
+
+static bool MonoGetFontTexture(void* font, void** texture, void** sourceMaterial) {
+    if (texture) *texture = NULL;
+    if (sourceMaterial) *sourceMaterial = NULL;
+    if (!font || !texture || !sourceMaterial || !g_monoBindings.fontGetMaterial ||
+        !g_monoBindings.getMaterialMainTexture) return false;
+    void* material = NULL;
+    if (!MonoInvoke(g_monoBindings.fontGetMaterial, font, NULL,
+        &material, "Font.get_material") || !material) return false;
+    void* mainTexture = NULL;
+    if (!MonoInvoke(g_monoBindings.getMaterialMainTexture, material, NULL,
+        &mainTexture, "Material.get_mainTexture") || !mainTexture) return false;
+    *sourceMaterial = material;
+    *texture = mainTexture;
+    return true;
+}
+
+static bool MonoCollectGlyphMetrics(void* characterArray, int textureWidth,
+    int textureHeight, std::vector<MonoGlyphMetric>& metrics,
+    bool* repackAtlas, int* atlasWidth, int* atlasHeight) {
+    metrics.clear();
+    if (repackAtlas) *repackAtlas = false;
+    if (atlasWidth) *atlasWidth = textureWidth;
+    if (atlasHeight) *atlasHeight = textureHeight;
+    if (!characterArray || !g_monoBindings.characterInfoClass ||
+        !g_monoApi.objectGetClass || !g_monoApi.arrayElementSize ||
+        !repackAtlas || !atlasWidth || !atlasHeight) return false;
+    void* arrayClass = g_monoApi.objectGetClass(characterArray);
+    int elementSize = g_monoApi.arrayElementSize(arrayClass);
+    if (elementSize <= 0) return false;
+    void* indexField = g_monoApi.classGetFieldFromName(
+        g_monoBindings.characterInfoClass, "index");
+    void* uvField = g_monoApi.classGetFieldFromName(
+        g_monoBindings.characterInfoClass, "uv");
+    void* vertField = g_monoApi.classGetFieldFromName(
+        g_monoBindings.characterInfoClass, "vert");
+    void* flippedField = g_monoApi.classGetFieldFromName(
+        g_monoBindings.characterInfoClass, "flipped");
+    if (!indexField || !uvField || !vertField) return false;
+    size_t negativeUvWidthCount = 0;
+    size_t negativeUvHeightCount = 0;
+    size_t positiveUvHeightCount = 0;
+    size_t packedFlippedCount = 0;
+    MonoRectValue sampleUv = {};
+    int sampleId = 0;
+    size_t count = MonoArrayLength(characterArray);
+    for (size_t i = 0; i < count; ++i) {
+        void* raw = g_monoApi.arrayAddrWithSize(characterArray, elementSize, i);
+        if (!raw) continue;
+        void* boxed = g_monoApi.valueBox(g_monoApi.domain,
+            g_monoBindings.characterInfoClass, raw);
+        if (!boxed) continue;
+        MonoGlyphMetric metric = {};
+        g_monoApi.fieldGetValue(boxed, indexField, &metric.id);
+        MonoRectValue uv = {};
+        MonoRectValue vert = {};
+        g_monoApi.fieldGetValue(boxed, uvField, &uv);
+        g_monoApi.fieldGetValue(boxed, vertField, &vert);
+        uint8_t packedFlipped = 0;
+        if (flippedField)
+            g_monoApi.fieldGetValue(boxed, flippedField, &packedFlipped);
+        if (packedFlipped) ++packedFlippedCount;
+        if (uv.width < 0.0f) ++negativeUvWidthCount;
+        if (uv.height < 0.0f) ++negativeUvHeightCount;
+        else if (uv.height > 0.0f) ++positiveUvHeightCount;
+        void* boxedAdvance = NULL;
+        if (g_monoBindings.characterInfoAdvance &&
+            MonoInvoke(g_monoBindings.characterInfoAdvance, boxed, NULL,
+                &boxedAdvance, "CharacterInfo.get_advance")) {
+            int advance = 0;
+            if (MonoReadInt(boxedAdvance, &advance)) metric.xAdvance = (float)advance;
+        }
+        if (metric.xAdvance == 0.0f) metric.xAdvance = vert.width;
+        int rawX = (int)std::lround(uv.x * textureWidth);
+        int rawOtherX = (int)std::lround((uv.x + uv.width) * textureWidth);
+        int rawY = (int)std::lround(uv.y * textureHeight);
+        int rawOtherY = (int)std::lround((uv.y + uv.height) * textureHeight);
+        metric.sourceX = std::min(rawX, rawOtherX);
+        metric.sourceY = std::min(rawY, rawOtherY);
+        metric.sourceWidth = std::abs(rawOtherX - rawX);
+        metric.sourceHeight = std::abs(rawOtherY - rawY);
+        metric.sourceXReversed = rawOtherX < rawX;
+        metric.sourceYReversed = rawOtherY < rawY;
+        metric.packedFlipped = packedFlipped != 0;
+        metric.width = (float)(metric.packedFlipped
+            ? metric.sourceHeight : metric.sourceWidth);
+        metric.height = (float)(metric.packedFlipped
+            ? metric.sourceWidth : metric.sourceHeight);
+        metric.x = (float)metric.sourceX;
+        metric.y = (float)(textureHeight - metric.sourceY - metric.sourceHeight);
+        metric.xOffset = vert.x;
+        metric.yOffset = vert.y;
+        bool sourceBoundsValid = metric.sourceX >= 0 && metric.sourceY >= 0 &&
+            metric.sourceWidth > 0 && metric.sourceHeight > 0 &&
+            metric.sourceX + metric.sourceWidth <= textureWidth &&
+            metric.sourceY + metric.sourceHeight <= textureHeight;
+        if (metric.id > 0 && sourceBoundsValid &&
+            metric.width > 0.0f && metric.height > 0.0f) {
+            if (!sampleId) {
+                sampleId = metric.id;
+                sampleUv = uv;
+            }
+            metrics.push_back(metric);
+        }
+    }
+    bool needsRepack = negativeUvWidthCount > 0 ||
+        negativeUvHeightCount > 0 || packedFlippedCount > 0;
+    if (needsRepack && !MonoPackGlyphMetrics(metrics, textureWidth,
+        textureHeight, atlasWidth, atlasHeight)) return false;
+    *repackAtlas = needsRepack;
+    if (!metrics.empty()) {
+        const MonoGlyphMetric& sample = metrics.front();
+        Utils::Trace("[DEBUG][UnityMono] legacy glyph UV sourceAtlas=%dx%d outputAtlas=%dx%d count=%zu negativeU=%zu negativeV=%zu positiveV=%zu packedFlipped=%zu repack=%d sample=U+%04X rawUv=(%.4f,%.4f,%.4f,%.4f) glyph=(%.1f,%.1f,%.1f,%.1f) bearing=(%.1f,%.1f) advance=%.1f",
+            textureWidth, textureHeight, *atlasWidth, *atlasHeight,
+            metrics.size(), negativeUvWidthCount, negativeUvHeightCount,
+            positiveUvHeightCount, packedFlippedCount, needsRepack ? 1 : 0,
+            (unsigned)sampleId, sampleUv.x, sampleUv.y, sampleUv.width,
+            sampleUv.height, sample.x, sample.y, sample.width, sample.height,
+            sample.xOffset, sample.yOffset, sample.xAdvance);
+    }
+    return !metrics.empty();
+}
+

@@ -1,0 +1,201 @@
+static bool BindPythonRuntime() {
+    if (g_pythonModule && g_pyIsInitialized && g_pyAddPendingCall &&
+        g_pyRunSimpleString) {
+        return true;
+    }
+
+    HMODULE modules[512] = {};
+    DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+        return false;
+    }
+
+    DWORD count = std::min<DWORD>(needed / sizeof(HMODULE), _countof(modules));
+    for (DWORD i = 0; i < count; ++i) {
+        char moduleName[MAX_PATH] = {};
+        GetModuleBaseNameA(GetCurrentProcess(), modules[i], moduleName,
+            _countof(moduleName));
+        std::string normalized = moduleName;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char ch) { return static_cast<char>(tolower(ch)); });
+        if (normalized.find("python") == std::string::npos) continue;
+
+        PyIsInitializedFn isInitialized = reinterpret_cast<PyIsInitializedFn>(
+            GetProcAddress(modules[i], "Py_IsInitialized"));
+        PyAddPendingCallFn addPendingCall = reinterpret_cast<PyAddPendingCallFn>(
+            GetProcAddress(modules[i], "Py_AddPendingCall"));
+        PyRunSimpleStringFn runSimpleString = reinterpret_cast<PyRunSimpleStringFn>(
+            GetProcAddress(modules[i], "PyRun_SimpleString"));
+        if (!isInitialized || !addPendingCall || !runSimpleString) continue;
+
+        g_pythonModule = modules[i];
+        g_pyIsInitialized = isInitialized;
+        g_pyAddPendingCall = addPendingCall;
+        g_pyRunSimpleString = runSimpleString;
+        TraceLimited("python runtime bound module='%s' handle=%p",
+            moduleName, modules[i]);
+        return true;
+    }
+    return false;
+}
+
+static std::string QuotePythonString(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\\' || ch == '\'') quoted += '\\';
+        quoted += ch;
+    }
+    quoted += "'";
+    return quoted;
+}
+
+static std::string HexEncode(const std::string& value) {
+    static const char digits[] = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(value.size() * 2);
+    for (unsigned char ch : value) {
+        encoded += digits[ch >> 4];
+        encoded += digits[ch & 0x0F];
+    }
+    return encoded;
+}
+
+static std::string BuildApplyScript(LONG version, bool enabled, bool refresh,
+    const std::string& fontName, const std::string& virtualPath,
+    const std::wstring& sourcePath) {
+    char versionText[32] = {};
+    sprintf_s(versionText, "%ld", version);
+
+    std::string script;
+    script += "import binascii, io, os, sys\n";
+    script += "_sfh_c = sys.modules.get('renpy.config')\n";
+    script += "_sfh_f = sys.modules.get('renpy.text.font')\n";
+    script += "if _sfh_c is not None and _sfh_f is not None:\n";
+    script += "    _sfh_map = _sfh_c.font_replacement_map\n";
+    if (enabled) {
+        std::string fontLiteral = QuotePythonString(fontName);
+        std::string virtualLiteral = QuotePythonString(virtualPath);
+    std::string sourceHex = HexEncode(EngineCommon::WideToUtf8(sourcePath));
+        script += "    _sfh_c._simplefonthook_source = binascii.unhexlify('" +
+            sourceHex + "').decode('utf-8')\n";
+        script += "    _sfh_c._simplefonthook_virtual = " + virtualLiteral + ".lower()\n";
+        script += "    _sfh_open = getattr(_sfh_c, 'file_open_callback', None)\n";
+        script += "    if not getattr(_sfh_open, '_simplefonthook', False):\n";
+        script += "        _sfh_c._simplefonthook_previous_file_open_callback = _sfh_open\n";
+        script += "        def _simplefonthook_open(name):\n";
+        script += "            _config = sys.modules.get('renpy.config')\n";
+        script += "            try:\n";
+        script += "                _normalized = name.replace('\\\\', '/').lower()\n";
+        script += "            except Exception:\n";
+        script += "                _normalized = ''\n";
+        script += "            _virtual = getattr(_config, '_simplefonthook_virtual', '')\n";
+        script += "            if _virtual and (_normalized == _virtual or _normalized.endswith('/' + _virtual)):\n";
+        script += "                try:\n";
+        script += "                    return io.open(getattr(_config, '_simplefonthook_source'), 'rb')\n";
+        script += "                except (IOError, OSError):\n";
+        script += "                    return None\n";
+        script += "            _previous = getattr(_config, '_simplefonthook_previous_file_open_callback', None)\n";
+        script += "            return _previous(name) if _previous is not None else None\n";
+        script += "        _simplefonthook_open._simplefonthook = True\n";
+        script += "        _sfh_c.file_open_callback = _simplefonthook_open\n";
+        script += "    if not getattr(_sfh_map, '_simplefonthook', False):\n";
+        script += "        class _SimpleFontHookMap(dict):\n";
+        script += "            _simplefonthook = True\n";
+        script += "            def __init__(self, source, font_path):\n";
+        script += "                dict.__init__(self, source)\n";
+        script += "                self.font_path = font_path\n";
+        script += "            def get(self, key, default=None):\n";
+        script += "                mapped = dict.get(self, key, key)\n";
+        script += "                try:\n";
+        script += "                    return (self.font_path, mapped[1], mapped[2])\n";
+        script += "                except Exception:\n";
+        script += "                    return (self.font_path, key[1], key[2])\n";
+        script += "        _sfh_map = _SimpleFontHookMap(_sfh_map, " + fontLiteral + ")\n";
+        script += "        _sfh_c.font_replacement_map = _sfh_map\n";
+        script += "    else:\n";
+        script += "        _sfh_map.font_path = " + fontLiteral + "\n";
+    } else {
+        script += "    if getattr(_sfh_map, '_simplefonthook', False):\n";
+        script += "        _sfh_c.font_replacement_map = dict(_sfh_map)\n";
+        script += "    _sfh_open = getattr(_sfh_c, 'file_open_callback', None)\n";
+        script += "    if getattr(_sfh_open, '_simplefonthook', False):\n";
+        script += "        _sfh_c.file_open_callback = getattr(_sfh_c, '_simplefonthook_previous_file_open_callback', None)\n";
+        script += "    for _sfh_attr in ('_simplefonthook_source', '_simplefonthook_virtual', '_simplefonthook_previous_file_open_callback'):\n";
+        script += "        if hasattr(_sfh_c, _sfh_attr):\n";
+        script += "            delattr(_sfh_c, _sfh_attr)\n";
+    }
+    script += "    _sfh_f.free_memory()\n";
+    if (refresh) {
+        script += "    _sfh_exports = sys.modules.get('renpy.exports')\n";
+        script += "    _sfh_game = sys.modules.get('renpy.game')\n";
+        script += "    _sfh_interface = getattr(_sfh_game, 'interface', None) if _sfh_game is not None else None\n";
+        script += "    if _sfh_exports is not None:\n";
+        script += "        _sfh_exports.restart_interaction()\n";
+        script += "    elif _sfh_interface is not None:\n";
+        script += "        _sfh_interface.restart_interaction = True\n";
+    }
+    script += "    os.environ['SIMPLEFONTHOOK_RENPY_APPLIED'] = '";
+    script += versionText;
+    script += "'\n";
+    return script;
+}
+
+static bool AppliedMarkerMatches(LONG version) {
+    char marker[64] = {};
+    DWORD length = GetEnvironmentVariableA("SIMPLEFONTHOOK_RENPY_APPLIED",
+        marker, _countof(marker));
+    if (length == 0 || length >= _countof(marker)) return false;
+    char* end = NULL;
+    long applied = strtol(marker, &end, 10);
+    return end && *end == '\0' && applied == version;
+}
+
+static int __cdecl ApplyPendingCallback(void*) {
+    InterlockedExchange(&g_pendingQueued, 0);
+    if (Utils::IsShuttingDown() || !g_pyRunSimpleString) return 0;
+
+    LONG version = LONG_MIN;
+    bool enabled = false;
+    bool refresh = false;
+    std::string fontName;
+    std::string virtualPath;
+    std::wstring sourcePath;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        version = g_readyVersion;
+        enabled = g_readyEnabled;
+        refresh = g_readyRefresh;
+        fontName = g_readyFontName;
+        virtualPath = g_readyVirtualPath;
+        sourcePath = g_readySourcePath;
+    }
+    if (version == LONG_MIN ||
+        (enabled && (fontName.empty() || virtualPath.empty() || sourcePath.empty()))) {
+        return 0;
+    }
+
+    std::string script = BuildApplyScript(version, enabled, refresh, fontName,
+        virtualPath, sourcePath);
+    int result = g_pyRunSimpleString(script.c_str());
+    if (result == 0 && AppliedMarkerMatches(version)) {
+        InterlockedExchange(&g_appliedVersion, version);
+        TraceLimited("applied version=%ld enabled=%d refresh=%d font='%s' source='%s'",
+            version, enabled ? 1 : 0, refresh ? 1 : 0, fontName.c_str(),
+        EngineCommon::WideToUtf8(sourcePath).c_str());
+    }
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
+    return 0;
+}
+
+static bool QueuePendingApply() {
+    if (!BindPythonRuntime() || !g_pyIsInitialized() ||
+        InterlockedCompareExchange(&g_pendingQueued, 1, 0) != 0) {
+        return false;
+    }
+
+    if (g_pyAddPendingCall(ApplyPendingCallback, NULL) != 0) {
+        InterlockedExchange(&g_pendingQueued, 0);
+        return false;
+    }
+    return true;
+}

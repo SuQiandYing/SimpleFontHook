@@ -1,0 +1,640 @@
+static bool MonoIsReplacementEnabled() {
+    return !Utils::IsShuttingDown() && Config::EnableCatSystemUnityHook && Config::EnableFontHook &&
+        Config::ForcedFontNameW[0] != L'\0';
+}
+
+static bool MonoManagedRuntimeReady() {
+    return !Utils::IsShuttingDown() && g_monoProcessAttachTick != 0 &&
+        static_cast<DWORD>(GetTickCount() - g_monoProcessAttachTick) >= 3000;
+}
+
+static std::wstring MonoWideFromAnsi(const char* text) {
+    if (!text || !text[0]) return L"";
+    int length = MultiByteToWideChar(CP_ACP, 0, text, -1, NULL, 0);
+    if (length <= 0) return L"";
+    std::vector<wchar_t> buffer((size_t)length);
+    MultiByteToWideChar(CP_ACP, 0, text, -1, buffer.data(), length);
+    return std::wstring(buffer.data());
+}
+
+static std::string MonoWideToUtf8(const std::wstring& text) {
+    if (text.empty()) return "";
+    int length = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1,
+        NULL, 0, NULL, NULL);
+    if (length <= 0) return "";
+    std::vector<char> buffer((size_t)length);
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1,
+        buffer.data(), length, NULL, NULL);
+    return std::string(buffer.data());
+}
+
+static std::string MonoDescribeCodePoints(const std::wstring& text, size_t limit) {
+    std::string description;
+    size_t emitted = 0;
+    for (size_t i = 0; i < text.size() && emitted < limit; ++i) {
+        uint32_t codePoint = static_cast<uint16_t>(text[i]);
+        if (codePoint >= 0xD800 && codePoint <= 0xDBFF && i + 1 < text.size()) {
+            uint32_t low = static_cast<uint16_t>(text[i + 1]);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                codePoint = 0x10000 + ((codePoint - 0xD800) << 10) +
+                    (low - 0xDC00);
+                ++i;
+            }
+        }
+        char item[20] = {};
+        sprintf_s(item, codePoint <= 0xFFFF ? "U+%04X" : "U+%06X", codePoint);
+        if (!description.empty()) description += ',';
+        description += item;
+        ++emitted;
+    }
+    if (emitted < text.size()) description += ",...";
+    return description;
+}
+
+static bool MonoFindAllObjects(void* typeObject, std::vector<void*>& objects,
+    std::vector<uint32_t>* objectRoots = NULL) {
+    objects.clear();
+    if (objectRoots) objectRoots->clear();
+    if (!typeObject || !g_monoBindings.findAllObjects) return false;
+    void* params[1] = { typeObject };
+    void* result = NULL;
+    if (!MonoInvoke(g_monoBindings.findAllObjects, NULL, params, &result,
+        "Resources.FindObjectsOfTypeAll") || !result) return false;
+    uint32_t root = g_monoApi.gcHandleNew(result, 1);
+    size_t count = MonoArrayLength(result);
+    if (count > 1000000) {
+        if (root) MonoFreeHandle(root);
+        return false;
+    }
+    objects.reserve(count);
+    if (objectRoots) objectRoots->reserve(count);
+    bool interrupted = false;
+    for (size_t i = 0; i < count; ++i) {
+        if (Utils::IsShuttingDown()) {
+            interrupted = true;
+            break;
+        }
+        void* slot = g_monoApi.arrayAddrWithSize(result, (int)sizeof(void*), i);
+        void* object = slot ? *reinterpret_cast<void**>(slot) : NULL;
+        if (object) {
+            objects.push_back(object);
+            if (objectRoots) objectRoots->push_back(g_monoApi.gcHandleNew(object, 1));
+        }
+    }
+    if (root) MonoFreeHandle(root);
+    if (interrupted || Utils::IsShuttingDown()) {
+        objects.clear();
+        if (objectRoots) objectRoots->clear();
+        return false;
+    }
+    return true;
+}
+
+static void MonoFreeObjectRoots(std::vector<uint32_t>& roots) {
+    if (!Utils::IsShuttingDown()) {
+        for (uint32_t root : roots) if (root) MonoFreeHandle(root);
+    }
+    roots.clear();
+}
+
+static void MonoInitializeFontName(void* font, const std::wstring& face) {
+    if (!font || !g_monoBindings.fontSetName) return;
+    void* managedName = MonoString(face);
+    void* params[1] = { managedName };
+    if (managedName) {
+        MonoInvoke(g_monoBindings.fontSetName, font, params, NULL,
+            "Font.set_name");
+    }
+}
+
+static void* MonoCreateDynamicFontFromArray(const std::wstring& face, int size,
+    uint32_t* outputRoot) {
+    if (outputRoot) *outputRoot = 0;
+    if (!g_monoBindings.dynamicFontArrayConstructor ||
+        !g_monoApi.arrayNew || !g_monoApi.arrayAddrWithSize ||
+        !g_monoApi.objectGetClass || !g_monoApi.objectNew ||
+        !g_monoApi.gcHandleNew || !g_monoApi.gcHandleGetTarget) return NULL;
+
+    void* managedFace = MonoString(face);
+    if (!managedFace) return NULL;
+    uint32_t faceRoot = g_monoApi.gcHandleNew(managedFace, 1);
+    if (!faceRoot) return NULL;
+
+    void* stringClass = g_monoApi.objectGetClass(managedFace);
+    void* names = stringClass
+        ? g_monoApi.arrayNew(g_monoApi.domain, stringClass, 1) : NULL;
+    uint32_t namesRoot = names ? g_monoApi.gcHandleNew(names, 1) : 0;
+    void* slot = names
+        ? g_monoApi.arrayAddrWithSize(names, (int)sizeof(void*), 0) : NULL;
+    if (!namesRoot || !slot) {
+        if (namesRoot) MonoFreeHandle(namesRoot);
+        MonoFreeHandle(faceRoot);
+        return NULL;
+    }
+    if (g_monoApi.gcWbarrierSetArrayRef) {
+        g_monoApi.gcWbarrierSetArrayRef(names,
+            reinterpret_cast<void**>(slot), managedFace);
+    } else {
+        *reinterpret_cast<void**>(slot) = managedFace;
+    }
+
+    void* font = g_monoApi.objectNew(g_monoApi.domain, g_monoBindings.fontClass);
+    uint32_t fontRoot = font ? g_monoApi.gcHandleNew(font, 1) : 0;
+    bool created = false;
+    if (fontRoot) {
+        void* params[2] = { names, &size };
+        created = MonoInvoke(g_monoBindings.dynamicFontArrayConstructor,
+            font, params, NULL, "Font..ctor(string[],int)");
+    }
+    if (created) {
+        font = g_monoApi.gcHandleGetTarget(fontRoot);
+        MonoInitializeFontName(font, face);
+        bool dynamic = true;
+        if (g_monoBindings.fontGetDynamic &&
+            !MonoGetFontDynamic(font, &dynamic)) dynamic = false;
+        if (dynamic) {
+            MonoFreeHandle(faceRoot);
+            MonoFreeHandle(namesRoot);
+            if (outputRoot) *outputRoot = fontRoot;
+            return font;
+        }
+    }
+    if (fontRoot) MonoFreeHandle(fontRoot);
+    MonoFreeHandle(namesRoot);
+    MonoFreeHandle(faceRoot);
+    return NULL;
+}
+
+static void MonoTraceFontState(void* font, const char* stage) {
+    if (!font) {
+        Utils::Trace("[DEBUG][UnityMono] font state stage=%s object=null",
+            stage ? stage : "<unknown>");
+        return;
+    }
+    bool dynamic = false;
+    bool dynamicOk = !g_monoBindings.fontGetDynamic ||
+        MonoGetFontDynamic(font, &dynamic);
+    void* nameObject = NULL;
+    bool nameOk = g_monoBindings.fontGetName &&
+        MonoInvoke(g_monoBindings.fontGetName, font, NULL, &nameObject,
+            "Font.get_name(diagnostic)");
+    std::string name = nameOk ? MonoWideToUtf8(MonoReadString(nameObject)) : "";
+    void* material = NULL;
+    bool materialOk = g_monoBindings.fontGetMaterial &&
+        MonoInvoke(g_monoBindings.fontGetMaterial, font, NULL, &material,
+            "Font.get_material(diagnostic)");
+    Utils::Trace("[DEBUG][UnityMono] font state stage=%s object=%p dynamicOk=%d dynamic=%d nameOk=%d name='%s' materialOk=%d material=%p",
+        stage ? stage : "<unknown>", font, dynamicOk ? 1 : 0,
+        dynamic ? 1 : 0, nameOk ? 1 : 0, name.c_str(),
+        materialOk ? 1 : 0, material);
+}
+
+struct MonoSourceFontCandidate {
+    std::wstring face;
+    std::wstring sourcePath;
+};
+
+static std::vector<MonoSourceFontCandidate> MonoBuildSourceFontCandidates() {
+    std::vector<std::wstring> faces;
+    std::wstring ansiFace = MonoWideFromAnsi(Config::ForcedFontNameA);
+    if (!ansiFace.empty()) faces.push_back(ansiFace);
+    std::wstring visibleFace = Config::ForcedFontNameW;
+    if (!visibleFace.empty()) {
+        bool duplicate = false;
+        for (const std::wstring& face : faces) {
+            if (_wcsicmp(face.c_str(), visibleFace.c_str()) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) faces.push_back(visibleFace);
+    }
+
+    std::vector<MonoSourceFontCandidate> resolved;
+    std::vector<MonoSourceFontCandidate> nameOnly;
+    resolved.reserve(faces.size());
+    nameOnly.reserve(faces.size());
+    for (const std::wstring& face : faces) {
+        MonoSourceFontCandidate candidate = {
+            face, EngineCommon::FindSystemFontFileByFace(face.c_str())
+        };
+        if (candidate.sourcePath.empty()) nameOnly.push_back(candidate);
+        else resolved.push_back(candidate);
+    }
+
+    // A TTC can expose an invariant family name to Unity while only its localized
+    // registry name resolves to the backing file. TMP may reject the name-created
+    // Font even though UI.Text accepts it, so consider every file-backed alias first.
+    resolved.insert(resolved.end(), nameOnly.begin(), nameOnly.end());
+    return resolved;
+}
+
+static bool MonoCreateSourceFont(LONG version, bool preserveReplacement = false) {
+    if (Utils::IsShuttingDown()) return false;
+    void* rooted = g_monoSourceFontHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle) : NULL;
+    if (rooted && g_monoSourceVersion == version &&
+        _wcsicmp(g_monoReplacementFace, Config::ForcedFontNameW) == 0) {
+        if (MonoFontIsUsable(rooted)) {
+            g_monoSourceFont = rooted;
+            return true;
+        }
+        Utils::Trace("[DEBUG][UnityMono] stale Unity font root detected version=%ld object=%p; rebuilding",
+            version, rooted);
+    }
+
+    bool keepReplacement = preserveReplacement &&
+        g_monoReplacementFontAssetHandle && g_monoReplacementMaterialHandle &&
+        g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle) &&
+        g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle) &&
+        g_monoReplacementVersion == version &&
+        _wcsicmp(g_monoReplacementFace, Config::ForcedFontNameW) == 0;
+    if (!keepReplacement) {
+        MonoReleaseRoot(&g_monoReplacementMaterial, &g_monoReplacementMaterialHandle);
+        MonoReleaseRoot(&g_monoReplacementFontAsset, &g_monoReplacementFontAssetHandle);
+        g_monoReplacementVersion = LONG_MIN;
+        g_monoLegacyCharacterHash = 0;
+        g_monoModernCharacterHash = 0;
+        InterlockedExchange(&g_monoLastCharacterScanTick, 0);
+    }
+    MonoReleaseRoot(&g_monoSourceFont, &g_monoSourceFontHandle);
+    g_monoSourceVersion = LONG_MIN;
+
+    std::vector<MonoSourceFontCandidate> candidates =
+        MonoBuildSourceFontCandidates();
+
+    void* font = NULL;
+    std::wstring resolvedFace;
+    std::wstring resolvedPath;
+    bool createdFromPath = false;
+    bool resolvedDynamic = false;
+    uint32_t selectedRoot = 0;
+    const int sampleSize = 48;
+    for (const MonoSourceFontCandidate& source : candidates) {
+        const std::wstring& face = source.face;
+        const std::wstring& sourcePath = source.sourcePath;
+        uint32_t candidateRoot = 0;
+        void* candidate = NULL;
+        bool candidateFromArray = false;
+        if (!sourcePath.empty() && g_monoBindings.internalCreateFontFromPath) {
+            candidate = g_monoApi.objectNew(g_monoApi.domain,
+                g_monoBindings.fontClass);
+            if (candidate) {
+                candidateRoot = g_monoApi.gcHandleNew(candidate, 1);
+                candidate = candidateRoot
+                    ? g_monoApi.gcHandleGetTarget(candidateRoot) : NULL;
+            }
+            if (candidate) {
+                g_monoApi.runtimeObjectInit(candidate);
+                void* managedPath = MonoString(sourcePath);
+                void* params[2] = { candidate, managedPath };
+                bool created = managedPath && MonoInvoke(
+                    g_monoBindings.internalCreateFontFromPath, NULL, params, NULL,
+                    "Font.Internal_CreateFontFromPath");
+                if (created) {
+                    MonoInitializeFontName(candidate, face);
+                    bool candidateDynamic = false;
+                    bool dynamicRead = g_monoBindings.fontGetDynamic &&
+                        MonoGetFontDynamic(candidate, &candidateDynamic);
+                    if (MonoFontIsUsable(candidate) &&
+                        MonoKeepUnityObjectAlive(candidate, "path UnityEngine.Font")) {
+                        MonoTraceFontState(candidate, "path-factory");
+                        font = candidate;
+                        selectedRoot = candidateRoot;
+                        resolvedFace = face;
+                        resolvedPath = sourcePath;
+                        createdFromPath = true;
+                        resolvedDynamic = dynamicRead && candidateDynamic;
+                        break;
+                    }
+                }
+            }
+            if (candidateRoot) MonoFreeHandle(candidateRoot);
+            candidateRoot = 0;
+            candidate = NULL;
+        }
+        // Fall back to Unity's public factory, then its private array
+        // constructor when direct loading from the resolved font file fails.
+        if (g_monoBindings.createDynamicFont) {
+            void* managedFace = MonoString(face);
+            int size = sampleSize;
+            void* params[2] = { managedFace, &size };
+            bool candidateDynamic = true;
+            if (managedFace && MonoInvoke(g_monoBindings.createDynamicFont,
+                NULL, params, &candidate, "Font.CreateDynamicFontFromOSFont") && candidate) {
+                candidateRoot = g_monoApi.gcHandleNew(candidate, 1);
+                candidate = candidateRoot
+                    ? g_monoApi.gcHandleGetTarget(candidateRoot) : NULL;
+                MonoInitializeFontName(candidate, face);
+                if (g_monoBindings.fontGetDynamic &&
+                    !MonoGetFontDynamic(candidate, &candidateDynamic)) {
+                    candidateDynamic = false;
+                }
+                if (candidateDynamic) {
+                    // Accepted below so both construction paths share the same
+                    // rooted lifetime and diagnostics.
+                } else {
+                    Utils::Trace("[DEBUG][UnityMono] rejected non-dynamic OS font face='%s' object=%p",
+                        MonoWideToUtf8(face).c_str(), candidate);
+                    if (candidateRoot) MonoFreeHandle(candidateRoot);
+                    candidateRoot = 0;
+                    candidate = NULL;
+                }
+            }
+        }
+        if (!candidate && g_monoBindings.dynamicFontArrayConstructor) {
+            candidate = MonoCreateDynamicFontFromArray(
+                face, sampleSize, &candidateRoot);
+            candidateFromArray = candidate != NULL;
+        }
+        if (candidate && candidateRoot) {
+            if (MonoFontIsUsable(candidate) &&
+                MonoKeepUnityObjectAlive(candidate, "candidate UnityEngine.Font")) {
+                MonoTraceFontState(candidate,
+                    candidateFromArray ? "dynamic-array-ctor" : "dynamic-factory");
+                font = candidate;
+                selectedRoot = candidateRoot;
+                resolvedFace = face;
+                resolvedPath = sourcePath;
+                createdFromPath = false;
+                resolvedDynamic = true;
+                break;
+            }
+            MonoFreeHandle(candidateRoot);
+            candidateRoot = 0;
+            candidate = NULL;
+        }
+    }
+    bool sourceRooted = font && MonoRootObject(font, &g_monoSourceFont,
+        &g_monoSourceFontHandle, "UnityEngine.Font");
+    if (sourceRooted && !MonoKeepUnityObjectAlive(g_monoSourceFont,
+        "UnityEngine.Font")) {
+        MonoReleaseRoot(&g_monoSourceFont, &g_monoSourceFontHandle);
+        sourceRooted = false;
+    }
+    if (selectedRoot) MonoFreeHandle(selectedRoot);
+    if (!sourceRooted) {
+        return false;
+    }
+    wcsncpy_s(g_monoReplacementFace, Config::ForcedFontNameW, _TRUNCATE);
+    g_monoSourceVersion = version;
+    Utils::Trace("[DEBUG][UnityMono] Unity font ready version=%ld requested='%s' resolved='%s' source=%s dynamic=%d path='%s' object=%p",
+        version, MonoWideToUtf8(Config::ForcedFontNameW).c_str(),
+        MonoWideToUtf8(resolvedFace).c_str(), createdFromPath ? "path" : "os",
+        resolvedDynamic ? 1 : 0,
+        MonoWideToUtf8(resolvedPath).c_str(), font);
+    return true;
+}
+
+static const size_t kMonoMaximumCollectedCodePoints = 8192;
+
+static void MonoAppendWideCodePoint(std::wstring& text, uint32_t codePoint) {
+    if (codePoint <= 0xFFFF) {
+        text.push_back(static_cast<wchar_t>(codePoint));
+        return;
+    }
+    uint32_t supplementary = codePoint - 0x10000;
+    text.push_back(static_cast<wchar_t>(0xD800 + (supplementary >> 10)));
+    text.push_back(static_cast<wchar_t>(0xDC00 + (supplementary & 0x3FF)));
+}
+
+static std::wstring MonoRememberTextCharacters(void* managedText) {
+    std::wstring additions;
+    if (!managedText) return additions;
+    std::wstring text = MonoReadString(managedText);
+    auto remember = [&additions](uint32_t codePoint) {
+        if (codePoint == 0 || codePoint > 0x10FFFF ||
+            (codePoint < 0x20 && codePoint != L'\t' && codePoint != L'\n' &&
+                codePoint != L'\r') ||
+            (codePoint >= 0xD800 && codePoint <= 0xDFFF) ||
+            g_monoKnownCodePoints.size() >= kMonoMaximumCollectedCodePoints ||
+            std::find(g_monoKnownCodePoints.begin(),
+                g_monoKnownCodePoints.end(), codePoint) !=
+                g_monoKnownCodePoints.end()) return;
+        g_monoKnownCodePoints.push_back(codePoint);
+        MonoAppendWideCodePoint(additions, codePoint);
+    };
+    for (size_t i = 0; i < text.size(); ++i) {
+        uint32_t first = static_cast<uint16_t>(text[i]);
+        if (first >= 0xD800 && first <= 0xDBFF && i + 1 < text.size()) {
+            uint32_t second = static_cast<uint16_t>(text[i + 1]);
+            if (second >= 0xDC00 && second <= 0xDFFF) {
+                remember(0x10000 + ((first - 0xD800) << 10) +
+                    (second - 0xDC00));
+                ++i;
+                continue;
+            }
+        }
+        remember(first >= 0xD800 && first <= 0xDFFF ? 0xFFFD : first);
+    }
+    return additions;
+}
+
+static void MonoAppendCodePoint(std::vector<bool>& seen,
+    std::vector<uint32_t>& codePoints, uint32_t codePoint) {
+    if (codePoint == 0 || codePoint >= seen.size() || seen[codePoint] ||
+        codePoints.size() >= kMonoMaximumCollectedCodePoints) return;
+    if (codePoint < 0x20 && codePoint != L'\t' && codePoint != L'\n' &&
+        codePoint != L'\r') return;
+    if (codePoint >= 0xD800 && codePoint <= 0xDFFF) return;
+    seen[codePoint] = true;
+    codePoints.push_back(codePoint);
+}
+
+static void MonoAppendText(std::vector<bool>& seen,
+    std::vector<uint32_t>& codePoints, const std::wstring& text) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        uint32_t first = static_cast<uint16_t>(text[i]);
+        if (first >= 0xD800 && first <= 0xDBFF && i + 1 < text.size()) {
+            uint32_t second = static_cast<uint16_t>(text[i + 1]);
+            if (second >= 0xDC00 && second <= 0xDFFF) {
+                uint32_t codePoint = 0x10000 + ((first - 0xD800) << 10) +
+                    (second - 0xDC00);
+                MonoAppendCodePoint(seen, codePoints, codePoint);
+                ++i;
+                continue;
+            }
+        }
+        if (first >= 0xD800 && first <= 0xDFFF) {
+            MonoAppendCodePoint(seen, codePoints, 0xFFFD);
+            continue;
+        }
+        MonoAppendCodePoint(seen, codePoints, first);
+    }
+}
+
+static void MonoCollectObjectText(void* typeObject, void* getText,
+    std::vector<bool>& seen, std::vector<uint32_t>& codePoints) {
+    if (!typeObject || !getText) return;
+    std::vector<void*> objects;
+    std::vector<uint32_t> objectRoots;
+    if (!MonoFindAllObjects(typeObject, objects, &objectRoots)) return;
+    for (void* object : objects) {
+        if (Utils::IsShuttingDown()) break;
+        void* objectClass = g_monoApi.objectGetClass(object);
+        void* objectGetText = objectClass ? MonoFindMethod(objectClass, "get_text", 0) : NULL;
+        if (!objectGetText) objectGetText = getText;
+        void* text = NULL;
+        if (MonoInvoke(objectGetText, object, NULL, &text, "Text.get_text") && text)
+            MonoAppendText(seen, codePoints, MonoReadString(text));
+    }
+    MonoFreeObjectRoots(objectRoots);
+}
+
+static std::wstring MonoCollectCharacters(uint64_t* hash) {
+    std::vector<bool> seen(0x110000, false);
+    std::vector<uint32_t> codePoints;
+    codePoints.reserve(std::max<size_t>(1024, g_monoKnownCodePoints.size() + 128));
+    std::wstring characters;
+    // Keep the session glyph set monotonic. History rows are pooled and hidden,
+    // so rebuilding from only the currently visible objects would continuously
+    // repack the atlas and invalidate material/mesh UV pairs.
+    for (uint32_t codePoint : g_monoKnownCodePoints)
+        MonoAppendCodePoint(seen, codePoints, codePoint);
+    MonoCollectObjectText(g_monoBindings.tmpTextTypeObject,
+        g_monoBindings.tmpGetText, seen, codePoints);
+    if (Utils::IsShuttingDown()) return L"";
+    MonoCollectObjectText(g_monoBindings.uiTextTypeObject,
+        g_monoBindings.uiGetText, seen, codePoints);
+    if (Utils::IsShuttingDown()) return L"";
+    for (uint32_t codePoint = 0x20; codePoint <= 0x7E; ++codePoint)
+        MonoAppendCodePoint(seen, codePoints, codePoint);
+    MonoAppendCodePoint(seen, codePoints, 0x3000);
+    MonoAppendCodePoint(seen, codePoints, 0xFFFD);
+    if (codePoints.size() > g_monoKnownCodePoints.size())
+        g_monoKnownCodePoints = codePoints;
+
+    uint64_t value = 1469598103934665603ULL;
+    std::vector<uint32_t> sortedCodePoints = codePoints;
+    std::sort(sortedCodePoints.begin(), sortedCodePoints.end());
+    for (uint32_t codePoint : sortedCodePoints) {
+        value ^= codePoint;
+        value *= 1099511628211ULL;
+    }
+    characters.reserve(codePoints.size());
+    for (uint32_t codePoint : codePoints)
+        MonoAppendWideCodePoint(characters, codePoint);
+    if (hash) *hash = value;
+    return characters;
+}
+
+static bool MonoGetAssetMaterial(void* fontAsset, void** material) {
+    if (material) *material = NULL;
+    if (!fontAsset || !material) return false;
+    if (g_monoBindings.getAssetMaterial) {
+        return MonoInvoke(g_monoBindings.getAssetMaterial, fontAsset,
+            NULL, material, "TMP_Asset.get_material");
+    }
+    *material = MonoGetObjectField(fontAsset, g_monoBindings.assetMaterialField);
+    return *material != NULL;
+}
+
+static bool MonoSetAssetMaterial(void* fontAsset, void* material) {
+    if (!fontAsset || !material) return false;
+    if (g_monoBindings.setAssetMaterial) {
+        void* params[1] = { material };
+        return MonoInvoke(g_monoBindings.setAssetMaterial, fontAsset,
+            params, NULL, "TMP_Asset.set_material");
+    }
+    return MonoSetObjectField(fontAsset, g_monoBindings.assetMaterialField, material);
+}
+
+static bool MonoSetSourceFontFile(void* fontAsset, void* sourceFont) {
+    if (!fontAsset || !sourceFont) return false;
+    if (g_monoBindings.setSourceFontFile) {
+        void* params[1] = { sourceFont };
+        if (MonoInvoke(g_monoBindings.setSourceFontFile, fontAsset, params,
+            NULL, "TMP_FontAsset.set_sourceFontFile")) return true;
+    }
+    return MonoSetObjectField(fontAsset,
+        g_monoBindings.sourceFontFileField, sourceFont);
+}
+
+static bool MonoEnsureModernSourceFont(void* fontAsset, LONG version,
+    void** outputSourceFont) {
+    if (outputSourceFont) *outputSourceFont = NULL;
+    if (!fontAsset || !outputSourceFont || g_monoBindings.legacyTmp)
+        return false;
+    void* sourceFont = g_monoSourceFontHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle) : NULL;
+    bool refreshed = false;
+    if (!MonoFontIsUsable(sourceFont)) {
+        if (!MonoCreateSourceFont(version, true)) return false;
+        sourceFont = g_monoSourceFontHandle
+            ? g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle) : NULL;
+        refreshed = true;
+    }
+    if (!MonoFontIsUsable(sourceFont)) return false;
+    void* boundSource = g_monoBindings.sourceFontFileField
+        ? MonoGetObjectField(fontAsset, g_monoBindings.sourceFontFileField)
+        : NULL;
+    bool rebound = g_monoBindings.sourceFontFileField
+        ? boundSource != sourceFont : refreshed;
+    if (rebound && !MonoSetSourceFontFile(fontAsset, sourceFont)) return false;
+    if (refreshed || rebound) {
+        Utils::Trace("[DEBUG][UnityMono] TMP source font rebound version=%ld asset=%p source=%p refreshed=%d",
+            version, fontAsset, sourceFont, refreshed ? 1 : 0);
+    }
+    *outputSourceFont = sourceFont;
+    return true;
+}
+
+static void* MonoFindTemplateMaterial(void* skipAsset) {
+    std::vector<void*> assets;
+    std::vector<uint32_t> assetRoots;
+    if (!MonoFindAllObjects(g_monoBindings.tmpFontAssetTypeObject, assets, &assetRoots)) return NULL;
+    void* fallback = NULL;
+    for (void* asset : assets) {
+        if (!asset || asset == skipAsset) continue;
+        void* material = NULL;
+        if (!MonoGetAssetMaterial(asset, &material) || !material) continue;
+        if (!fallback) fallback = material;
+        if (g_monoBindings.fontAssetTypeField) {
+            int assetType = 0;
+            g_monoApi.fieldGetValue(asset, g_monoBindings.fontAssetTypeField, &assetType);
+            if (assetType == 2) {
+                MonoFreeObjectRoots(assetRoots);
+                return material;
+            }
+        }
+    }
+    MonoFreeObjectRoots(assetRoots);
+    return fallback;
+}
+
+static void* MonoCloneMaterialWithTexture(void* templateMaterial, void* texture,
+    uint32_t* temporaryRoot, bool allowSharedTemplate) {
+    if (temporaryRoot) *temporaryRoot = 0;
+    if (!templateMaterial || !texture || !g_monoBindings.setMaterialMainTexture)
+        return NULL;
+
+    void* material = templateMaterial;
+    uint32_t materialRoot = 0;
+    if (g_monoBindings.materialCopyConstructor) {
+        material = g_monoApi.objectNew(g_monoApi.domain, g_monoBindings.materialClass);
+        if (!material) return NULL;
+        materialRoot = g_monoApi.gcHandleNew(material, 1);
+        if (!materialRoot) return NULL;
+        void* constructorParams[1] = { templateMaterial };
+        if (!MonoInvoke(g_monoBindings.materialCopyConstructor, material,
+            constructorParams, NULL, "Material..ctor(Material)")) {
+            MonoFreeHandle(materialRoot);
+            return NULL;
+        }
+    } else if (!allowSharedTemplate) {
+        return NULL;
+    } else {
+        Utils::Trace("[DEBUG][UnityMono] material copy constructor unavailable; using shared template material=%p",
+            templateMaterial);
+    }
+
+    void* textureParams[1] = { texture };
+    if (!MonoInvoke(g_monoBindings.setMaterialMainTexture, material,
+        textureParams, NULL, "Material.set_mainTexture")) {
+        if (materialRoot) MonoFreeHandle(materialRoot);
+        return NULL;
+    }
+    if (temporaryRoot) *temporaryRoot = materialRoot;
+    else if (materialRoot) MonoFreeHandle(materialRoot);
+    return material;
+}

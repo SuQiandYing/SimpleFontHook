@@ -1,0 +1,420 @@
+static char ArtemisLowerAscii(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return (char)(ch - 'A' + 'a');
+    return ch;
+}
+
+static bool ArtemisIsAsciiIdent(char ch) {
+    unsigned char c = (unsigned char)ch;
+    return std::isalnum(c) != 0 || ch == '_';
+}
+
+static bool ArtemisIsAsciiDigit(char ch) {
+    return ch >= '0' && ch <= '9';
+}
+
+static bool ArtemisIsQuote(char ch) {
+    return ch == '"' || ch == '\'';
+}
+
+static bool ArtemisEqualsAsciiAt(const std::string& text, size_t pos, const char* needle) {
+    for (size_t i = 0; needle[i]; ++i) {
+        if (pos + i >= text.size()) return false;
+        if (ArtemisLowerAscii(text[pos + i]) != ArtemisLowerAscii(needle[i])) return false;
+    }
+    return true;
+}
+
+static bool ArtemisLooksBinary(const std::string& text) {
+    if (text.empty()) return false;
+    size_t nulCount = 0;
+    for (char ch : text) {
+        if (ch == '\0') ++nulCount;
+    }
+    return nulCount > text.size() / 16;
+}
+
+static bool ArtemisPatchNumericField(std::string& text, const char* key, int value) {
+    char replacement[32] = {};
+    sprintf_s(replacement, "%d", value);
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        if (!ArtemisEqualsAsciiAt(text, pos, key)) {
+            ++pos;
+            continue;
+        }
+        if (pos > 0 && ArtemisIsAsciiIdent(text[pos - 1])) {
+            ++pos;
+            continue;
+        }
+
+        size_t p = pos + keyLen;
+        if (p < text.size() && ArtemisIsAsciiIdent(text[p])) {
+            ++pos;
+            continue;
+        }
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || (text[p] != '=' && text[p] != ':')) {
+            ++pos;
+            continue;
+        }
+        ++p;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+
+        bool quoted = false;
+        char quote = '\0';
+        if (p < text.size() && ArtemisIsQuote(text[p])) {
+            quoted = true;
+            quote = text[p++];
+        }
+
+        size_t valueStart = p;
+        if (p < text.size() && (text[p] == '-' || text[p] == '+')) ++p;
+        size_t digitStart = p;
+        while (p < text.size() && ArtemisIsAsciiDigit(text[p])) ++p;
+        if (p == digitStart) {
+            ++pos;
+            continue;
+        }
+        if (quoted && (p >= text.size() || text[p] != quote)) {
+            ++pos;
+            continue;
+        }
+        text.replace(valueStart, p - valueStart, replacement);
+        pos = valueStart + strlen(replacement) + (quoted ? 1 : 0);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static int ArtemisScalePermilleToInt(int base, int permille) {
+    long long value = (long long)base * (long long)permille;
+    if (value >= 0) return (int)((value + 500) / 1000);
+    return (int)((value - 500) / 1000);
+}
+
+static bool ArtemisFindNumericFieldInRange(const std::string& text, size_t begin, size_t end,
+    const char* key, int* valueOut) {
+    if (!key || begin >= text.size() || begin >= end) return false;
+    end = std::min(end, text.size());
+
+    const size_t keyLen = strlen(key);
+    for (size_t pos = begin; pos + keyLen < end;) {
+        if (!ArtemisEqualsAsciiAt(text, pos, key) ||
+            (pos > begin && ArtemisIsAsciiIdent(text[pos - 1]))) {
+            ++pos;
+            continue;
+        }
+
+        size_t p = pos + keyLen;
+        if (p < end && ArtemisIsAsciiIdent(text[p])) {
+            pos = p;
+            continue;
+        }
+        while (p < end && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= end || (text[p] != '=' && text[p] != ':')) {
+            ++pos;
+            continue;
+        }
+        ++p;
+        while (p < end && (text[p] == ' ' || text[p] == '\t')) ++p;
+
+        bool quoted = false;
+        char quote = '\0';
+        if (p < end && ArtemisIsQuote(text[p])) {
+            quoted = true;
+            quote = text[p++];
+        }
+
+        int sign = 1;
+        if (p < end && (text[p] == '-' || text[p] == '+')) {
+            sign = text[p] == '-' ? -1 : 1;
+            ++p;
+        }
+
+        size_t digitStart = p;
+        int value = 0;
+        while (p < end && ArtemisIsAsciiDigit(text[p])) {
+            value = value * 10 + (text[p] - '0');
+            ++p;
+        }
+        if (p == digitStart) {
+            ++pos;
+            continue;
+        }
+        if (quoted && (p >= end || text[p] != quote)) {
+            ++pos;
+            continue;
+        }
+
+        if (valueOut) *valueOut = value * sign;
+        return true;
+    }
+
+    return false;
+}
+
+static int ArtemisResolveTableLineSpacing(const std::string& text, size_t fieldPos) {
+    if (!Config::EnableFontVerticalMetrics) return Config::FontLineSpacing;
+
+    size_t blockStart = text.rfind('{', fieldPos);
+    size_t blockEnd = text.find('}', fieldPos);
+    int fontSize = Config::ArtemisFontSize;
+    if (fontSize <= 0 && blockStart != std::string::npos && blockEnd != std::string::npos &&
+        blockStart < fieldPos && fieldPos < blockEnd) {
+        ArtemisFindNumericFieldInRange(text, blockStart + 1, blockEnd, "size", &fontSize);
+    }
+    if (fontSize <= 0) fontSize = 34;
+    return ArtemisScalePermilleToInt(fontSize, Config::FontLineSpacing);
+}
+
+static bool ArtemisPatchLineSpacingField(std::string& text) {
+    const char* key = "spacemiddle";
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        if (!ArtemisEqualsAsciiAt(text, pos, key)) {
+            ++pos;
+            continue;
+        }
+        if (pos > 0 && ArtemisIsAsciiIdent(text[pos - 1])) {
+            ++pos;
+            continue;
+        }
+
+        size_t p = pos + keyLen;
+        if (p < text.size() && ArtemisIsAsciiIdent(text[p])) {
+            pos = p;
+            continue;
+        }
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || (text[p] != '=' && text[p] != ':')) {
+            ++pos;
+            continue;
+        }
+        ++p;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+
+        bool quoted = false;
+        char quote = '\0';
+        if (p < text.size() && ArtemisIsQuote(text[p])) {
+            quoted = true;
+            quote = text[p++];
+        }
+
+        size_t valueStart = p;
+        if (p < text.size() && (text[p] == '-' || text[p] == '+')) ++p;
+        size_t digitStart = p;
+        while (p < text.size() && ArtemisIsAsciiDigit(text[p])) ++p;
+        if (p == digitStart) {
+            ++pos;
+            continue;
+        }
+        if (quoted && (p >= text.size() || text[p] != quote)) {
+            ++pos;
+            continue;
+        }
+
+        char replacement[32] = {};
+        sprintf_s(replacement, "%d", ArtemisResolveTableLineSpacing(text, pos));
+        text.replace(valueStart, p - valueStart, replacement);
+        pos = valueStart + strlen(replacement) + (quoted ? 1 : 0);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisPatchNumberedFontAssignments(std::string& text, const std::string& virtualFontPath) {
+    if (virtualFontPath.empty()) return false;
+    bool changed = false;
+
+    for (size_t pos = 0; pos + 6 < text.size();) {
+        if (!ArtemisEqualsAsciiAt(text, pos, "font") ||
+            !ArtemisIsAsciiDigit(text[pos + 4]) ||
+            !ArtemisIsAsciiDigit(text[pos + 5]) ||
+            (pos > 0 && ArtemisIsAsciiIdent(text[pos - 1]))) {
+            ++pos;
+            continue;
+        }
+
+        size_t keyEnd = pos + 6;
+        if (keyEnd < text.size() && ArtemisIsAsciiIdent(text[keyEnd])) {
+            pos = keyEnd;
+            continue;
+        }
+
+        size_t p = keyEnd;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || text[p] != '=') {
+            pos = keyEnd;
+            continue;
+        }
+        ++p;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || !ArtemisIsQuote(text[p])) {
+            pos = p;
+            continue;
+        }
+
+        char quote = text[p++];
+        size_t valueStart = p;
+        while (p < text.size() && text[p] != quote && text[p] != '\r' && text[p] != '\n') ++p;
+        if (p >= text.size() || text[p] != quote) {
+            pos = valueStart;
+            continue;
+        }
+
+        text.replace(valueStart, p - valueStart, virtualFontPath);
+        pos = valueStart + virtualFontPath.size() + 1;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static std::string ArtemisLowerPathValue(std::string value) {
+    for (char& ch : value) {
+        if (ch == '\\') ch = '/';
+        ch = ArtemisLowerAscii(ch);
+    }
+    return value;
+}
+
+static bool ArtemisEndsWithAscii(const std::string& text, const char* suffix) {
+    size_t textLen = text.size();
+    size_t suffixLen = strlen(suffix);
+    return textLen >= suffixLen &&
+        text.compare(textLen - suffixLen, suffixLen, suffix) == 0;
+}
+
+static bool ArtemisLooksLikePatchableFontValue(const std::string& value) {
+    if (value.empty()) return false;
+    if (value.find('$') != std::string::npos ||
+        value.find('+') != std::string::npos ||
+        value.find('(') != std::string::npos ||
+        value.find(')') != std::string::npos) {
+        return false;
+    }
+
+    std::string lower = ArtemisLowerPathValue(value);
+    return lower.find("/font/") != std::string::npos ||
+        ArtemisEndsWithAscii(lower, ".ttf") ||
+        ArtemisEndsWithAscii(lower, ".ttc") ||
+        ArtemisEndsWithAscii(lower, ".otf");
+}
+
+static bool ArtemisPatchQuotedFontField(std::string& text, const char* key,
+    const std::string& virtualFontPath) {
+    if (virtualFontPath.empty()) return false;
+
+    const size_t keyLen = strlen(key);
+    bool changed = false;
+
+    for (size_t pos = 0; pos + keyLen < text.size();) {
+        if (!ArtemisEqualsAsciiAt(text, pos, key)) {
+            ++pos;
+            continue;
+        }
+        if (pos > 0 && ArtemisIsAsciiIdent(text[pos - 1])) {
+            ++pos;
+            continue;
+        }
+
+        size_t p = pos + keyLen;
+        if (p < text.size() && ArtemisIsAsciiIdent(text[p])) {
+            pos = p;
+            continue;
+        }
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || (text[p] != '=' && text[p] != ':')) {
+            ++pos;
+            continue;
+        }
+        ++p;
+        while (p < text.size() && (text[p] == ' ' || text[p] == '\t')) ++p;
+        if (p >= text.size() || !ArtemisIsQuote(text[p])) {
+            ++pos;
+            continue;
+        }
+
+        char quote = text[p++];
+        size_t valueStart = p;
+        while (p < text.size() && text[p] != quote && text[p] != '\r' && text[p] != '\n') ++p;
+        if (p >= text.size() || text[p] != quote) {
+            pos = valueStart;
+            continue;
+        }
+
+        std::string oldValue = text.substr(valueStart, p - valueStart);
+        if (!ArtemisLooksLikePatchableFontValue(oldValue)) {
+            pos = p + 1;
+            continue;
+        }
+
+        text.replace(valueStart, p - valueStart, virtualFontPath);
+        pos = valueStart + virtualFontPath.size() + 1;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool ArtemisPatchFontAssignments(std::string& text, const std::string& virtualFontPath) {
+    bool changed = false;
+    changed = ArtemisPatchNumberedFontAssignments(text, virtualFontPath) || changed;
+    changed = ArtemisPatchQuotedFontField(text, "rubyface", virtualFontPath) || changed;
+    changed = ArtemisPatchQuotedFontField(text, "ruby", virtualFontPath) || changed;
+    changed = ArtemisPatchQuotedFontField(text, "face", virtualFontPath) || changed;
+    return changed;
+}
+
+static bool ArtemisPatchTableContent(const ArtemisPathInfo& info, std::vector<BYTE>& bytes) {
+    if (bytes.empty()) return false;
+    std::string text((const char*)bytes.data(), bytes.size());
+    if (ArtemisLooksBinary(text)) {
+        ArtemisTraceLimited("table-skip-binary path='%s' size=%u",
+            ArtemisWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size());
+        return false;
+    }
+
+    bool changed = false;
+    if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
+        bool syncedFontFile = ArtemisSyncVirtualFontFile(Config::ConfigVersion);
+        std::string virtualFontPath = ArtemisVirtualFontPathUtf8();
+        if (syncedFontFile && !virtualFontPath.empty()) {
+            changed = ArtemisPatchFontAssignments(text, virtualFontPath) || changed;
+        } else {
+            ArtemisTraceLimited("table-font-skip reason=no-font-file path='%s'",
+                ArtemisWideToUtf8(info.sourcePath).c_str());
+        }
+    }
+
+    if (Config::EnableFontCharSpacing) {
+        changed = ArtemisPatchNumericField(text, "kerning", Config::FontCharSpacing) || changed;
+    }
+    if (Config::EnableFontLineSpacing) {
+        changed = ArtemisPatchLineSpacingField(text) || changed;
+    }
+    if (Config::ArtemisFontSize > 0) {
+        changed = ArtemisPatchNumericField(text, "size", Config::ArtemisFontSize) || changed;
+    }
+    if (Config::ArtemisRubySize >= 0) {
+        changed = ArtemisPatchNumericField(text, "rubysize", Config::ArtemisRubySize) || changed;
+    }
+
+    if (!changed) return false;
+    bytes.assign(text.begin(), text.end());
+    ArtemisTraceLimited("table-patched kind=%d source='%s' bytes=%u fontPath='%s' kerning=%d spacemiddle=%d spacemiddleMode='%s' size=%d ruby=%d",
+        (int)info.kind, ArtemisWideToUtf8(info.sourcePath).c_str(), (unsigned)bytes.size(),
+        ArtemisWideToUtf8(ArtemisBuildVirtualFontPath()).c_str(),
+        Config::EnableFontCharSpacing ? Config::FontCharSpacing : 0,
+        Config::EnableFontLineSpacing ? Config::FontLineSpacing : 0,
+        Config::EnableFontVerticalMetrics ? "per-em" : "pixel",
+        Config::ArtemisFontSize,
+        Config::ArtemisRubySize);
+    return true;
+}

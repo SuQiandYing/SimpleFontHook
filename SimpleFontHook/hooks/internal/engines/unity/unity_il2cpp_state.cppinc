@@ -1,0 +1,195 @@
+struct Il2CppObjectLayout {
+    void* klass;
+    void* monitor;
+};
+
+struct Il2CppArrayBoundsLayout {
+    size_t length;
+    ptrdiff_t lowerBound;
+};
+
+struct Il2CppArrayLayout {
+    Il2CppObjectLayout object;
+    Il2CppArrayBoundsLayout* bounds;
+    size_t maxLength;
+    void* vector[1];
+};
+
+// methodPointer is the first field of MethodInfo on the IL2CPP versions used by
+// CatSystem for Unity. Only this stable prefix is needed for native detours.
+struct Il2CppMethodInfoHead {
+    void* methodPointer;
+};
+
+static_assert(offsetof(Il2CppArrayLayout, vector) ==
+    sizeof(Il2CppObjectLayout) + sizeof(void*) + sizeof(size_t),
+    "Unexpected IL2CPP array vector layout");
+
+typedef void* (*pIl2CppDomainGet)();
+typedef void* (*pIl2CppThreadCurrent)();
+typedef void* (*pIl2CppThreadAttach)(void* domain);
+typedef const void** (*pIl2CppDomainGetAssemblies)(void* domain, size_t* size);
+typedef const void* (*pIl2CppDomainAssemblyOpen)(void* domain, const char* name);
+typedef const void* (*pIl2CppAssemblyGetImage)(const void* assembly);
+typedef const char* (*pIl2CppImageGetName)(const void* image);
+typedef void* (*pIl2CppClassFromName)(const void* image, const char* namespaze, const char* name);
+typedef void* (*pIl2CppClassGetParent)(void* klass);
+typedef const void* (*pIl2CppClassGetType)(void* klass);
+typedef void* (*pIl2CppTypeGetObject)(const void* type);
+typedef const void* (*pIl2CppClassGetMethodFromName)(void* klass, const char* name, int argsCount);
+typedef const void* (*pIl2CppClassGetMethods)(void* klass, void** iter);
+typedef const void* (*pIl2CppClassGetFields)(void* klass, void** iter);
+typedef const char* (*pIl2CppMethodGetName)(const void* method);
+typedef unsigned int (*pIl2CppMethodGetParamCount)(const void* method);
+typedef const void* (*pIl2CppMethodGetParam)(const void* method, unsigned int index);
+typedef char* (*pIl2CppTypeGetName)(const void* type);
+typedef void (*pIl2CppFree)(void* memory);
+typedef void* (*pIl2CppRuntimeInvoke)(const void* method, void* object, void** params, void** exception);
+typedef void* (*pIl2CppStringNewUtf16)(const wchar_t* text, int length);
+typedef void* (*pIl2CppObjectNew)(void* klass);
+typedef void* (*pIl2CppObjectGetClass)(void* object);
+typedef void* (*pIl2CppObjectUnbox)(void* object);
+typedef size_t (*pIl2CppArrayLength)(const void* array);
+typedef void* (*pIl2CppArrayNew)(void* elementClass, size_t length);
+typedef void* (*pIl2CppResolveIcall)(const char* name);
+typedef void (*pIl2CppFormatException)(void* exception, char* message, int messageSize);
+typedef const char* (*pIl2CppFieldGetName)(const void* field);
+typedef const void* (*pIl2CppFieldGetType)(const void* field);
+typedef void (*pIl2CppFieldGetValue)(void* object, const void* field, void* value);
+typedef void (*pIl2CppFieldSetValue)(void* object, const void* field, void* value);
+typedef uint32_t (*pIl2CppGcHandleNew)(void* object, bool pinned);
+typedef void* (*pIl2CppGcHandleGetTarget)(uint32_t handle);
+typedef void (*pIl2CppGcHandleFree)(uint32_t handle);
+typedef void (*pIl2CppGcWbarrierSetField)(void* object, void** targetAddress, void* value);
+
+struct Il2CppApi {
+    HMODULE module;
+    pIl2CppDomainGet domainGet;
+    pIl2CppThreadCurrent threadCurrent;
+    pIl2CppThreadAttach threadAttach;
+    pIl2CppDomainGetAssemblies domainGetAssemblies;
+    pIl2CppDomainAssemblyOpen domainAssemblyOpen;
+    pIl2CppAssemblyGetImage assemblyGetImage;
+    pIl2CppImageGetName imageGetName;
+    pIl2CppClassFromName classFromName;
+    pIl2CppClassGetParent classGetParent;
+    pIl2CppClassGetType classGetType;
+    pIl2CppTypeGetObject typeGetObject;
+    pIl2CppClassGetMethodFromName classGetMethodFromName;
+    pIl2CppClassGetMethods classGetMethods;
+    pIl2CppClassGetFields classGetFields;
+    pIl2CppMethodGetName methodGetName;
+    pIl2CppMethodGetParamCount methodGetParamCount;
+    pIl2CppMethodGetParam methodGetParam;
+    pIl2CppTypeGetName typeGetName;
+    pIl2CppFree freeMemory;
+    pIl2CppRuntimeInvoke runtimeInvoke;
+    pIl2CppStringNewUtf16 stringNewUtf16;
+    pIl2CppObjectNew objectNew;
+    pIl2CppObjectGetClass objectGetClass;
+    pIl2CppObjectUnbox objectUnbox;
+    pIl2CppArrayLength arrayLength;
+    pIl2CppArrayNew arrayNew;
+    pIl2CppResolveIcall resolveIcall;
+    pIl2CppFormatException formatException;
+    pIl2CppFieldGetName fieldGetName;
+    pIl2CppFieldGetType fieldGetType;
+    pIl2CppFieldGetValue fieldGetValue;
+    pIl2CppFieldSetValue fieldSetValue;
+    pIl2CppGcHandleNew gcHandleNew;
+    pIl2CppGcHandleGetTarget gcHandleGetTarget;
+    pIl2CppGcHandleFree gcHandleFree;
+    pIl2CppGcWbarrierSetField gcWbarrierSetField;
+};
+
+typedef void(__cdecl* pInternalCreateDynamicFont)(void* font, void* fontNames,
+    int size);
+typedef void(__cdecl* pInternalCreateFontFromPath)(void* font, void* path);
+typedef bool(__cdecl* pFontGetDynamic)(void* font);
+
+struct RuntimeBindings {
+    void* fontClass;
+    void* stringClass;
+    void* resourcesClass;
+    void* materialClass;
+    void* tmpAssetClass;
+    void* tmpFontAssetClass;
+    void* tmpTextClass;
+    void* tmpSettingsClass;
+    const void* createDynamicFont;
+    pInternalCreateDynamicFont internalCreateDynamicFont;
+    pInternalCreateFontFromPath internalCreateFontFromPath;
+    pFontGetDynamic getFontDynamic;
+    const void* createTmpFontAsset;
+    const void* createTmpFontAssetDetailed;
+    const void* getAtlasTexture;
+    const void* getAssetMaterial;
+    const void* setAssetMaterial;
+    const void* assetMaterialField;
+    const void* materialCopyConstructor;
+    const void* getMaterialMainTexture;
+    const void* setMaterialMainTexture;
+    const void* getMaterialShader;
+    const void* setMultiAtlasEnabled;
+    const void* getAssetFallbacks;
+    const void* findAllObjects;
+    const void* getTextFont;
+    const void* setTextFont;
+    const void* setTextSharedMaterial;
+    const void* forceMeshUpdate;
+    const void* getGlobalFallbacks;
+    void* tmpTextTypeObject;
+    void* tmpFontAssetTypeObject;
+    uint32_t tmpTextTypeHandle;
+    uint32_t tmpFontAssetTypeHandle;
+};
+
+typedef LRESULT(WINAPI* pDispatchMessageW)(const MSG* message);
+typedef BOOL(WINAPI* pShowWindow)(HWND window, int command);
+typedef BOOL(WINAPI* pSetWindowPos)(HWND window, HWND insertAfter, int x, int y,
+    int width, int height, UINT flags);
+typedef void(__cdecl* pTmpTextObjectSetter)(void* text, void* value,
+    const void* methodInfo);
+
+static bool IsUnityWindow(HWND window);
+static void RevealUnityWindow();
+
+static Il2CppApi g_api = {};
+static RuntimeBindings g_bindings = {};
+static pDispatchMessageW g_originalDispatchMessageW = DispatchMessageW;
+static pShowWindow g_originalShowWindow = ShowWindow;
+static pSetWindowPos g_originalSetWindowPos = SetWindowPos;
+static pTmpTextObjectSetter g_originalTmpSetFont = NULL;
+static pTmpTextObjectSetter g_originalTmpSetSharedMaterial = NULL;
+static volatile LONG g_engineProbe = -1;
+static volatile LONG g_dispatchHookInstalled = 0;
+static volatile LONG g_applyThreadStarted = 0;
+static volatile LONG g_applyActive = 0;
+static volatile LONG g_fontReady = 0;
+static volatile LONG g_windowVisibilityHookInstalled = 0;
+static volatile LONG g_tmpSetterHooksState = 0;
+static volatile LONG g_applyAttempts = 0;
+static PVOID volatile g_applyWindow = NULL;
+static volatile LONG g_applyWindowThreadId = 0;
+static HookWorkerThreadState g_applyThread = {};
+static UINT g_applyMessage = 0;
+static volatile LONG g_deferredShowCommand = SW_SHOWDEFAULT;
+static void* g_sourceUnityFont = NULL;
+static void* g_replacementFontAsset = NULL;
+static void* g_replacementMaterial = NULL;
+static uint32_t g_sourceUnityFontHandle = 0;
+static uint32_t g_replacementFontAssetHandle = 0;
+static uint32_t g_replacementMaterialHandle = 0;
+static LONG g_replacementVersion = LONG_MIN;
+static LONG g_lastFailureVersion = LONG_MIN;
+static LONG g_lastDetailedFailureVersion = LONG_MIN;
+static LONG g_lastFactoryTraceVersion = LONG_MIN;
+static LONG g_lastAppliedTraceVersion = LONG_MIN;
+static LONG g_lastFontAttemptVersion = LONG_MIN;
+static DWORD g_lastFontAttemptTick = 0;
+static volatile LONG g_bindingDiagnosticsLogged = 0;
+static wchar_t g_replacementFace[LF_FACESIZE] = {};
+static void* g_cachedListClass = NULL;
+static const void* g_listContains = NULL;
+static const void* g_listAdd = NULL;
+

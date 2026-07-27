@@ -1,0 +1,141 @@
+// JavaScript bridges keep the selected font synchronized in Electron's main
+// and renderer processes without restarting the game.
+
+static const char kTyranoFontBridgeMarker[] = "SimpleFontHookTyranoFontBridgeV1";
+static const char kTyranoFontBridge[] = R"SFH(
+// SimpleFontHookTyranoFontBridgeV1
+(() => {
+  try {
+    const electron = require("electron");
+    const fs = require("fs");
+    const path = require("path");
+    const iniPath = path.join(path.dirname(process.execPath), "FontHook.ini");
+    const cssKeys = new Map();
+    let lastFace = "";
+    let timer = 0;
+
+    const readFace = () => {
+      try {
+        const text = fs.readFileSync(iniPath, "utf8").replace(/^\uFEFF/, "");
+        const match = /^FontNameW=(.*)$/m.exec(text);
+        return match ? match[1].trim() : "";
+      } catch (_) {
+        return "";
+      }
+    };
+
+    const applyToWindow = (win, face) => {
+      if (!win || win.isDestroyed() || !face) return;
+      const oldKey = cssKeys.get(win.id);
+      const remove = oldKey
+        ? win.webContents.removeInsertedCSS(oldKey).catch(() => {})
+        : Promise.resolve();
+      remove.then(() => {
+        if (win.isDestroyed()) return;
+        const quoted = JSON.stringify(face);
+        return win.webContents.insertCSS(
+          `html, body, body * { font-family: ${quoted}, sans-serif !important; }`,
+          { cssOrigin: "user" }
+        );
+      }).then((key) => {
+        if (key) cssKeys.set(win.id, key);
+      }).catch(() => {});
+    };
+
+    const applyToAll = () => {
+      const face = readFace();
+      if (!face) return;
+      lastFace = face;
+      electron.BrowserWindow.getAllWindows().forEach((win) => applyToWindow(win, face));
+    };
+
+    electron.app.on("browser-window-created", (_, win) => {
+      win.webContents.on("did-finish-load", () => {
+        cssKeys.delete(win.id);
+        applyToWindow(win, readFace());
+      });
+      win.on("closed", () => cssKeys.delete(win.id));
+    });
+
+    electron.app.whenReady().then(applyToAll);
+    fs.watchFile(iniPath, { interval: 200 }, () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const face = readFace();
+        if (face && face !== lastFace) applyToAll();
+      }, 80);
+    });
+    electron.app.on("will-quit", () => fs.unwatchFile(iniPath));
+  } catch (_) {
+    // The bridge is optional; the native web-font redirect remains available.
+  }
+})();
+)SFH";
+
+static const char kTyranoRendererFontBridgeMarker[] =
+    "SimpleFontHookTyranoRendererFontBridgeV1";
+static const char kTyranoRendererFontBridge[] = R"SFH(
+// SimpleFontHookTyranoRendererFontBridgeV1
+(() => {
+  try {
+    if (window.__simpleFontHookTyranoRendererBridge) return;
+    window.__simpleFontHookTyranoRendererBridge = true;
+
+    const api = window.studio_api || {};
+    const nodeRequire = typeof require === "function" ? require : null;
+    const fs = api.fs_default || (nodeRequire ? nodeRequire("fs") : null);
+    const path = api.path || (nodeRequire ? nodeRequire("path") : null);
+    let execPath = window.process && window.process.execPath;
+    if (!execPath && api.ipcRenderer) {
+      const processInfo = api.ipcRenderer.sendSync("getProcess");
+      execPath = processInfo && processInfo.execPath;
+    }
+    if (!fs || !path || !execPath) return;
+
+    const iniPath = path.join(path.dirname(execPath), "FontHook.ini");
+    const style = document.createElement("style");
+    style.id = "simple-font-hook-tyrano-font";
+    (document.head || document.documentElement).appendChild(style);
+    let lastFace = "";
+
+    const readFace = () => {
+      try {
+        const text = fs.readFileSync(iniPath, "utf8").replace(/^\uFEFF/, "");
+        const match = /^FontNameW=(.*)$/m.exec(text);
+        return match ? match[1].trim() : "";
+      } catch (_) {
+        return "";
+      }
+    };
+
+    const apply = () => {
+      const face = readFace();
+      if (!face || face === lastFace) return;
+      lastFace = face;
+      const quoted = JSON.stringify(face);
+      style.textContent =
+        `html, body, body * { font-family: ${quoted}, sans-serif !important; }`;
+      document.documentElement.dataset.simpleFontHookFace = face;
+    };
+
+    apply();
+    const timer = window.setInterval(apply, 200);
+    window.addEventListener("beforeunload", () => window.clearInterval(timer),
+      { once: true });
+  } catch (_) {
+    // The native web-font redirect remains the fallback when preload APIs differ.
+  }
+})();
+)SFH";
+
+static const char* TyranoBridgePayloadForPath(const std::wstring& relativePath) {
+    if (relativePath == L"main.js") return kTyranoFontBridge;
+    if (relativePath == L"tyrano\\tyrano.js") return kTyranoRendererFontBridge;
+    return nullptr;
+}
+
+static const char* TyranoBridgeMarkerForPath(const std::wstring& relativePath) {
+    if (relativePath == L"main.js") return kTyranoFontBridgeMarker;
+    if (relativePath == L"tyrano\\tyrano.js") return kTyranoRendererFontBridgeMarker;
+    return nullptr;
+}

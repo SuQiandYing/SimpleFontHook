@@ -1,0 +1,124 @@
+constexpr size_t kMaxCacheLayouts = 8;
+constexpr size_t kInstanceEpochSlots = 256;
+constexpr size_t kMaxCacheFunctionBytes = 0x200;
+constexpr size_t kMaxRasterFunctionBytes = 0x300;
+constexpr size_t kMaxMetricNormalizationEntries = 64;
+constexpr int kMetricSearchRadius = 3;
+constexpr wchar_t kMetricProbeText[] = L"\u65e5\u672c\u8a9e\u3042\u30a2\u6f22";
+
+typedef void* (__thiscall* CacheLookupFn)(void*, void*, unsigned int);
+
+struct CodeRange {
+    BYTE* begin;
+    BYTE* end;
+};
+
+struct ImportSlot {
+    const char* name;
+    PVOID* slot;
+};
+
+struct ImportProfile {
+    bool hasFontFactory = false;
+    bool hasRasterOutput = false;
+    bool hasSelectObject = false;
+    bool hasGetObject = false;
+    bool hasCompatibleDc = false;
+    bool hasDibSection = false;
+    bool hasFontEnumeration = false;
+    std::vector<ImportSlot> knownSlots;
+    std::vector<PVOID*> rasterSlots;
+};
+
+struct CacheLayout {
+    CacheLookupFn original = nullptr;
+    BYTE* target = nullptr;
+    DWORD headOffset = 0;
+    DWORD countOffset = 0;
+};
+
+struct CacheInstanceEpoch {
+    PVOID volatile instance;
+    volatile LONG version;
+};
+
+struct FontProbeMetrics {
+    LONG totalWidth;
+    LONG inkTop;
+    LONG inkBottom;
+    int inkGlyphCount;
+    TEXTMETRICW textMetric;
+    wchar_t actualFace[LF_FACESIZE];
+
+    LONG InkHeight() const {
+        return inkGlyphCount > 0 && inkBottom > inkTop ? inkBottom - inkTop : 0;
+    }
+};
+
+struct LogicalVerticalMetrics {
+    LONG height;
+    LONG ascent;
+    LONG descent;
+    LONG internalLeading;
+    LONG externalLeading;
+};
+
+struct MetricNormalizationEntry {
+    LONG configVersion;
+    LOGFONTW sourceLogfont;
+    LOGFONTW requestedReplacementLogfont;
+    LONG normalizedHeight;
+    LONG normalizedWidth;
+    LogicalVerticalMetrics logicalMetrics;
+    LONG topYOffset;
+    LONG baselineYOffset;
+    LONG bottomYOffset;
+    bool hasVerticalMetrics;
+};
+
+class ScopedInternalFontProbe {
+public:
+    ScopedInternalFontProbe() { ++::g_internalFontProbeDepth; }
+    ~ScopedInternalFontProbe() { --::g_internalFontProbeDepth; }
+
+    ScopedInternalFontProbe(const ScopedInternalFontProbe&) = delete;
+    ScopedInternalFontProbe& operator=(const ScopedInternalFontProbe&) = delete;
+};
+
+static const char* const kKnownGdiApis[] = {
+    "CreateFontA",
+    "CreateFontW",
+    "CreateFontIndirectA",
+    "CreateFontIndirectW",
+    "CreateFontIndirectExA",
+    "CreateFontIndirectExW",
+    "TextOutA",
+    "TextOutW",
+    "ExtTextOutA",
+    "ExtTextOutW",
+    "SelectObject",
+    "GetObjectA",
+    "GetObjectW",
+    "EnumFontFamiliesExA",
+    "EnumFontFamiliesExW",
+    "GetGlyphOutlineA",
+    "GetGlyphOutlineW",
+    "GetTextExtentPointA",
+    "GetTextExtentPointW",
+    "GetTextExtentPoint32A",
+    "GetTextExtentPoint32W",
+    "CreateCompatibleDC",
+    "CreateDIBSection",
+};
+
+static std::vector<CacheLayout> g_cacheLayouts;
+static CacheInstanceEpoch g_instanceEpochs[kMaxCacheLayouts][kInstanceEpochSlots] = {};
+static std::mutex g_instanceEpochMutex;
+static std::mutex g_metricNormalizationMutex;
+static std::vector<MetricNormalizationEntry> g_metricNormalizationEntries;
+static volatile LONG g_active = 0;
+static volatile LONG g_cacheObserveTraceCount = 0;
+static volatile LONG g_cacheClearTraceCount = 0;
+static volatile LONG g_metricNormalizationTraceCount = 0;
+static LONG g_installConfigVersion = 0;
+static __declspec(thread) unsigned int g_textOutputDepth = 0;

@@ -1,0 +1,413 @@
+static bool MonoIsExecutableAddress(const void* address) {
+    if (!address) return false;
+    MEMORY_BASIC_INFORMATION info = {};
+    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT)
+        return false;
+    DWORD protection = info.Protect & 0xFF;
+    bool executable = protection == PAGE_EXECUTE ||
+        protection == PAGE_EXECUTE_READ ||
+        protection == PAGE_EXECUTE_READWRITE ||
+        protection == PAGE_EXECUTE_WRITECOPY;
+    return executable && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+}
+
+static void __cdecl MonoNewTmpSetTextJit(void* text, void* managedText) {
+    pMonoManagedObjectSetter original = g_monoOriginalTmpSetTextJit;
+    if (!original) return;
+    if (g_monoTmpSetTextJitGuard || !MonoIsReplacementEnabled() ||
+        !g_monoApi.gcHandleGetTarget || !g_monoApi.gcHandleNew) {
+        original(text, managedText);
+        return;
+    }
+    MonoGlyphMutationGuard mutation;
+    if (!mutation.acquired) {
+        original(text, managedText);
+        return;
+    }
+
+    g_monoTmpSetTextJitGuard = true;
+    void* originalText = text;
+    void* originalManagedText = managedText;
+    uint32_t textRoot = text ? g_monoApi.gcHandleNew(text, 1) : 0;
+    uint32_t managedTextRoot = managedText
+        ? g_monoApi.gcHandleNew(managedText, 1) : 0;
+    if ((text && !textRoot) || (managedText && !managedTextRoot)) {
+        if (managedTextRoot) MonoFreeHandle(managedTextRoot);
+        if (textRoot) MonoFreeHandle(textRoot);
+        g_monoTmpSetTextJitGuard = false;
+        original(originalText, originalManagedText);
+        return;
+    }
+    text = textRoot ? g_monoApi.gcHandleGetTarget(textRoot) : text;
+    managedText = managedTextRoot
+        ? g_monoApi.gcHandleGetTarget(managedTextRoot) : managedText;
+    void* fontAsset = g_monoReplacementFontAssetHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle) : NULL;
+    void* material = g_monoReplacementMaterialHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle) : NULL;
+    std::wstring additions = MonoRememberTextCharacters(managedText);
+    bool fontReady = InterlockedCompareExchange(&g_monoFontReady, 0, 0) != 0;
+    if (!additions.empty()) InterlockedExchange(&g_monoLastCharacterScanTick, 0);
+    if (!additions.empty() && fontReady && fontAsset && material) {
+        if (g_monoBindings.legacyTmp) {
+            // A legacy TMP asset cannot grow in place. Rebuild it before the
+            // game's setter creates a mesh, otherwise the new text is rendered
+            // once with the previous glyph table and appears one frame late.
+            InterlockedExchange(&g_monoLastCharacterScanTick, 0);
+            bool glyphSetChanged = false;
+            bool rebuilt = MonoCreateReplacementFontAsset(
+                Config::ConfigVersion, &glyphSetChanged);
+            fontAsset = rebuilt && g_monoReplacementFontAssetHandle
+                ? g_monoApi.gcHandleGetTarget(
+                    g_monoReplacementFontAssetHandle) : NULL;
+            material = rebuilt && g_monoReplacementMaterialHandle
+                ? g_monoApi.gcHandleGetTarget(
+                    g_monoReplacementMaterialHandle) : NULL;
+            Utils::Trace("[DEBUG][UnityMono] legacy TMP text glyphs prepared before setter codeUnits=%llu codePoints=%s rebuilt=%d changed=%d asset=%p material=%p",
+                (unsigned long long)additions.size(),
+                MonoDescribeCodePoints(additions, 32).c_str(),
+                rebuilt ? 1 : 0, glyphSetChanged ? 1 : 0,
+                fontAsset, material);
+        } else {
+            void* sourceFont = NULL;
+            bool complete = false;
+            bool populated = MonoEnsureModernSourceFont(fontAsset,
+                Config::ConfigVersion, &sourceFont) &&
+                MonoPopulateModernFontAsset(fontAsset, additions, &complete) &&
+                MonoEnsureModernMaterialAtlas(fontAsset, material);
+            Utils::Trace("[DEBUG][UnityMono] TMP text glyphs prepared before setter codeUnits=%llu codePoints=%s asset=%p populated=%d complete=%d",
+                (unsigned long long)additions.size(),
+                MonoDescribeCodePoints(additions, 32).c_str(), fontAsset,
+                populated ? 1 : 0, complete ? 1 : 0);
+        }
+    }
+    if (!fontReady && !additions.empty()) {
+        Utils::Trace("[DEBUG][UnityMono] text glyphs remembered before font ready codeUnits=%llu codePoints=%s",
+            (unsigned long long)additions.size(),
+            MonoDescribeCodePoints(additions, 32).c_str());
+    }
+
+    bool appliedBeforeSetter = fontReady && g_monoBindings.legacyTmp &&
+        !additions.empty() && fontAsset && material &&
+        MonoApplyTmpObjectImmediately(text, fontAsset, material);
+    original(text, managedText);
+    if (fontReady && fontAsset && material) {
+        if (appliedBeforeSetter) MonoForceTmpMeshUpdate(text);
+        else MonoApplyTmpObjectImmediately(text, fontAsset, material);
+    }
+    if (managedTextRoot) MonoFreeHandle(managedTextRoot);
+    if (textRoot) MonoFreeHandle(textRoot);
+    g_monoTmpSetTextJitGuard = false;
+}
+
+static bool MonoInstallTmpSetTextJitHook() {
+    LONG state = InterlockedCompareExchange(&g_monoTmpSetTextJitHookState, 0, 0);
+    if (state == 1) return true;
+    if (state != 0 || !g_monoApi.compileMethod || !g_monoBindings.tmpSetText)
+        return false;
+    if (InterlockedCompareExchange(&g_monoTmpSetTextJitHookState, -1, 0) != 0)
+        return false;
+
+    void* entry = g_monoApi.compileMethod(g_monoBindings.tmpSetText);
+    if (!MonoIsExecutableAddress(entry)) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_text JIT hook rejected entry=%p",
+            entry);
+        InterlockedExchange(&g_monoTmpSetTextJitHookState, 0);
+        return false;
+    }
+    g_monoOriginalTmpSetTextJit =
+        reinterpret_cast<pMonoManagedObjectSetter>(entry);
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_text JIT transaction begin failed=%ld",
+            begin);
+        g_monoOriginalTmpSetTextJit = NULL;
+        InterlockedExchange(&g_monoTmpSetTextJitHookState, 0);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+    LONG attach = DetourAttach(&(PVOID&)g_monoOriginalTmpSetTextJit,
+        MonoNewTmpSetTextJit);
+    LONG commit = attach == NO_ERROR ? DetourTransactionCommit()
+        : DetourTransactionAbort();
+    if (attach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_text JIT hook failed attach=%ld commit=%ld",
+            attach, commit);
+        g_monoOriginalTmpSetTextJit = NULL;
+        InterlockedExchange(&g_monoTmpSetTextJitHookState, 0);
+        return false;
+    }
+    InterlockedExchange(&g_monoTmpSetTextJitHookState, 1);
+    Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_text JIT hook attached target=%p trampoline=%p",
+        entry, g_monoOriginalTmpSetTextJit);
+    return true;
+}
+
+static void __cdecl MonoNewTmpSetFontJit(void* text, void* requestedFont) {
+    pMonoManagedObjectSetter original = g_monoOriginalTmpSetFontJit;
+    if (!original) return;
+    void* font = requestedFont;
+    if (!g_monoCatSetFontJitActive && MonoIsReplacementEnabled() &&
+        InterlockedCompareExchange(&g_monoFontReady, 0, 0) != 0) {
+        void* replacement = InterlockedCompareExchangePointer(
+            reinterpret_cast<PVOID volatile*>(&g_monoReplacementFontAsset),
+            NULL, NULL);
+        if (replacement) font = replacement;
+    }
+    original(text, font);
+}
+
+static bool MonoInstallTmpSetFontJitHook() {
+    LONG state = InterlockedCompareExchange(&g_monoTmpSetFontJitHookState, 0, 0);
+    if (state == 1) return true;
+    if (state != 0 || !g_monoApi.compileMethod || !g_monoBindings.tmpSetFont)
+        return false;
+    if (InterlockedCompareExchange(&g_monoTmpSetFontJitHookState, -1, 0) != 0)
+        return false;
+
+    void* entry = g_monoApi.compileMethod(g_monoBindings.tmpSetFont);
+    if (!MonoIsExecutableAddress(entry)) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_font JIT hook rejected entry=%p",
+            entry);
+        InterlockedExchange(&g_monoTmpSetFontJitHookState, 0);
+        return false;
+    }
+    g_monoOriginalTmpSetFontJit =
+        reinterpret_cast<pMonoManagedObjectSetter>(entry);
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_font JIT transaction begin failed=%ld",
+            begin);
+        g_monoOriginalTmpSetFontJit = NULL;
+        InterlockedExchange(&g_monoTmpSetFontJitHookState, 0);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+    LONG attach = DetourAttach(&(PVOID&)g_monoOriginalTmpSetFontJit,
+        MonoNewTmpSetFontJit);
+    LONG commit = attach == NO_ERROR ? DetourTransactionCommit()
+        : DetourTransactionAbort();
+    if (attach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_font JIT hook failed attach=%ld commit=%ld",
+            attach, commit);
+        g_monoOriginalTmpSetFontJit = NULL;
+        InterlockedExchange(&g_monoTmpSetFontJitHookState, 0);
+        return false;
+    }
+    InterlockedExchange(&g_monoTmpSetFontJitHookState, 1);
+    Utils::Trace("[DEBUG][UnityMono] TMP_Text.set_font JIT hook attached target=%p trampoline=%p",
+        entry, g_monoOriginalTmpSetFontJit);
+    return true;
+}
+
+static bool MonoRepairCatTextStyle(void* gameObject) {
+    if (!gameObject || !MonoIsReplacementEnabled() ||
+        InterlockedCompareExchange(&g_monoFontReady, 0, 0) == 0 ||
+        !g_monoApi.gcHandleGetTarget || !g_monoBindings.catGetTextMeshPro)
+        return false;
+    void* fontAsset = g_monoReplacementFontAssetHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle) : NULL;
+    void* material = g_monoReplacementMaterialHandle
+        ? g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle) : NULL;
+    void* text = NULL;
+    bool gotText = fontAsset && material &&
+        MonoInvoke(g_monoBindings.catGetTextMeshPro, gameObject, NULL, &text,
+            "TextMeshProTextGameObject.get_textMeshPro(style-repair)");
+    bool repaired = gotText && text &&
+        MonoApplyTmpObjectImmediately(text, fontAsset, material);
+    if (repaired && InterlockedExchange(&g_monoCatStyleRepairLogged, 1) == 0) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem TMP material style repaired before render object=%p text=%p",
+            gameObject, text);
+    }
+    return repaired;
+}
+
+static void __cdecl MonoNewCatInitializeMaterialJit(void* gameObject) {
+    pMonoManagedObjectAction original = g_monoOriginalCatInitializeMaterialJit;
+    if (!original) return;
+    original(gameObject);
+    if (g_monoCatSetFontJitActive || g_monoCatInitializeMaterialJitGuard)
+        return;
+    g_monoCatInitializeMaterialJitGuard = true;
+    MonoRepairCatTextStyle(gameObject);
+    g_monoCatInitializeMaterialJitGuard = false;
+}
+
+static void __cdecl MonoNewCatSetFontJit(void* gameObject, void* requestedFont) {
+    pMonoManagedObjectSetter original = g_monoOriginalCatSetFontJit;
+    if (!original) return;
+    if (g_monoCatSetFontJitActive || !MonoIsReplacementEnabled() ||
+        InterlockedCompareExchange(&g_monoFontReady, 0, 0) == 0) {
+        original(gameObject, requestedFont);
+        return;
+    }
+
+    // Let CatSystem build its original styled material first.  The TMP setter
+    // detour is bypassed only inside this call; the replacement and atlas swap
+    // are completed before SetFont returns to the game's render loop.
+    g_monoCatSetFontJitActive = true;
+    original(gameObject, requestedFont);
+    g_monoCatSetFontJitActive = false;
+    MonoRepairCatTextStyle(gameObject);
+}
+
+static bool MonoInstallCatSetFontJitHook() {
+    LONG state = InterlockedCompareExchange(&g_monoCatSetFontJitHookState, 0, 0);
+    if (state == 1) return true;
+    if (state != 0 || !g_monoApi.compileMethod || !g_monoBindings.catSetFont ||
+        !g_monoBindings.catGetTextMeshPro) return false;
+    if (InterlockedCompareExchange(&g_monoCatSetFontJitHookState, -1, 0) != 0)
+        return false;
+
+    void* entry = g_monoApi.compileMethod(g_monoBindings.catSetFont);
+    if (!MonoIsExecutableAddress(entry)) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem SetFont JIT hook rejected entry=%p",
+            entry);
+        InterlockedExchange(&g_monoCatSetFontJitHookState, 0);
+        return false;
+    }
+    g_monoOriginalCatSetFontJit = reinterpret_cast<pMonoManagedObjectSetter>(entry);
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem SetFont JIT transaction begin failed=%ld",
+            begin);
+        g_monoOriginalCatSetFontJit = NULL;
+        InterlockedExchange(&g_monoCatSetFontJitHookState, 0);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+    LONG attach = DetourAttach(&(PVOID&)g_monoOriginalCatSetFontJit,
+        MonoNewCatSetFontJit);
+    LONG commit = attach == NO_ERROR ? DetourTransactionCommit()
+        : DetourTransactionAbort();
+    if (attach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem SetFont JIT hook failed attach=%ld commit=%ld",
+            attach, commit);
+        g_monoOriginalCatSetFontJit = NULL;
+        InterlockedExchange(&g_monoCatSetFontJitHookState, 0);
+        return false;
+    }
+    InterlockedExchange(&g_monoCatSetFontJitHookState, 1);
+    Utils::Trace("[DEBUG][UnityMono] CatSystem SetFont JIT hook attached target=%p trampoline=%p",
+        entry, g_monoOriginalCatSetFontJit);
+    return true;
+}
+
+static bool MonoInstallCatInitializeMaterialJitHook() {
+    LONG state = InterlockedCompareExchange(
+        &g_monoCatInitializeMaterialJitHookState, 0, 0);
+    if (state == 1) return true;
+    if (state != 0 || !g_monoApi.compileMethod ||
+        !g_monoBindings.catInitializeMaterial ||
+        !g_monoBindings.catGetTextMeshPro) return false;
+    if (InterlockedCompareExchange(
+        &g_monoCatInitializeMaterialJitHookState, -1, 0) != 0) return false;
+
+    void* entry = g_monoApi.compileMethod(g_monoBindings.catInitializeMaterial);
+    if (!MonoIsExecutableAddress(entry)) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem InitializeMaterial JIT hook rejected entry=%p",
+            entry);
+        InterlockedExchange(&g_monoCatInitializeMaterialJitHookState, 0);
+        return false;
+    }
+    g_monoOriginalCatInitializeMaterialJit =
+        reinterpret_cast<pMonoManagedObjectAction>(entry);
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem InitializeMaterial JIT transaction begin failed=%ld",
+            begin);
+        g_monoOriginalCatInitializeMaterialJit = NULL;
+        InterlockedExchange(&g_monoCatInitializeMaterialJitHookState, 0);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+    LONG attach = DetourAttach(&(PVOID&)g_monoOriginalCatInitializeMaterialJit,
+        MonoNewCatInitializeMaterialJit);
+    LONG commit = attach == NO_ERROR ? DetourTransactionCommit()
+        : DetourTransactionAbort();
+    if (attach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] CatSystem InitializeMaterial JIT hook failed attach=%ld commit=%ld",
+            attach, commit);
+        g_monoOriginalCatInitializeMaterialJit = NULL;
+        InterlockedExchange(&g_monoCatInitializeMaterialJitHookState, 0);
+        return false;
+    }
+    InterlockedExchange(&g_monoCatInitializeMaterialJitHookState, 1);
+    Utils::Trace("[DEBUG][UnityMono] CatSystem InitializeMaterial JIT hook attached target=%p trampoline=%p",
+        entry, g_monoOriginalCatInitializeMaterialJit);
+    return true;
+}
+
+static void* __cdecl MonoNewRuntimeInvoke(void* method, void* object,
+    void** params, void** exception) {
+    if (!g_monoOriginalRuntimeInvoke) return NULL;
+    if (g_monoRuntimeInvokeGuard) {
+        return g_monoOriginalRuntimeInvoke(method, object, params, exception);
+    }
+
+    g_monoRuntimeInvokeGuard = true;
+    bool tmpObject = MonoIsTmpTextObject(object);
+    bool uiObject = !tmpObject && MonoIsUiTextObject(object);
+    const char* methodName = MonoRuntimeMethodName(method);
+    bool setFont = methodName && strcmp(methodName, "set_font") == 0;
+    bool lifecycle = methodName &&
+        (strcmp(methodName, "Awake") == 0 ||
+            strcmp(methodName, "OnEnable") == 0 ||
+            strcmp(methodName, "LoadFontAsset") == 0);
+    void* replacementAsset = NULL;
+    void* replacementMaterial = NULL;
+    void* sourceFont = NULL;
+    if (InterlockedCompareExchange(&g_monoFontReady, 0, 0) != 0 &&
+        g_monoApi.gcHandleGetTarget) {
+        replacementAsset = g_monoReplacementFontAssetHandle
+            ? g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle) : NULL;
+        replacementMaterial = g_monoReplacementMaterialHandle
+            ? g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle) : NULL;
+        sourceFont = g_monoSourceFontHandle
+            ? g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle) : NULL;
+    }
+
+    // Replace the managed argument before the game's setter sees it. This is
+    // the zero-frame guard for newly instantiated dialogue/history entries.
+    if (setFont && params && !g_monoCatSetFontJitActive) {
+        if (tmpObject && replacementAsset) params[0] = replacementAsset;
+        else if (uiObject && sourceFont) params[0] = sourceFont;
+    }
+
+    void* result = g_monoOriginalRuntimeInvoke(method, object, params, exception);
+    if (lifecycle && replacementAsset && replacementMaterial && tmpObject) {
+        MonoApplyTmpObjectImmediately(object, replacementAsset, replacementMaterial);
+    } else if (lifecycle && sourceFont && uiObject) {
+        MonoApplyUiTextObjectImmediately(object, sourceFont);
+    }
+    g_monoRuntimeInvokeGuard = false;
+    return result;
+}
+
+static bool MonoInstallRuntimeInvokeHook() {
+    if (InterlockedCompareExchange(&g_monoRuntimeInvokeHookInstalled, 0, 0) != 0)
+        return true;
+    if (!g_monoApi.runtimeInvoke) return false;
+    g_monoOriginalRuntimeInvoke = g_monoApi.runtimeInvoke;
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] runtime_invoke transaction begin failed=%ld", begin);
+        return false;
+    }
+    DetourUpdateThread(GetCurrentThread());
+    LONG attach = DetourAttach(&(PVOID&)g_monoOriginalRuntimeInvoke,
+        MonoNewRuntimeInvoke);
+    LONG commit = attach == NO_ERROR ? DetourTransactionCommit()
+        : DetourTransactionAbort();
+    if (attach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] runtime_invoke hook failed attach=%ld commit=%ld",
+            attach, commit);
+        g_monoOriginalRuntimeInvoke = NULL;
+        return false;
+    }
+    InterlockedExchange(&g_monoRuntimeInvokeHookInstalled, 1);
+    Utils::Trace("[DEBUG][UnityMono] runtime_invoke hook attached target=%p",
+        g_monoApi.runtimeInvoke);
+    return true;
+}
+

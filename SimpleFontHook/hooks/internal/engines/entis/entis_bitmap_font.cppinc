@@ -1,0 +1,124 @@
+namespace EntisCompat {
+
+static volatile LONG g_bitmapPatchAttempted = 0;
+static volatile LONG g_bitmapPatchInstalled = 0;
+static BYTE* g_bitmapRegisterEntry = NULL;
+static BYTE g_bitmapRegisterOriginal[3] = {};
+
+static const char kRegisterBitmapFontLog[] =
+    "register bitmap font %s : '%s'";
+
+static bool LooksLikeBitmapRegisterPrologue(const BYTE* candidate,
+    const BYTE* sectionEnd) {
+    static const BYTE prefix[] = {
+        0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68
+    };
+    static const BYTE sehPrefix[] = {
+        0x64, 0xA1, 0x00, 0x00, 0x00, 0x00
+    };
+    if (!candidate || !sectionEnd || candidate + 16 > sectionEnd) return false;
+    return BytesEqual(candidate, prefix, sizeof(prefix)) &&
+        BytesEqual(candidate + 10, sehPrefix, sizeof(sehPrefix));
+}
+
+static bool HasRet4(const BYTE* begin, const BYTE* end) {
+    static const BYTE ret4[] = { 0xC2, 0x04, 0x00 };
+    return FindBytes(begin, end, ret4, sizeof(ret4)) != NULL;
+}
+
+static BYTE* FindBitmapRegisterEntry(const ImageView& view) {
+#if !defined(_M_IX86)
+    (void)view;
+    return NULL;
+#else
+    BYTE* logText = FindBytesInImage(view,
+        reinterpret_cast<const BYTE*>(kRegisterBitmapFontLog),
+        sizeof(kRegisterBitmapFontLog) - 1, false);
+    if (!logText || reinterpret_cast<uintptr_t>(logText) > 0xFFFFFFFFu)
+        return NULL;
+
+    BYTE xrefPattern[5] = { 0x68, 0, 0, 0, 0 };
+    DWORD logAddress = static_cast<DWORD>(reinterpret_cast<uintptr_t>(logText));
+    memcpy(xrefPattern + 1, &logAddress, sizeof(logAddress));
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+
+        BYTE* sectionBegin = NULL;
+        BYTE* sectionEnd = NULL;
+        if (!GetSectionRange(view, i, &sectionBegin, &sectionEnd)) continue;
+
+        BYTE* search = sectionBegin;
+        while (search < sectionEnd) {
+            BYTE* xref = FindBytes(search, sectionEnd, xrefPattern,
+                sizeof(xrefPattern));
+            if (!xref) break;
+
+            uintptr_t xrefAddress = reinterpret_cast<uintptr_t>(xref);
+            uintptr_t sectionAddress = reinterpret_cast<uintptr_t>(sectionBegin);
+            uintptr_t lowerAddress = xrefAddress > sectionAddress + 0x300
+                ? xrefAddress - 0x300 : sectionAddress;
+            BYTE* lower = reinterpret_cast<BYTE*>(lowerAddress);
+
+            for (BYTE* candidate = xref; ; --candidate) {
+                if (LooksLikeBitmapRegisterPrologue(candidate, sectionEnd)) {
+                    size_t bytesRemaining = static_cast<size_t>(sectionEnd - candidate);
+                    const BYTE* retSearchEnd = candidate +
+                        (bytesRemaining < 0x280 ? bytesRemaining : 0x280);
+                    if (HasRet4(xref, retSearchEnd)) return candidate;
+                }
+                if (candidate == lower) break;
+            }
+            search = xref + sizeof(xrefPattern);
+        }
+    }
+    return NULL;
+#endif
+}
+
+static bool WriteCode(BYTE* address, const BYTE* replacement, size_t length) {
+    if (!address || !replacement || length == 0) return false;
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(address, length, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return false;
+
+    memcpy(address, replacement, length);
+    FlushInstructionCache(GetCurrentProcess(), address, length);
+
+    DWORD ignoredProtect = 0;
+    VirtualProtect(address, length, oldProtect, &ignoredProtect);
+    return true;
+}
+
+static bool DisableBitmapFontRegistration() {
+    if (InterlockedExchange(&g_bitmapPatchAttempted, 1) != 0)
+        return InterlockedCompareExchange(&g_bitmapPatchInstalled, 0, 0) != 0;
+
+    ImageView view = {};
+    if (!QueryMainImage(&view)) return false;
+
+    BYTE* entry = FindBitmapRegisterEntry(view);
+    if (!entry) {
+        TraceLimited("bitmap-font registration entry not found");
+        return false;
+    }
+
+    static const BYTE noOpReturn[] = { 0xC2, 0x04, 0x00 };
+    if (!BytesEqual(entry, noOpReturn, sizeof(noOpReturn))) {
+        memcpy(g_bitmapRegisterOriginal, entry, sizeof(g_bitmapRegisterOriginal));
+        if (!WriteCode(entry, noOpReturn, sizeof(noOpReturn))) {
+            TraceLimited("bitmap-font registration patch failed entry=%p error=%lu",
+                entry, GetLastError());
+            return false;
+        }
+    }
+
+    g_bitmapRegisterEntry = entry;
+    InterlockedExchange(&g_bitmapPatchInstalled, 1);
+    TraceLimited("bitmap-font registration disabled entry=%p; BMF requests will use SGLWindowsFont fallback",
+        entry);
+    return true;
+}
+
+} // namespace EntisCompat

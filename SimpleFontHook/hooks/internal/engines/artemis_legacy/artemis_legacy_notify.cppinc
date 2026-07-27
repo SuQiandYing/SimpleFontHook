@@ -1,0 +1,36 @@
+static bool ArtemisLegacyNotifyConfigChanged(LONG version) {
+    if (!Config::EnableArtemisHook) return false;
+    if (!ArtemisLegacyLooksLikeEngineRoot()) return false;
+
+    LONG previous = InterlockedExchange(&g_artemisLegacyConfigNotifyVersion, version);
+    LONG lastRedirectVersion = InterlockedCompareExchange(&g_artemisLegacyLastFontRedirectVersion, 0, 0);
+    LONG lastScriptOpenVersion = InterlockedCompareExchange(&g_artemisLegacyLastScriptOpenVersion, 0, 0);
+    LONG lastScriptPatchVersion = InterlockedCompareExchange(&g_artemisLegacyLastScriptPatchVersion, 0, 0);
+    LONG lastFontReadyVersion = InterlockedCompareExchange(&g_artemisLegacyLastVirtualFontReadyVersion, 0, 0);
+
+    if (previous != LONG_MIN) {
+        const char* reason = NULL;
+        if (lastRedirectVersion < previous) {
+            reason = "virtual-font-not-reopened-after-previous-switch";
+        } else if (lastScriptOpenVersion < previous) {
+            reason = "no-iet-open-after-switch";
+        } else if (lastScriptPatchVersion < previous) {
+            reason = "iet-opened-but-not-patched-after-switch";
+        }
+
+        if (reason) {
+            ArtemisLegacyTraceLimited("hot-switch-diagnosis previousVersion=%ld currentVersion=%ld reason=%s ietOpen=%ld ietPatch=%ld fontRedirect=%ld fontReady=%ld detail='Legacy Artemis has no shared safe runtime cache layout; this module updates virtual files and avoids modern object scans.'",
+                previous, version, reason, lastScriptOpenVersion, lastScriptPatchVersion,
+                lastRedirectVersion, lastFontReadyVersion);
+        }
+    }
+
+    bool fontSynced = ArtemisLegacySyncVirtualFontFile(version);
+    ArtemisLegacyTraceLimited("hot-switch-request version=%ld font='%s' virtual='%s' fontSync=%d ietOpen=%ld ietPatch=%ld fontRedirect=%ld",
+        version, ArtemisLegacyWideToUtf8(Config::ForcedFontNameW).c_str(),
+        ArtemisLegacyWideToUtf8(ArtemisLegacyBuildVirtualFontPathForVersion(version)).c_str(),
+        fontSynced ? 1 : 0,
+        lastScriptOpenVersion, lastScriptPatchVersion, lastRedirectVersion);
+
+    return true;
+}

@@ -1,0 +1,123 @@
+// Detect loose and archived TyranoScript installations and control the
+// resources/app.asar fallback.
+
+static bool TyranoPathIsDirectory(const wchar_t* relativePath) {
+    std::wstring path = TyranoBuildRootPath(relativePath);
+    DWORD attrs = orgGetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static bool TyranoPackageHasMarker() {
+    std::wstring packagePath = TyranoBuildRootPath(L"resources\\app\\package.json");
+    HANDLE file = orgCreateFileW(packagePath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 1024 * 1024) {
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<char> bytes((size_t)size.QuadPart + 1, 0);
+    DWORD read = 0;
+    BOOL ok = ReadFile(file, bytes.data(), (DWORD)size.QuadPart, &read, NULL);
+    CloseHandle(file);
+    if (!ok || read != size.QuadPart) return false;
+
+    std::string content(bytes.data(), read);
+    std::transform(content.begin(), content.end(), content.begin(),
+        [](unsigned char ch) { return (char)tolower(ch); });
+    return content.find("tyranoscript") != std::string::npos;
+}
+
+static bool TyranoAsarHasMarker() {
+    if (!TyranoEnsureAsarIndex()) return false;
+
+    bool hasTyranoPath = false;
+    TyranoAsarEntry packageEntry = {};
+    bool hasPackageEntry = false;
+    {
+        std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+        for (const auto& pair : g_tyranoAsarEntries) {
+            const std::wstring& path = pair.first;
+            if (path.rfind(L"tyrano\\", 0) == 0) {
+                hasTyranoPath = true;
+                break;
+            }
+        }
+
+        auto pkgIt = g_tyranoAsarEntries.find(L"package.json");
+        if (pkgIt != g_tyranoAsarEntries.end()) {
+            packageEntry = pkgIt->second;
+            hasPackageEntry = true;
+        }
+    }
+
+    if (hasPackageEntry) {
+        std::vector<BYTE> bytes;
+        if (TyranoReadAsarEntry(packageEntry, bytes) && !bytes.empty()) {
+            std::string content((const char*)bytes.data(), bytes.size());
+            std::transform(content.begin(), content.end(), content.begin(),
+                [](unsigned char ch) { return (char)tolower(ch); });
+            if (content.find("tyranoscript") != std::string::npos) {
+                return true;
+            }
+        }
+    }
+
+    return hasTyranoPath;
+}
+
+static bool TyranoLooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_tyranoEngineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    bool hasLooseRuntime = TyranoPathIsDirectory(L"resources\\app\\tyrano");
+    bool hasLoosePackageMarker = hasLooseRuntime && TyranoPackageHasMarker();
+    bool looseContract = EngineIdentityPolicy::ConfirmFrameworkContract(
+        hasLooseRuntime, hasLoosePackageMarker);
+    bool detectedLoose = EngineIdentityPolicy::Confirm({
+        false, false, false, false, looseContract });
+
+    bool detectedAsar = TyranoAsarHasMarker();
+    bool detected = detectedLoose || EngineIdentityPolicy::Confirm({
+        false, detectedAsar, false, false });
+    InterlockedExchange(&g_tyranoEngineProbe, detected ? 1 : 0);
+
+    TyranoTraceLimited("engine-probe result=%d loose=%d asar=%d renderer=Chromium",
+        detected ? 1 : 0, detectedLoose ? 1 : 0, detectedAsar ? 1 : 0);
+    return detected;
+}
+
+static bool TyranoReplacementEnabled() {
+    return Config::EnableTyranoHook && Config::TyranoRedirectWebFonts &&
+        Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        Config::ForcedFontNameW[0] != L'\0' && !IsPickerThread() &&
+        TyranoLooksLikeEngineRoot();
+}
+
+static bool TyranoShouldHideAsarW(const wchar_t* fileName) {
+    if (!fileName || !fileName[0]) return false;
+    const wchar_t* leaf = PathFindFileNameW(fileName);
+    if (!leaf || _wcsicmp(leaf, L"app.asar") != 0) return false;
+
+    std::wstring fullPath = EngineCommon::FullPath(fileName);
+    std::wstring asarPath = TyranoBuildRootPath(L"resources\\app.asar");
+    if (!EngineCommon::SamePath(fullPath, asarPath)) return false;
+    if (!TyranoReplacementEnabled()) return false;
+
+    // Electron selects resources/app when resources/app.asar is unavailable.
+    // Only do this when the archive index is readable: text and script opens
+    // are then overlaid from app.asar, so a stale loose extraction cannot hide
+    // localized scenario content.
+    if (!TyranoEnsureAsarIndex()) {
+        TyranoTraceLimited("asar-visible request='%s' reason=overlay-index-unavailable",
+            EngineCommon::WideToUtf8(fullPath).c_str());
+        return false;
+    }
+    TyranoTraceLimited("asar-hidden request='%s' fallback='resources/app' overlay=archive-text",
+        EngineCommon::WideToUtf8(fullPath).c_str());
+    return true;
+}

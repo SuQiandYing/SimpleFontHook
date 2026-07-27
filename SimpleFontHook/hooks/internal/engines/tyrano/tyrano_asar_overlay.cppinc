@@ -1,0 +1,398 @@
+// ASAR indexing and loose resources/app overlay used when Electron prefers the
+// archive over the extracted fallback tree.
+
+static bool TyranoReadAt(HANDLE file, ULONGLONG offset, void* buffer, DWORD size) {
+    if (!file || file == INVALID_HANDLE_VALUE || (!buffer && size != 0)) return false;
+    LARGE_INTEGER position = {};
+    position.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(file, position, NULL, FILE_BEGIN)) return false;
+
+    BYTE* out = (BYTE*)buffer;
+    DWORD remaining = size;
+    while (remaining != 0) {
+        DWORD read = 0;
+        if (!ReadFile(file, out, remaining, &read, NULL) || read == 0) return false;
+        out += read;
+        remaining -= read;
+    }
+    return true;
+}
+
+static bool TyranoEnsureAsarIndex() {
+    std::wstring asarPath = TyranoBuildRootPath(L"resources\\app.asar");
+    DWORD now = GetTickCount();
+    {
+        std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+        if (g_tyranoAsarIndexAttempted &&
+            g_tyranoAsarIndexPath == asarPath &&
+            now - g_tyranoAsarLastValidationTick < 1000) {
+            return !g_tyranoAsarEntries.empty();
+        }
+    }
+
+    HANDLE file = orgCreateFileW(asarPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart < 32) {
+        CloseHandle(file);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+    if (g_tyranoAsarIndexAttempted && g_tyranoAsarIndexPath == asarPath &&
+        g_tyranoAsarIndexFileSize == (ULONGLONG)fileSize.QuadPart) {
+        g_tyranoAsarLastValidationTick = now;
+        CloseHandle(file);
+        return !g_tyranoAsarEntries.empty();
+    }
+
+    g_tyranoAsarIndexAttempted = true;
+    g_tyranoAsarIndexPath = asarPath;
+    g_tyranoAsarIndexFileSize = (ULONGLONG)fileSize.QuadPart;
+    g_tyranoAsarDataOffset = 0;
+    g_tyranoAsarLastValidationTick = now;
+    g_tyranoAsarEntries.clear();
+
+    DWORD headerWords[4] = {};
+    if (!TyranoReadAt(file, 0, headerWords, sizeof(headerWords))) {
+        CloseHandle(file);
+        return false;
+    }
+
+    // ASAR uses two Chromium Pickle records. The archive payload starts at
+    // 8 + headerWords[1], while headerWords[3] is the UTF-8 JSON byte count.
+    ULONGLONG dataOffset = 8ULL + headerWords[1];
+    DWORD jsonSize = headerWords[3];
+    bool headerLooksValid = headerWords[0] == 4 && jsonSize >= 2 &&
+        jsonSize <= 64U * 1024U * 1024U && dataOffset > 16 &&
+        dataOffset <= (ULONGLONG)fileSize.QuadPart &&
+        16ULL + jsonSize <= dataOffset;
+    if (!headerLooksValid) {
+        TyranoTraceLimited("asar-index-failed reason=header words=%lu,%lu,%lu,%lu size=%llu",
+            headerWords[0], headerWords[1], headerWords[2], headerWords[3],
+            (unsigned long long)fileSize.QuadPart);
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<char> json((size_t)jsonSize + 1, '\0');
+    if (!TyranoReadAt(file, 16, json.data(), jsonSize)) {
+        CloseHandle(file);
+        return false;
+    }
+    CloseHandle(file);
+
+    TyranoAsarJsonParser parser(json.data(), jsonSize);
+    if (!parser.Parse(g_tyranoAsarEntries, dataOffset) || g_tyranoAsarEntries.empty()) {
+        TyranoTraceLimited("asar-index-failed reason=json bytes=%lu", jsonSize);
+        g_tyranoAsarEntries.clear();
+        return false;
+    }
+
+    g_tyranoAsarDataOffset = dataOffset;
+    TyranoTraceLimited("asar-index-ready entries=%lu data-offset=%llu archive='%s'",
+        (DWORD)g_tyranoAsarEntries.size(), (unsigned long long)dataOffset,
+        EngineCommon::WideToUtf8(asarPath).c_str());
+    return true;
+}
+
+static bool TyranoLoosePathToRelative(const wchar_t* fileName,
+    std::wstring* fullPathOut, std::wstring* relativePathOut) {
+    if (!fileName || !fileName[0]) return false;
+
+    std::wstring fullPath = EngineCommon::FullPath(fileName);
+    std::wstring normalized = EngineCommon::NormalizePath(fullPath);
+    std::wstring appRoot = EngineCommon::NormalizePath(TyranoBuildRootPath(L"resources\\app"));
+    if (appRoot.empty() || normalized.size() <= appRoot.size() ||
+        normalized.compare(0, appRoot.size(), appRoot) != 0 ||
+        normalized[appRoot.size()] != L'\\') {
+        return false;
+    }
+
+    std::wstring relative = TyranoNormalizeRelativePath(
+        normalized.substr(appRoot.size() + 1));
+    if (relative.empty() || relative.find(L"..\\") == 0 ||
+        relative.find(L"\\..\\") != std::wstring::npos) {
+        return false;
+    }
+
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (relativePathOut) *relativePathOut = relative;
+    return true;
+}
+
+static bool TyranoAsarIsDirectory(const std::wstring& relativePath) {
+    if (!TyranoEnsureAsarIndex()) return false;
+    std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+    if (relativePath.empty()) return true;
+    std::wstring prefix = relativePath;
+    if (prefix.back() != L'\\') prefix += L'\\';
+    for (const auto& pair : g_tyranoAsarEntries) {
+        if (pair.first.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool TyranoFindAsarEntryForLoosePath(const wchar_t* fileName,
+    std::wstring* fullPathOut, std::wstring* relativePathOut,
+    TyranoAsarEntry* entryOut) {
+    std::wstring fullPath;
+    std::wstring relativePath;
+    if (!TyranoLoosePathToRelative(fileName, &fullPath, &relativePath) ||
+        !TyranoEnsureAsarIndex()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+    auto found = g_tyranoAsarEntries.find(relativePath);
+    if (found == g_tyranoAsarEntries.end() || found->second.unpacked) return false;
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (relativePathOut) *relativePathOut = relativePath;
+    if (entryOut) *entryOut = found->second;
+    return true;
+}
+
+static bool TyranoIsTextAsarEntry(const std::wstring& path) {
+    const wchar_t* extensions[] = {
+        L".ks", L".tjs", L".js", L".mjs", L".cjs", L".json",
+        L".html", L".htm", L".css", L".txt", L".csv", L".xml",
+        L".ini", L".yaml", L".yml"
+    };
+    for (const wchar_t* extension : extensions) {
+        if (EngineCommon::HasExtension(path, extension)) return true;
+    }
+    return false;
+}
+
+static bool TyranoShouldOverlayAsarEntry(const std::wstring& fullPath,
+    const std::wstring& relativePath, const TyranoAsarEntry& entry) {
+    if (entry.size > 64ULL * 1024ULL * 1024ULL) return false;
+    if (relativePath == L"main.js" || TyranoIsTextAsarEntry(relativePath)) return true;
+
+    // Missing or size-mismatched loose assets also come from the archive. This
+    // preserves localized UI images without forcing large audio/video streams
+    // through temporary files.
+    HANDLE loose = orgCreateFileW(fullPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (loose == INVALID_HANDLE_VALUE) return true;
+    LARGE_INTEGER looseSize = {};
+    bool mismatch = !GetFileSizeEx(loose, &looseSize) ||
+        (ULONGLONG)looseSize.QuadPart != entry.size;
+    CloseHandle(loose);
+    return mismatch;
+}
+
+static bool TyranoReadAsarEntry(const TyranoAsarEntry& entry,
+    std::vector<BYTE>& bytes) {
+    bytes.clear();
+    if (entry.unpacked || entry.size > 64ULL * 1024ULL * 1024ULL ||
+        entry.size > MAXDWORD || !TyranoEnsureAsarIndex()) {
+        return false;
+    }
+
+    std::wstring asarPath;
+    ULONGLONG archiveSize = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+        asarPath = g_tyranoAsarIndexPath;
+        archiveSize = g_tyranoAsarIndexFileSize;
+    }
+    if (entry.absoluteOffset > archiveSize || entry.size > archiveSize - entry.absoluteOffset)
+        return false;
+
+    HANDLE file = orgCreateFileW(asarPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    bytes.resize((size_t)entry.size);
+    bool ok = entry.size == 0 ||
+        TyranoReadAt(file, entry.absoluteOffset, bytes.data(), (DWORD)entry.size);
+    CloseHandle(file);
+    if (!ok) bytes.clear();
+    return ok;
+}
+
+static bool TyranoBytesContain(const std::vector<BYTE>& bytes, const char* needle) {
+    if (!needle || !needle[0] || bytes.empty()) return false;
+    size_t needleLength = strlen(needle);
+    if (needleLength > bytes.size()) return false;
+    return std::search(bytes.begin(), bytes.end(), needle, needle + needleLength) != bytes.end();
+}
+
+static bool TyranoPrepareAsarOverlay(const wchar_t* fileName,
+    std::wstring* fullPathOut, std::wstring* relativePathOut,
+    TyranoAsarEntry* entryOut, bool* injectBridgeOut) {
+    std::wstring fullPath;
+    std::wstring relativePath;
+    if (!TyranoLoosePathToRelative(fileName, &fullPath, &relativePath)) return false;
+    if (!TyranoReplacementEnabled()) return false;
+
+    const char* bridgePayload = TyranoBridgePayloadForPath(relativePath);
+    if (bridgePayload) {
+        if (fullPathOut) *fullPathOut = fullPath;
+        if (relativePathOut) *relativePathOut = relativePath;
+        if (injectBridgeOut) *injectBridgeOut = true;
+        TyranoAsarEntry entry = {};
+        if (TyranoEnsureAsarIndex()) {
+            std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+            auto found = g_tyranoAsarEntries.find(relativePath);
+            if (found != g_tyranoAsarEntries.end() && !found->second.unpacked) {
+                entry = found->second;
+            }
+        }
+        if (entryOut) *entryOut = entry;
+        return true;
+    }
+
+    TyranoAsarEntry entry = {};
+    if (!TyranoFindAsarEntryForLoosePath(fileName, &fullPath, &relativePath, &entry) ||
+        !TyranoShouldOverlayAsarEntry(fullPath, relativePath, entry)) {
+        return false;
+    }
+
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (relativePathOut) *relativePathOut = relativePath;
+    if (entryOut) *entryOut = entry;
+    if (injectBridgeOut) *injectBridgeOut = false;
+    return true;
+}
+
+static bool TyranoReadAsarOverlayBytes(const wchar_t* fileName,
+    std::vector<BYTE>& bytes, std::wstring* fullPathOut,
+    std::wstring* relativePathOut) {
+    bytes.clear();
+    TyranoAsarEntry entry = {};
+    bool injectBridge = false;
+    std::wstring fullPath;
+    std::wstring relativePath;
+    if (!TyranoPrepareAsarOverlay(fileName, &fullPath, &relativePath,
+        &entry, &injectBridge)) {
+        return false;
+    }
+
+    bool readOk = false;
+    if (entry.size > 0 || entry.absoluteOffset > 0) {
+        readOk = TyranoReadAsarEntry(entry, bytes);
+    }
+
+    if (!readOk) {
+        // Loose file fallback on disk (e.g. loose main.js).
+        HANDLE looseFile = orgCreateFileW(fullPath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (looseFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER looseSize = {};
+            if (GetFileSizeEx(looseFile, &looseSize) && looseSize.QuadPart > 0 &&
+                looseSize.QuadPart <= 64ULL * 1024ULL * 1024ULL) {
+                bytes.resize((size_t)looseSize.QuadPart);
+                DWORD readBytes = 0;
+                if (ReadFile(looseFile, bytes.data(), (DWORD)looseSize.QuadPart, &readBytes, NULL) &&
+                    readBytes == (DWORD)looseSize.QuadPart) {
+                    readOk = true;
+                }
+            }
+            CloseHandle(looseFile);
+        }
+    }
+
+    if (!readOk) return false;
+
+    const char* bridgePayload = injectBridge ?
+        TyranoBridgePayloadForPath(relativePath) : nullptr;
+    const char* bridgeMarker = injectBridge ?
+        TyranoBridgeMarkerForPath(relativePath) : nullptr;
+    if (bridgePayload && bridgeMarker && !TyranoBytesContain(bytes, bridgeMarker)) {
+        const BYTE* bridge = (const BYTE*)bridgePayload;
+        bytes.insert(bytes.end(), bridge, bridge + strlen(bridgePayload));
+    }
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (relativePathOut) *relativePathOut = relativePath;
+    return true;
+}
+
+static HANDLE TyranoTryOpenAsarOverlayFileW(const wchar_t* fileName,
+    DWORD desiredAccess, DWORD creationDisposition) {
+    if (!EngineCommon::IsReadOnlyOpen(desiredAccess, creationDisposition))
+        return INVALID_HANDLE_VALUE;
+
+    std::vector<BYTE> bytes;
+    std::wstring fullPath;
+    std::wstring relativePath;
+    if (!TyranoReadAsarOverlayBytes(fileName, bytes, &fullPath, &relativePath))
+        return INVALID_HANDLE_VALUE;
+
+    HANDLE file = EngineCommon::CreateTemporaryReadHandle(bytes.data(), bytes.size());
+    if (file == INVALID_HANDLE_VALUE) {
+        TyranoTraceLimited("asar-overlay-open-failed request='%s' entry='%s' err=%lu bytes=%lu",
+            EngineCommon::WideToUtf8(fullPath).c_str(), EngineCommon::WideToUtf8(relativePath).c_str(),
+            GetLastError(), (DWORD)bytes.size());
+        return INVALID_HANDLE_VALUE;
+    }
+
+    TyranoTraceLimited("asar-overlay-open request='%s' entry='%s' bytes=%lu bridge=%d",
+        EngineCommon::WideToUtf8(fullPath).c_str(), EngineCommon::WideToUtf8(relativePath).c_str(),
+        (DWORD)bytes.size(), TyranoBridgePayloadForPath(relativePath) ? 1 : 0);
+    return file;
+}
+
+static bool TyranoTryGetAsarOverlayAttributesW(const wchar_t* fileName,
+    WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attrs) {
+    std::wstring fullPath;
+    std::wstring relativePath;
+    if (!TyranoLoosePathToRelative(fileName, &fullPath, &relativePath)) return false;
+    if (!TyranoReplacementEnabled()) return false;
+
+    if (relativePath.empty() || TyranoAsarIsDirectory(relativePath)) {
+        WIN32_FILE_ATTRIBUTE_DATA localData = {};
+        localData.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        GetSystemTimeAsFileTime(&localData.ftCreationTime);
+        localData.ftLastAccessTime = localData.ftCreationTime;
+        localData.ftLastWriteTime = localData.ftCreationTime;
+
+        if (data) *data = localData;
+        if (attrs) *attrs = localData.dwFileAttributes;
+        return true;
+    }
+
+    TyranoAsarEntry entry = {};
+    bool injectBridge = false;
+    if (!TyranoPrepareAsarOverlay(fileName, &fullPath, &relativePath,
+        &entry, &injectBridge)) {
+        return false;
+    }
+
+    const char* bridgePayload = injectBridge ?
+        TyranoBridgePayloadForPath(relativePath) : nullptr;
+    ULONGLONG size = entry.size;
+    if (bridgePayload && size == 0) {
+        HANDLE looseFile = orgCreateFileW(fullPath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (looseFile != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER looseSize = {};
+            if (GetFileSizeEx(looseFile, &looseSize) && looseSize.QuadPart >= 0) {
+                size = (ULONGLONG)looseSize.QuadPart;
+            }
+            CloseHandle(looseFile);
+        }
+    }
+    if (bridgePayload) size += strlen(bridgePayload);
+    WIN32_FILE_ATTRIBUTE_DATA localData = {};
+    localData.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    localData.nFileSizeHigh = (DWORD)(size >> 32);
+    localData.nFileSizeLow = (DWORD)size;
+    GetSystemTimeAsFileTime(&localData.ftCreationTime);
+    localData.ftLastAccessTime = localData.ftCreationTime;
+    localData.ftLastWriteTime = localData.ftCreationTime;
+
+    if (data) *data = localData;
+    if (attrs) *attrs = localData.dwFileAttributes;
+    return true;
+}

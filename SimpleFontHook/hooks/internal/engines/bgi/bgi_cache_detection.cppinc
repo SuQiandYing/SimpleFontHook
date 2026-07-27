@@ -1,0 +1,248 @@
+static std::vector<CodeRange> GetExecutableRanges(BYTE* imageBase, size_t imageSize, IMAGE_NT_HEADERS32* nt) {
+    std::vector<CodeRange> ranges;
+    IMAGE_SECTION_HEADER* section = reinterpret_cast<IMAGE_SECTION_HEADER*>(
+        reinterpret_cast<BYTE*>(&nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
+    const size_t sectionBytes = static_cast<size_t>(nt->FileHeader.NumberOfSections) *
+        sizeof(IMAGE_SECTION_HEADER);
+    if (!IsImageRange(imageBase, imageSize, section, sectionBytes)) return ranges;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        size_t sectionSize = section->Misc.VirtualSize;
+        if (sectionSize == 0) sectionSize = section->SizeOfRawData;
+        BYTE* begin = ImageRva(imageBase, imageSize, section->VirtualAddress, sectionSize);
+        if (!begin) continue;
+        ranges.push_back({ begin, begin + sectionSize });
+    }
+    return ranges;
+}
+
+static const CodeRange* FindContainingCodeRange(const std::vector<CodeRange>& ranges, const BYTE* address) {
+    for (const CodeRange& range : ranges) {
+        if (address >= range.begin && address < range.end) return &range;
+    }
+    return nullptr;
+}
+
+static bool ReadEdiDisplacement(const BYTE* cursor, const BYTE* end, BYTE opcode, BYTE registerBits,
+    DWORD* displacement, size_t* instructionLength) {
+    if (!cursor || !displacement || !instructionLength || cursor + 3 > end || cursor[0] != opcode) return false;
+
+    const BYTE disp8ModRm = static_cast<BYTE>(0x47 | registerBits);
+    const BYTE disp32ModRm = static_cast<BYTE>(0x87 | registerBits);
+    if (cursor[1] == disp8ModRm) {
+        const signed char value = static_cast<signed char>(cursor[2]);
+        if (value < 0) return false;
+        *displacement = static_cast<DWORD>(value);
+        *instructionLength = 3;
+        return true;
+    }
+    if (cursor[1] == disp32ModRm && cursor + 6 <= end) {
+        const LONG value = ReadUnalignedLong(cursor + 2);
+        if (value < 0) return false;
+        *displacement = static_cast<DWORD>(value);
+        *instructionLength = 6;
+        return true;
+    }
+    return false;
+}
+
+static bool ContainsBytes(const BYTE* begin, const BYTE* end, const BYTE* bytes, size_t length) {
+    if (!begin || !end || !bytes || length == 0 || begin > end || static_cast<size_t>(end - begin) < length)
+        return false;
+    for (const BYTE* cursor = begin; cursor + length <= end; ++cursor) {
+        if (memcmp(cursor, bytes, length) == 0) return true;
+    }
+    return false;
+}
+
+static bool ContainsEdiDisplacement(const BYTE* begin, const BYTE* end, BYTE opcode, BYTE registerBits,
+    DWORD expectedDisplacement) {
+    for (const BYTE* cursor = begin; cursor + 3 <= end; ++cursor) {
+        DWORD displacement = 0;
+        size_t length = 0;
+        if (ReadEdiDisplacement(cursor, end, opcode, registerBits, &displacement, &length) &&
+            displacement == expectedDisplacement) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ReferencesRasterIat(const BYTE* function, const std::vector<CodeRange>& ranges,
+    const std::vector<PVOID*>& rasterSlots) {
+    const CodeRange* range = FindContainingCodeRange(ranges, function);
+    if (!range) return false;
+    const BYTE* rangeEnd = range->end;
+    const BYTE* end = std::min(rangeEnd, function + kMaxRasterFunctionBytes);
+    for (const BYTE* cursor = function; cursor + 6 <= end; ++cursor) {
+        if (cursor[0] != 0xFF || (cursor[1] != 0x15 && cursor[1] != 0x25)) continue;
+        const uintptr_t referencedSlot = ReadUnalignedDword(cursor + 2);
+        for (PVOID* rasterSlot : rasterSlots) {
+            if (referencedSlot == reinterpret_cast<uintptr_t>(rasterSlot)) return true;
+        }
+    }
+    return false;
+}
+
+static bool CallsRasterFunction(const BYTE* begin, const BYTE* end, const std::vector<CodeRange>& ranges,
+    const std::vector<PVOID*>& rasterSlots) {
+    if (ReferencesRasterIat(begin, ranges, rasterSlots)) return true;
+    for (const BYTE* cursor = begin; cursor + 5 <= end; ++cursor) {
+        if (cursor[0] != 0xE8) continue;
+        const LONG relative = ReadUnalignedLong(cursor + 1);
+        const int64_t targetValue = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor + 5)) + relative;
+        if (targetValue < 0 || static_cast<uint64_t>(targetValue) >
+            std::numeric_limits<uintptr_t>::max()) {
+            continue;
+        }
+        const BYTE* target = reinterpret_cast<const BYTE*>(static_cast<uintptr_t>(targetValue));
+        if (FindContainingCodeRange(ranges, target) && ReferencesRasterIat(target, ranges, rasterSlots)) return true;
+    }
+    return false;
+}
+
+static const BYTE* FindCacheFunctionStart(const BYTE* rangeBegin, const BYTE* semanticCore) {
+    const BYTE* searchBegin = semanticCore - std::min<size_t>(48, semanticCore - rangeBegin);
+    const BYTE* movThis = nullptr;
+    for (const BYTE* cursor = semanticCore; cursor >= searchBegin + 2; ) {
+        --cursor;
+        if (cursor[0] == 0x8B && cursor[1] == 0xF9) {
+            movThis = cursor;
+            break;
+        }
+    }
+    if (!movThis || movThis + 4 > semanticCore ||
+        !((movThis[2] == 0x33 || movThis[2] == 0x31) && movThis[3] == 0xC9)) {
+        return nullptr;
+    }
+
+    const BYTE* functionStart = nullptr;
+    for (const BYTE* cursor = movThis; cursor >= searchBegin + 3; ) {
+        --cursor;
+        if (cursor[0] == 0x83 && cursor[1] == 0xEC) {
+            functionStart = cursor;
+            break;
+        }
+        if (cursor + 6 <= movThis && cursor[0] == 0x81 && cursor[1] == 0xEC) {
+            functionStart = cursor;
+            break;
+        }
+        if (cursor[0] == 0x55 && cursor[1] == 0x8B && cursor[2] == 0xEC) {
+            functionStart = cursor;
+            break;
+        }
+    }
+    if (!functionStart) return nullptr;
+
+    const BYTE stackArgumentLoad[] = { 0x8B, 0x5C, 0x24 };
+    if (!ContainsBytes(functionStart, movThis, stackArgumentLoad, sizeof(stackArgumentLoad))) return nullptr;
+    return functionStart;
+}
+
+static const BYTE* FindRet8(const BYTE* functionStart, const BYTE* rangeEnd) {
+    const BYTE* end = std::min(rangeEnd, functionStart + kMaxCacheFunctionBytes);
+    for (const BYTE* cursor = functionStart; cursor + 3 <= end; ++cursor) {
+        if (cursor[0] != 0xC2 || cursor[1] != 0x08 || cursor[2] != 0x00) continue;
+        const BYTE* epilogueBegin = cursor - std::min<size_t>(16, cursor - functionStart);
+        bool restoresStack = false;
+        bool restoresRegister = false;
+        for (const BYTE* epilogue = epilogueBegin; epilogue < cursor; ++epilogue) {
+            if (epilogue[0] >= 0x5B && epilogue[0] <= 0x5F) restoresRegister = true;
+            if (epilogue[0] == 0xC9 ||
+                (epilogue + 3 <= cursor && epilogue[0] == 0x83 && epilogue[1] == 0xC4)) {
+                restoresStack = true;
+            }
+        }
+        if (restoresStack && restoresRegister) return cursor + 3;
+    }
+    return nullptr;
+}
+
+static bool TryReadCacheSemanticCore(const BYTE* cursor, const BYTE* end,
+    DWORD* headOffset, DWORD* countOffset, size_t* coreLength) {
+    DWORD count = 0;
+    DWORD head = 0;
+    DWORD sentinel = 0;
+    size_t countLoadLength = 0;
+    size_t headLoadLength = 0;
+    size_t sentinelLoadLength = 0;
+
+    if (!ReadEdiDisplacement(cursor, end, 0x8B, 0x00, &count, &countLoadLength)) return false;
+    const BYTE* headLoad = cursor + countLoadLength;
+    if (!ReadEdiDisplacement(headLoad, end, 0x8B, 0x30, &head, &headLoadLength)) return false;
+    const BYTE* test = headLoad + headLoadLength;
+    if (test + 2 > end || test[0] != 0x85 || test[1] != 0xC0) return false;
+    const BYTE* sentinelLoad = test + 2;
+    if (!ReadEdiDisplacement(sentinelLoad, end, 0x8D, 0x10, &sentinel, &sentinelLoadLength)) return false;
+    const BYTE* branch = sentinelLoad + sentinelLoadLength;
+    size_t branchLength = 0;
+    if (branch + 2 <= end && branch[0] == 0x7E) branchLength = 2;
+    else if (branch + 6 <= end && branch[0] == 0x0F && branch[1] == 0x8E) branchLength = 6;
+    else return false;
+
+    if ((head & 3) != 0 || (count & 3) != 0 || (sentinel & 3) != 0 ||
+        count != head + 8 || head != sentinel + 0x1C || count > 0x400) {
+        return false;
+    }
+
+    *headOffset = head;
+    *countOffset = count;
+    *coreLength = countLoadLength + headLoadLength + 2 + sentinelLoadLength + branchLength;
+    return true;
+}
+
+static bool ValidateCacheFunction(const BYTE* functionStart, const BYTE* functionEnd,
+    DWORD headOffset, DWORD countOffset, const std::vector<CodeRange>& ranges,
+    const std::vector<PVOID*>& rasterSlots) {
+    const BYTE entryStride[] = { 0xC1, 0xE6, 0x05 };
+    const DWORD entriesOffset = headOffset + sizeof(void*);
+    const DWORD capacityOffset = countOffset + sizeof(DWORD);
+    return ContainsEdiDisplacement(functionStart, functionEnd, 0x3B, 0x00, capacityOffset) &&
+        ContainsEdiDisplacement(functionStart, functionEnd, 0x8B, 0x08, entriesOffset) &&
+        ContainsEdiDisplacement(functionStart, functionEnd, 0x89, 0x00, countOffset) &&
+        ContainsBytes(functionStart, functionEnd, entryStride, sizeof(entryStride)) &&
+        CallsRasterFunction(functionStart, functionEnd, ranges, rasterSlots);
+}
+
+static std::vector<CacheLayout> FindCacheLayouts(BYTE* imageBase, size_t imageSize,
+    IMAGE_NT_HEADERS32* nt, const ImportProfile& imports) {
+    std::vector<CacheLayout> layouts;
+    layouts.reserve(kMaxCacheLayouts);
+    const std::vector<CodeRange> ranges = GetExecutableRanges(imageBase, imageSize, nt);
+
+    for (const CodeRange& range : ranges) {
+        for (BYTE* cursor = range.begin; cursor + 16 < range.end && layouts.size() < kMaxCacheLayouts; ++cursor) {
+            DWORD headOffset = 0;
+            DWORD countOffset = 0;
+            size_t coreLength = 0;
+            if (!TryReadCacheSemanticCore(cursor, range.end, &headOffset, &countOffset, &coreLength)) continue;
+
+            const BYTE* functionStart = FindCacheFunctionStart(range.begin, cursor);
+            if (!functionStart) continue;
+            const BYTE* functionEnd = FindRet8(functionStart, range.end);
+            if (!functionEnd || !ValidateCacheFunction(functionStart, functionEnd, headOffset, countOffset,
+                ranges, imports.rasterSlots)) {
+                continue;
+            }
+
+            bool duplicate = false;
+            for (const CacheLayout& existing : layouts) {
+                if (existing.target == functionStart) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            CacheLayout layout;
+            layout.target = const_cast<BYTE*>(functionStart);
+            layout.original = reinterpret_cast<CacheLookupFn>(layout.target);
+            layout.headOffset = headOffset;
+            layout.countOffset = countOffset;
+            layouts.push_back(layout);
+            Utils::Trace("[DEBUG][BGI] semantic glyph cache target=%p head=0x%lX count=0x%lX",
+                layout.target, layout.headOffset, layout.countOffset);
+        }
+    }
+    return layouts;
+}

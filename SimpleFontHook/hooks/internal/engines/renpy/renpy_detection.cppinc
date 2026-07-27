@@ -1,0 +1,22 @@
+static bool LooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_engineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    bool hasRuntimePackage =
+        EngineCommon::IsDirectory(EngineCommon::BuildRootPath(L"renpy")) &&
+        EngineCommon::IsFile(EngineCommon::BuildRootPath(L"renpy\\__init__.py"));
+    bool hasRuntimeSubsystem = hasRuntimePackage &&
+        (EngineCommon::IsDirectory(EngineCommon::BuildRootPath(L"renpy\\text")) ||
+         EngineCommon::IsDirectory(EngineCommon::BuildRootPath(L"renpy\\display")) ||
+         EngineCommon::IsDirectory(EngineCommon::BuildRootPath(L"renpy\\common")));
+    bool frameworkContract = EngineIdentityPolicy::ConfirmFrameworkContract(
+        hasRuntimePackage, hasRuntimeSubsystem);
+    bool detected = EngineIdentityPolicy::Confirm({
+        false, false, false, false, frameworkContract });
+    InterlockedExchange(&g_engineProbe, detected ? 1 : 0);
+    if (detected) {
+        TraceLimited("engine detected root='%s'",
+            EngineCommon::WideToUtf8(EngineCommon::GameRoot()).c_str());
+    }
+    return detected;
+}

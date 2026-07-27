@@ -1,0 +1,57 @@
+namespace EngineCommon {
+
+static bool ExportConfiguredFontToMemory(std::vector<BYTE>& bytes) {
+    bytes.clear();
+    if (Config::ForcedFontNameW[0] == L'\0') return false;
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) return false;
+
+    LOGFONTW logfont = {};
+    logfont.lfHeight = -64;
+    logfont.lfWeight = (Config::EnableFontWeight && Config::FontWeight > 0) ?
+        Config::FontWeight : FW_NORMAL;
+    logfont.lfCharSet = Config::EnableCharsetReplace ?
+        static_cast<BYTE>(Config::ForcedCharset) : DEFAULT_CHARSET;
+    logfont.lfQuality = CLEARTYPE_QUALITY;
+    wcscpy_s(logfont.lfFaceName, Config::ForcedFontNameW);
+
+    HFONT font = orgCreateFontIndirectW(&logfont);
+    if (!font) {
+        DeleteDC(hdc);
+        return false;
+    }
+
+    HGDIOBJ previous = orgSelectObject(hdc, font);
+    if (!previous || previous == HGDI_ERROR) {
+        DeleteObject(font);
+        DeleteDC(hdc);
+        return false;
+    }
+
+    DWORD size = orgGetFontData(hdc, 0, 0, NULL, 0);
+    if (size == GDI_ERROR || size < 12 || size > 128 * 1024 * 1024) {
+        DWORD error = GetLastError();
+        orgSelectObject(hdc, previous);
+        DeleteObject(font);
+        DeleteDC(hdc);
+        SetLastError(error);
+        return false;
+    }
+
+    bytes.resize(size);
+    DWORD read = orgGetFontData(hdc, 0, 0, bytes.data(), size);
+    DWORD error = GetLastError();
+    orgSelectObject(hdc, previous);
+    DeleteObject(font);
+    DeleteDC(hdc);
+
+    if (read == GDI_ERROR || read != size || !LooksLikeSfnt(bytes.data(), bytes.size())) {
+        bytes.clear();
+        SetLastError(error);
+        return false;
+    }
+    return true;
+}
+
+} // namespace EngineCommon

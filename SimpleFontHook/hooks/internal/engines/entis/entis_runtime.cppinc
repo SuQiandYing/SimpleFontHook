@@ -1,0 +1,608 @@
+namespace EntisCompat {
+
+#if defined(_M_IX86)
+typedef void* (__thiscall *DeletingDestructorFn)(void* instance,
+    unsigned int flags);
+typedef int (__thiscall *SetStyleFn)(void* instance, const void* style);
+typedef int (__thiscall *RasterGlyphFn)(void* instance,
+    ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, ULONG_PTR arg4);
+#else
+typedef void* (*DeletingDestructorFn)(void* instance, unsigned int flags);
+typedef int (*SetStyleFn)(void* instance, const void* style);
+typedef int (*RasterGlyphFn)(void* instance,
+    ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, ULONG_PTR arg4);
+#endif
+
+static const char kWindowsFontRttiName[] =
+    ".?AVSGLWindowsFont@SakuraGL@@";
+static const char kReferenceFontRttiName[] =
+    ".?AVSGLReferenceFont@SGLBitmapFontLoader@SakuraGL@@";
+
+static const size_t kDeletingDestructorVtableIndex = 0;
+static const size_t kSetStyleVtableIndex = 7;
+static const size_t kRasterGlyphVtableIndex = 8;
+static const size_t kWindowsFontObjectSize = 0x5C;
+
+static void** g_windowsFontVtable = NULL;
+static DeletingDestructorFn g_windowsFontDestructor = NULL;
+static SetStyleFn g_windowsSetStyle = NULL;
+static RasterGlyphFn g_windowsRasterGlyph = NULL;
+
+static void** g_referenceFontVtable = NULL;
+static DeletingDestructorFn g_referenceFontDestructor = NULL;
+static SetStyleFn g_referenceSetStyle = NULL;
+static RasterGlyphFn g_referenceRasterGlyph = NULL;
+
+static std::mutex g_referenceFontMutex;
+static std::unordered_map<void*, void*> g_referenceFontSurrogates;
+static volatile LONG g_runtimePrepared = 0;
+static volatile LONG g_rasterHookInstalled = 0;
+static volatile LONG g_requestedVersion = 0;
+static volatile LONG g_observedRasterVersion = LONG_MIN;
+static volatile LONG g_referenceRedirectTraceCount = 0;
+
+static bool MatchesMaskedBytes(const BYTE* address, const BYTE* pattern,
+    const char* mask, size_t length) {
+    if (!address || !pattern || !mask) return false;
+    for (size_t i = 0; i < length; ++i) {
+        if (mask[i] == 'x' && address[i] != pattern[i]) return false;
+    }
+    return true;
+}
+
+static bool AddressIsInImage(const ImageView& view, const void* address,
+    size_t length) {
+    if (!view.base || !address || length == 0) return false;
+    uintptr_t imageBegin = reinterpret_cast<uintptr_t>(view.base);
+    uintptr_t imageEnd = imageBegin + view.size;
+    uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+    return imageEnd >= imageBegin && begin >= imageBegin && begin < imageEnd &&
+        length <= imageEnd - begin;
+}
+
+static bool ImportSlotTargets(void** slot, const char* moduleName,
+    const char* functionName) {
+    if (!slot || !moduleName || !functionName ||
+        !IsReadableMemory(slot, sizeof(void*))) {
+        return false;
+    }
+
+    HMODULE module = GetModuleHandleA(moduleName);
+    if (!module) return false;
+    FARPROC function = GetProcAddress(module, functionName);
+    return function && *slot == reinterpret_cast<void*>(function);
+}
+
+static BYTE* FindSetStyleFunction(const ImageView& view) {
+#if !defined(_M_IX86)
+    (void)view;
+    return NULL;
+#else
+    // SGLWindowsFont::SetStyle creates and selects its HFONT in this sequence:
+    // lea localLogFont; push; call [CreateFontIndirectA]; push eax;
+    // push [this+8]; mov [this+0c],eax; call [SelectObject].
+    static const BYTE pattern[] = {
+        0x8D, 0x45, 0x00, 0x50, 0xFF, 0x15, 0, 0, 0, 0,
+        0x50, 0xFF, 0x76, 0x08, 0x89, 0x46, 0x0C,
+        0xFF, 0x15, 0, 0, 0, 0, 0x89, 0x46, 0x10
+    };
+    static const char mask[] = "xx?xxx????xxxxxxxxx????xxx";
+    static const BYTE prologue[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xEC
+    };
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        BYTE* begin = NULL;
+        BYTE* end = NULL;
+        if (!GetSectionRange(view, i, &begin, &end)) continue;
+
+        for (BYTE* current = begin;
+            static_cast<size_t>(end - current) >= sizeof(pattern); ++current) {
+            if (!MatchesMaskedBytes(current, pattern, mask, sizeof(pattern)))
+                continue;
+
+            DWORD createFontSlotAddress = 0;
+            DWORD selectObjectSlotAddress = 0;
+            memcpy(&createFontSlotAddress, current + 6, sizeof(DWORD));
+            memcpy(&selectObjectSlotAddress, current + 19, sizeof(DWORD));
+            void** createFontSlot = reinterpret_cast<void**>(
+                static_cast<uintptr_t>(createFontSlotAddress));
+            void** selectObjectSlot = reinterpret_cast<void**>(
+                static_cast<uintptr_t>(selectObjectSlotAddress));
+            if (!ImportSlotTargets(createFontSlot, "gdi32.dll",
+                    "CreateFontIndirectA") ||
+                !ImportSlotTargets(selectObjectSlot, "gdi32.dll",
+                    "SelectObject")) {
+                continue;
+            }
+
+            uintptr_t currentAddress = reinterpret_cast<uintptr_t>(current);
+            uintptr_t sectionAddress = reinterpret_cast<uintptr_t>(begin);
+            uintptr_t lowerAddress = currentAddress > sectionAddress + 0x100
+                ? currentAddress - 0x100 : sectionAddress;
+            BYTE* lower = reinterpret_cast<BYTE*>(lowerAddress);
+            for (BYTE* candidate = current; ; --candidate) {
+                if (static_cast<size_t>(end - candidate) >= sizeof(prologue) &&
+                    BytesEqual(candidate, prologue, sizeof(prologue))) {
+                    return candidate;
+                }
+                if (candidate == lower) break;
+            }
+        }
+    }
+    return NULL;
+#endif
+}
+
+static BYTE* FindRasterGlyphFunction(const ImageView& view, BYTE* setStyle) {
+#if !defined(_M_IX86)
+    (void)view;
+    (void)setStyle;
+    return NULL;
+#else
+    if (!setStyle || reinterpret_cast<uintptr_t>(setStyle) > 0xFFFFFFFFu)
+        return NULL;
+
+    DWORD setStyleAddress =
+        static_cast<DWORD>(reinterpret_cast<uintptr_t>(setStyle));
+    static const BYTE rasterPrologue[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8
+    };
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) continue;
+        BYTE* begin = NULL;
+        BYTE* end = NULL;
+        if (!GetSectionRange(view, i, &begin, &end)) continue;
+
+        for (BYTE* current = begin;
+            static_cast<size_t>(end - current) >= sizeof(DWORD) * 2;
+            current += sizeof(DWORD)) {
+            if (!BytesEqual(current,
+                    reinterpret_cast<const BYTE*>(&setStyleAddress),
+                    sizeof(setStyleAddress))) {
+                continue;
+            }
+
+            DWORD rasterAddress = 0;
+            memcpy(&rasterAddress, current + sizeof(DWORD), sizeof(DWORD));
+            BYTE* raster = reinterpret_cast<BYTE*>(
+                static_cast<uintptr_t>(rasterAddress));
+            if (AddressIsExecutable(view, raster) &&
+                BytesEqual(raster, rasterPrologue, sizeof(rasterPrologue))) {
+                return raster;
+            }
+        }
+    }
+    return NULL;
+#endif
+}
+
+#if defined(_M_IX86)
+static bool IsExpectedFontVtable(const ImageView& view, void** vtable) {
+    if (!AddressIsInImage(view, vtable,
+            (kRasterGlyphVtableIndex + 1) * sizeof(void*))) {
+        return false;
+    }
+
+    const size_t requiredEntries[] = {
+        kDeletingDestructorVtableIndex,
+        kSetStyleVtableIndex,
+        kRasterGlyphVtableIndex
+    };
+    for (size_t i = 0; i < _countof(requiredEntries); ++i) {
+        void* function = NULL;
+        memcpy(&function, vtable + requiredEntries[i], sizeof(function));
+        if (!AddressIsExecutable(view, function)) return false;
+    }
+    return true;
+}
+
+static void** FindMsvcVtableByRttiName(const ImageView& view,
+    const char* rttiName) {
+    if (!rttiName || !rttiName[0]) return NULL;
+
+    BYTE* className = FindBytesInImage(view,
+        reinterpret_cast<const BYTE*>(rttiName), strlen(rttiName), false);
+    if (!className || !AddressIsInImage(view, className - sizeof(DWORD) * 2,
+            sizeof(DWORD) * 2 + strlen(rttiName) + 1)) {
+        TraceLimited("RTTI class name not found name='%s'", rttiName);
+        return NULL;
+    }
+
+    BYTE* typeDescriptor = className - sizeof(DWORD) * 2;
+    DWORD typeDescriptorAddress = static_cast<DWORD>(
+        reinterpret_cast<uintptr_t>(typeDescriptor));
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) continue;
+        BYTE* begin = NULL;
+        BYTE* end = NULL;
+        if (!GetSectionRange(view, i, &begin, &end)) continue;
+
+        for (BYTE* typeReference = begin;
+            static_cast<size_t>(end - typeReference) >= sizeof(DWORD);
+            typeReference += sizeof(DWORD)) {
+            DWORD value = 0;
+            memcpy(&value, typeReference, sizeof(value));
+            if (value != typeDescriptorAddress ||
+                typeReference < begin + sizeof(DWORD) * 3) {
+                continue;
+            }
+
+            BYTE* objectLocator = typeReference - sizeof(DWORD) * 3;
+            if (!AddressIsInImage(view, objectLocator, sizeof(DWORD) * 5))
+                continue;
+
+            DWORD signature = 0;
+            DWORD objectOffset = 0;
+            DWORD constructorOffset = 0;
+            DWORD hierarchyAddress = 0;
+            memcpy(&signature, objectLocator, sizeof(DWORD));
+            memcpy(&objectOffset, objectLocator + sizeof(DWORD), sizeof(DWORD));
+            memcpy(&constructorOffset, objectLocator + sizeof(DWORD) * 2,
+                sizeof(DWORD));
+            memcpy(&hierarchyAddress, objectLocator + sizeof(DWORD) * 4,
+                sizeof(DWORD));
+            if (signature != 0 || objectOffset > 0x1000 ||
+                constructorOffset > 0x1000) {
+                continue;
+            }
+
+            BYTE* hierarchy = reinterpret_cast<BYTE*>(
+                static_cast<uintptr_t>(hierarchyAddress));
+            if (!AddressIsInImage(view, hierarchy, sizeof(DWORD) * 4))
+                continue;
+
+            DWORD hierarchySignature = 0;
+            DWORD baseClassCount = 0;
+            DWORD baseClassArrayAddress = 0;
+            memcpy(&hierarchySignature, hierarchy, sizeof(DWORD));
+            memcpy(&baseClassCount, hierarchy + sizeof(DWORD) * 2,
+                sizeof(DWORD));
+            memcpy(&baseClassArrayAddress, hierarchy + sizeof(DWORD) * 3,
+                sizeof(DWORD));
+            if (hierarchySignature != 0 || baseClassCount == 0 ||
+                baseClassCount > 128 || !AddressIsInImage(view,
+                    reinterpret_cast<void*>(
+                        static_cast<uintptr_t>(baseClassArrayAddress)),
+                    sizeof(DWORD))) {
+                continue;
+            }
+
+            DWORD objectLocatorAddress = static_cast<DWORD>(
+                reinterpret_cast<uintptr_t>(objectLocator));
+            for (WORD sectionIndex = 0;
+                sectionIndex < view.nt->FileHeader.NumberOfSections;
+                ++sectionIndex) {
+                if ((sections[sectionIndex].Characteristics &
+                        IMAGE_SCN_MEM_EXECUTE) != 0) {
+                    continue;
+                }
+                BYTE* refBegin = NULL;
+                BYTE* refEnd = NULL;
+                if (!GetSectionRange(view, sectionIndex, &refBegin, &refEnd))
+                    continue;
+
+                for (BYTE* locatorReference = refBegin;
+                    static_cast<size_t>(refEnd - locatorReference) >=
+                        sizeof(DWORD) * 2;
+                    locatorReference += sizeof(DWORD)) {
+                    DWORD locatorValue = 0;
+                    memcpy(&locatorValue, locatorReference, sizeof(DWORD));
+                    if (locatorValue != objectLocatorAddress) continue;
+
+                    void** vtable = reinterpret_cast<void**>(
+                        locatorReference + sizeof(DWORD));
+                    if (IsExpectedFontVtable(view, vtable)) {
+                        TraceLimited("RTTI resolved name='%s' type=%p col=%p vtable=%p",
+                            rttiName, typeDescriptor, objectLocator, vtable);
+                        return vtable;
+                    }
+                }
+            }
+        }
+    }
+
+    TraceLimited("RTTI vtable not found name='%s' type=%p",
+        rttiName, typeDescriptor);
+    return NULL;
+}
+
+template <typename FunctionType>
+static FunctionType FunctionFromVtable(void** vtable, size_t index) {
+    if (!vtable) return NULL;
+    void* function = NULL;
+    memcpy(&function, vtable + index, sizeof(function));
+    return reinterpret_cast<FunctionType>(function);
+}
+#endif
+
+static bool ResolveRuntimeTargets() {
+    ImageView view = {};
+    if (!QueryMainImage(&view)) return false;
+
+#if defined(_M_IX86)
+    g_windowsFontVtable = FindMsvcVtableByRttiName(view,
+        kWindowsFontRttiName);
+    if (g_windowsFontVtable) {
+        g_windowsFontDestructor = FunctionFromVtable<DeletingDestructorFn>(
+            g_windowsFontVtable, kDeletingDestructorVtableIndex);
+        g_windowsSetStyle = FunctionFromVtable<SetStyleFn>(
+            g_windowsFontVtable, kSetStyleVtableIndex);
+        g_windowsRasterGlyph = FunctionFromVtable<RasterGlyphFn>(
+            g_windowsFontVtable, kRasterGlyphVtableIndex);
+    } else {
+        BYTE* setStyle = FindSetStyleFunction(view);
+        BYTE* rasterGlyph = FindRasterGlyphFunction(view, setStyle);
+        g_windowsSetStyle = reinterpret_cast<SetStyleFn>(setStyle);
+        g_windowsRasterGlyph = reinterpret_cast<RasterGlyphFn>(rasterGlyph);
+    }
+
+    g_referenceFontVtable = FindMsvcVtableByRttiName(view,
+        kReferenceFontRttiName);
+    if (g_referenceFontVtable) {
+        g_referenceFontDestructor = FunctionFromVtable<DeletingDestructorFn>(
+            g_referenceFontVtable, kDeletingDestructorVtableIndex);
+        g_referenceSetStyle = FunctionFromVtable<SetStyleFn>(
+            g_referenceFontVtable, kSetStyleVtableIndex);
+        g_referenceRasterGlyph = FunctionFromVtable<RasterGlyphFn>(
+            g_referenceFontVtable, kRasterGlyphVtableIndex);
+    }
+#endif
+
+    bool windowsReady = g_windowsFontVtable && g_windowsFontDestructor &&
+        g_windowsSetStyle && g_windowsRasterGlyph;
+    bool referenceReady = g_referenceFontVtable &&
+        g_referenceFontDestructor && g_referenceSetStyle &&
+        g_referenceRasterGlyph;
+    TraceLimited("runtime resolve windows-ready=%d vtable=%p dtor=%p set-style=%p raster=%p reference-ready=%d vtable=%p dtor=%p set-style=%p raster=%p",
+        windowsReady ? 1 : 0, g_windowsFontVtable,
+        reinterpret_cast<void*>(g_windowsFontDestructor),
+        reinterpret_cast<void*>(g_windowsSetStyle),
+        reinterpret_cast<void*>(g_windowsRasterGlyph),
+        referenceReady ? 1 : 0, g_referenceFontVtable,
+        reinterpret_cast<void*>(g_referenceFontDestructor),
+        reinterpret_cast<void*>(g_referenceSetStyle),
+        reinterpret_cast<void*>(g_referenceRasterGlyph));
+    return g_windowsRasterGlyph != NULL;
+}
+
+static size_t ReferenceFontSurrogateCount() {
+    std::lock_guard<std::mutex> lock(g_referenceFontMutex);
+    return g_referenceFontSurrogates.size();
+}
+
+#if defined(_M_IX86)
+static bool ShouldRedirectReferenceFont() {
+    return Config::EnableEntisHook && Config::EntisDisableBitmapFonts &&
+        Config::EntisRefreshFontOnSwitch && !Utils::IsShuttingDown();
+}
+
+static void* CreateWindowsFontSurrogate() {
+    if (!g_windowsFontVtable || !g_windowsFontDestructor ||
+        !g_windowsSetStyle || !g_windowsRasterGlyph) {
+        return NULL;
+    }
+
+    BYTE* object = reinterpret_cast<BYTE*>(HeapAlloc(GetProcessHeap(),
+        HEAP_ZERO_MEMORY, kWindowsFontObjectSize));
+    if (!object) return NULL;
+
+    *reinterpret_cast<void***>(object) = g_windowsFontVtable;
+    *reinterpret_cast<HDC*>(object + 8) = CreateCompatibleDC(NULL);
+    *reinterpret_cast<WORD*>(object + 0x58) = 1;
+    if (!*reinterpret_cast<HDC*>(object + 8)) {
+        HeapFree(GetProcessHeap(), 0, object);
+        return NULL;
+    }
+    return object;
+}
+
+static void DestroyWindowsFontSurrogate(void* surrogate) {
+    if (!surrogate) return;
+    if (g_windowsFontDestructor)
+        g_windowsFontDestructor(surrogate, 0);
+    HeapFree(GetProcessHeap(), 0, surrogate);
+}
+
+static void* FindReferenceFontSurrogate(void* referenceFont) {
+    if (!referenceFont) return NULL;
+    std::lock_guard<std::mutex> lock(g_referenceFontMutex);
+    std::unordered_map<void*, void*>::iterator found =
+        g_referenceFontSurrogates.find(referenceFont);
+    return found == g_referenceFontSurrogates.end() ? NULL : found->second;
+}
+
+static void* EnsureReferenceFontSurrogate(void* referenceFont) {
+    if (!referenceFont) return NULL;
+    std::lock_guard<std::mutex> lock(g_referenceFontMutex);
+    std::unordered_map<void*, void*>::iterator found =
+        g_referenceFontSurrogates.find(referenceFont);
+    if (found != g_referenceFontSurrogates.end()) return found->second;
+
+    void* surrogate = CreateWindowsFontSurrogate();
+    if (!surrogate) return NULL;
+    g_referenceFontSurrogates[referenceFont] = surrogate;
+    return surrogate;
+}
+
+static void DestroyReferenceFontSurrogate(void* referenceFont,
+    void* expectedSurrogate) {
+    void* surrogate = NULL;
+    {
+        std::lock_guard<std::mutex> lock(g_referenceFontMutex);
+        std::unordered_map<void*, void*>::iterator found =
+            g_referenceFontSurrogates.find(referenceFont);
+        if (found != g_referenceFontSurrogates.end() &&
+            (!expectedSurrogate || found->second == expectedSurrogate)) {
+            surrogate = found->second;
+            g_referenceFontSurrogates.erase(found);
+        }
+    }
+    DestroyWindowsFontSurrogate(surrogate);
+}
+
+static int RasterWithWindowsFont(void* instance,
+    ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, ULONG_PTR arg4,
+    const char* source) {
+    if (!g_windowsRasterGlyph) return 0;
+
+    HFONT oldFont = NULL;
+    HFONT replacementFont = NULL;
+    LONG requestedVersion = InterlockedCompareExchange(
+        &g_requestedVersion, 0, 0);
+    HDC hdc = NULL;
+
+    if (Config::EnableEntisHook && Config::EntisRefreshFontOnSwitch &&
+        IsReadableMemory(instance, 0x10)) {
+        hdc = *reinterpret_cast<HDC*>(
+            reinterpret_cast<BYTE*>(instance) + 8);
+        if (hdc) replacementFont = ReplaceHdcFont(hdc, &oldFont);
+    }
+
+    int result = g_windowsRasterGlyph(instance, arg1, arg2, arg3, arg4);
+
+    if (replacementFont && hdc)
+        RestoreHdcFont(hdc, oldFont, replacementFont);
+
+    if (InterlockedExchange(&g_observedRasterVersion, requestedVersion) !=
+        requestedVersion) {
+        TraceLimited("%s render observed font version=%ld replacement=%p",
+            source ? source : "windows", requestedVersion, replacementFont);
+    }
+    return result;
+}
+
+static int __fastcall HookWindowsRasterGlyph(void* instance, void*,
+    ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, ULONG_PTR arg4) {
+    return RasterWithWindowsFont(instance, arg1, arg2, arg3, arg4,
+        "windows-font");
+}
+
+static void* __fastcall HookReferenceFontDestructor(void* instance, void*,
+    unsigned int flags) {
+    DestroyReferenceFontSurrogate(instance, NULL);
+    return g_referenceFontDestructor(instance, flags);
+}
+
+static int __fastcall HookReferenceSetStyle(void* instance, void*,
+    const void* style) {
+    int referenceResult = g_referenceSetStyle(instance, style);
+    if (!ShouldRedirectReferenceFont()) return referenceResult;
+
+    void* surrogate = EnsureReferenceFontSurrogate(instance);
+    if (!surrogate) {
+        TraceLimited("reference SetStyle could not allocate surrogate instance=%p result=%d",
+            instance, referenceResult);
+        return referenceResult;
+    }
+
+    int windowsResult = g_windowsSetStyle(surrogate, style);
+    if (windowsResult != 0) {
+        TraceLimited("reference SetStyle surrogate failed instance=%p reference-result=%d windows-result=%d",
+            instance, referenceResult, windowsResult);
+        DestroyReferenceFontSurrogate(instance, surrogate);
+        return referenceResult;
+    }
+
+    TraceLimited("reference SetStyle redirected instance=%p surrogate=%p reference-result=%d",
+        instance, surrogate, referenceResult);
+    return 0;
+}
+
+static int __fastcall HookReferenceRasterGlyph(void* instance, void*,
+    ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3, ULONG_PTR arg4) {
+    if (!ShouldRedirectReferenceFont())
+        return g_referenceRasterGlyph(instance, arg1, arg2, arg3, arg4);
+
+    void* surrogate = FindReferenceFontSurrogate(instance);
+    if (!surrogate)
+        return g_referenceRasterGlyph(instance, arg1, arg2, arg3, arg4);
+
+    LONG traceHit = InterlockedIncrement(&g_referenceRedirectTraceCount);
+    if (Config::EnableDebugLog && traceHit <= 64) {
+        TraceLimited("reference glyph redirected instance=%p surrogate=%p cp=0x%04X",
+            instance, surrogate,
+            static_cast<unsigned int>(arg4 & 0xFFFFu));
+    }
+    return RasterWithWindowsFont(surrogate, arg1, arg2, arg3, arg4,
+        "reference-font");
+}
+#endif
+
+static void Prepare() {
+    if (InterlockedExchange(&g_runtimePrepared, 1) != 0) return;
+    if (!Config::EnableEntisHook || !LooksLikeEngine()) return;
+
+    bool bitmapDisabled = false;
+    if (Config::EntisDisableBitmapFonts)
+        bitmapDisabled = DisableBitmapFontRegistration();
+    bool runtimeResolved = false;
+    if (Config::EntisRefreshFontOnSwitch)
+        runtimeResolved = ResolveRuntimeTargets();
+    InterlockedExchange(&g_requestedVersion, Config::ConfigVersion);
+
+    TraceLimited("prepare bitmap-disabled=%d runtime-resolved=%d windows-raster=%p reference-raster=%p",
+        bitmapDisabled ? 1 : 0, runtimeResolved ? 1 : 0,
+        reinterpret_cast<void*>(g_windowsRasterGlyph),
+        reinterpret_cast<void*>(g_referenceRasterGlyph));
+}
+
+static void InstallInOpenDetourTransaction() {
+#if defined(_M_IX86)
+    if (!Config::EnableEntisHook || !Config::EntisRefreshFontOnSwitch ||
+        !g_windowsRasterGlyph) {
+        return;
+    }
+
+    LONG windowsRasterError = DetourAttach(
+        reinterpret_cast<PVOID*>(&g_windowsRasterGlyph),
+        HookWindowsRasterGlyph);
+    if (windowsRasterError == NO_ERROR)
+        InterlockedExchange(&g_rasterHookInstalled, 1);
+
+    LONG referenceDestructorError = ERROR_PROC_NOT_FOUND;
+    LONG referenceSetStyleError = ERROR_PROC_NOT_FOUND;
+    LONG referenceRasterError = ERROR_PROC_NOT_FOUND;
+    if (Config::EntisDisableBitmapFonts && g_windowsFontVtable &&
+        g_windowsFontDestructor && g_windowsSetStyle &&
+        g_referenceFontDestructor && g_referenceSetStyle &&
+        g_referenceRasterGlyph) {
+        referenceDestructorError = DetourAttach(
+            reinterpret_cast<PVOID*>(&g_referenceFontDestructor),
+            HookReferenceFontDestructor);
+        referenceSetStyleError = DetourAttach(
+            reinterpret_cast<PVOID*>(&g_referenceSetStyle),
+            HookReferenceSetStyle);
+        referenceRasterError = DetourAttach(
+            reinterpret_cast<PVOID*>(&g_referenceRasterGlyph),
+            HookReferenceRasterGlyph);
+        if (referenceRasterError == NO_ERROR)
+            InterlockedExchange(&g_rasterHookInstalled, 1);
+    }
+
+    TraceLimited("hook attach windows-raster=%ld reference-dtor=%ld reference-style=%ld reference-raster=%ld",
+        windowsRasterError, referenceDestructorError,
+        referenceSetStyleError, referenceRasterError);
+#endif
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (!Config::EnableEntisHook || !Config::EntisRefreshFontOnSwitch ||
+        Utils::IsShuttingDown() || !LooksLikeEngine()) {
+        return;
+    }
+
+    InterlockedExchange(&g_requestedVersion, version);
+    TraceLimited("font refresh queued version=%ld raster-hook=%d reference-surrogates=%lu",
+        version,
+        InterlockedCompareExchange(&g_rasterHookInstalled, 0, 0) != 0 ? 1 : 0,
+        static_cast<unsigned long>(ReferenceFontSurrogateCount()));
+}
+
+} // namespace EntisCompat

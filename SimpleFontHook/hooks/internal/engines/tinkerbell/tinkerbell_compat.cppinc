@@ -1,0 +1,45 @@
+namespace TinkerBellCompat {
+
+static volatile LONG g_engineProbe = -1;
+
+static bool LooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_engineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    static const char* const strongMarkers[] = {
+        "Software\\TinkerBell\\",
+        "Cyberworks \"TinkerBell\"",
+    };
+    static const char* const pairedMarkers[] = {
+        "Cyberworks",
+        "TinkerBell",
+    };
+    HMODULE mainModule = GetModuleHandleW(NULL);
+    bool hasStrongMarker = EngineCommon::ModuleContainsAnyAscii(mainModule,
+        strongMarkers, _countof(strongMarkers));
+    bool hasMarkerPair = EngineCommon::ModuleContainsAllAscii(mainModule,
+        pairedMarkers, _countof(pairedMarkers));
+    bool detected = EngineIdentityPolicy::Confirm({
+        hasStrongMarker || hasMarkerPair, false, false, false });
+    InterlockedExchange(&g_engineProbe, detected ? 1 : 0);
+
+    if (detected) {
+        Utils::Trace("[DEBUG][TinkerBell] identity marker=%d pair=%d wideFontCreation=off selectObjectTrackedOnly=on",
+            hasStrongMarker ? 1 : 0, hasMarkerPair ? 1 : 0);
+    }
+    return detected;
+}
+
+static bool IsCompatibilityActive() {
+    return Config::EnableTinkerBellHook && LooksLikeEngineRoot();
+}
+
+static bool ShouldSkipWideFontCreationHook() {
+    return IsCompatibilityActive();
+}
+
+static bool ShouldPassThroughUntrackedSelectObject() {
+    return IsCompatibilityActive();
+}
+
+} // namespace TinkerBellCompat

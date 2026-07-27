@@ -1,0 +1,126 @@
+static void CaptureRequest(LONG version) {
+    bool enabled = Config::EnableRenPyHook && Config::RenPyRedirectFonts &&
+        Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        Config::SourceFontNameW[0] != L'\0';
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_requestedVersion = version;
+    g_requestedEnabled = enabled;
+    g_requestedRefresh = Config::RenPyRefreshFontOnSwitch;
+    g_requestedFace = Config::SourceFontNameW;
+    g_readyVersion = LONG_MIN;
+    g_readyFontName.clear();
+    g_readyVirtualPath.clear();
+    g_readySourcePath.clear();
+}
+
+static bool PrepareRequestedState() {
+    LONG version = LONG_MIN;
+    bool enabled = false;
+    bool refresh = false;
+    std::wstring face;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        if (g_readyVersion == g_requestedVersion) return true;
+        version = g_requestedVersion;
+        enabled = g_requestedEnabled;
+        refresh = g_requestedRefresh;
+        face = g_requestedFace;
+    }
+    if (version == LONG_MIN) return false;
+
+    std::string fontName;
+    std::string virtualPath;
+    std::wstring sourcePath;
+    if (enabled && !PrepareFontSource(version, face, &fontName, &virtualPath,
+            &sourcePath)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if (g_requestedVersion != version || g_requestedEnabled != enabled ||
+        g_requestedFace != face) {
+        return false;
+    }
+    g_readyVersion = version;
+    g_readyEnabled = enabled;
+    g_readyRefresh = refresh;
+    g_readyFontName = fontName;
+    g_readyVirtualPath = virtualPath;
+    g_readySourcePath = sourcePath;
+    return true;
+}
+
+static unsigned __stdcall WorkerThread(void*) {
+    while (InterlockedCompareExchange(&g_stopRequested, 0, 0) == 0 &&
+        !Utils::IsShuttingDown()) {
+        LONG requested = LONG_MIN;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            requested = g_requestedVersion;
+        }
+
+        LONG applied = InterlockedCompareExchange(&g_appliedVersion, 0, 0);
+        if (requested != LONG_MIN && requested != applied &&
+            PrepareRequestedState()) {
+            QueuePendingApply();
+        }
+
+        if (g_wakeEvent) WaitForSingleObject(g_wakeEvent, 100);
+        else Sleep(100);
+    }
+    return 0;
+}
+
+static void Prepare() {
+    if (!Config::EnableRenPyHook || !LooksLikeEngineRoot() ||
+        InterlockedExchange(&g_prepared, 1) != 0) {
+        return;
+    }
+
+    g_wakeEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_wakeEvent) {
+        InterlockedExchange(&g_prepared, 0);
+        return;
+    }
+
+    CaptureRequest(Config::ConfigVersion);
+    uintptr_t thread = _beginthreadex(NULL, 0, WorkerThread, NULL, 0, NULL);
+    if (!thread) {
+        CloseHandle(g_wakeEvent);
+        g_wakeEvent = NULL;
+        InterlockedExchange(&g_prepared, 0);
+        return;
+    }
+    g_workerThread = reinterpret_cast<HANDLE>(thread);
+    TraceLimited("worker started version=%ld face='%s'",
+            Config::ConfigVersion, EngineCommon::WideToUtf8(Config::SourceFontNameW).c_str());
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (InterlockedCompareExchange(&g_prepared, 0, 0) == 0) {
+        Prepare();
+        if (InterlockedCompareExchange(&g_prepared, 0, 0) == 0) return;
+    }
+
+    CaptureRequest(version);
+    TraceLimited("config changed version=%ld enabled=%d face='%s'",
+        version,
+        Config::EnableRenPyHook && Config::RenPyRedirectFonts &&
+            Config::EnableFontHook && Config::EnableFaceNameReplace ? 1 : 0,
+            EngineCommon::WideToUtf8(Config::SourceFontNameW).c_str());
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
+}
+
+static void StopWorker(bool wait) {
+    if (InterlockedExchange(&g_stopRequested, 1) != 0) return;
+    if (g_wakeEvent) SetEvent(g_wakeEvent);
+    if (wait && g_workerThread) WaitForSingleObject(g_workerThread, 3000);
+    if (g_workerThread) {
+        CloseHandle(g_workerThread);
+        g_workerThread = NULL;
+    }
+    if (g_wakeEvent) {
+        CloseHandle(g_wakeEvent);
+        g_wakeEvent = NULL;
+    }
+}

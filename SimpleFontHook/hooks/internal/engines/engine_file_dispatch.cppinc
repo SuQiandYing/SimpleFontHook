@@ -1,0 +1,164 @@
+// Cross-engine file virtualization dispatch.
+//
+// Keep engine priority and result normalization here. The Win32 A/W hooks only
+// adapt their arguments and delegate, which avoids duplicating every engine
+// branch for both API variants.
+
+static __declspec(thread) bool g_inEngineFileHook = false;
+
+struct EngineFileHookGuard {
+    EngineFileHookGuard() { g_inEngineFileHook = true; }
+    ~EngineFileHookGuard() { g_inEngineFileHook = false; }
+};
+
+static bool EngineShouldHideFileW(const wchar_t* fileName, bool readOnly,
+    bool includeCacheSearches) {
+    if (TyranoShouldHideAsarW(fileName)) return true;
+
+    if (readOnly &&
+        (SoftpalShouldHideDefaultFontDatW(fileName) ||
+         KrkrShouldHidePrerenderedFontW(fileName) ||
+         ArtemisLegacyShouldHideRenderedFontW(fileName) ||
+         TyranoShouldHideCompressedWebFontW(fileName))) {
+        return true;
+    }
+
+    return includeCacheSearches &&
+        (DxLibShouldHideFontCacheSearchW(fileName) ||
+         MajiroShouldHideFontCacheSearchW(fileName));
+}
+
+static bool EngineTryOpenFileW(const wchar_t* fileName, DWORD desiredAccess,
+    DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile,
+    HANDLE* result) {
+    if (!result) return false;
+
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    if (DxLibTryOpenFontCacheW(fileName, desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes,
+        templateFile, &handle)) {
+        *result = handle;
+        return true;
+    }
+
+    if (MajiroTryOpenFontCacheW(fileName, desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes,
+        templateFile, &handle)) {
+        *result = handle;
+        return true;
+    }
+
+    handle = MiraiTryOpenRedirectedFontFileW(fileName, desiredAccess,
+        shareMode, creationDisposition, flagsAndAttributes);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
+    handle = TyranoTryOpenRedirectedFontFileW(fileName, desiredAccess,
+        creationDisposition);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
+    handle = TyranoTryOpenAsarOverlayFileW(fileName, desiredAccess,
+        creationDisposition);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
+    handle = ArtemisLegacyTryOpenVirtualFileW(fileName, desiredAccess,
+        shareMode, securityAttributes, creationDisposition,
+        flagsAndAttributes, templateFile);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
+    handle = ArtemisTryOpenVirtualFileW(fileName, desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes,
+        templateFile);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+    return false;
+}
+
+enum class EngineFileAttributeStatus {
+    Unhandled,
+    Found,
+    Missing,
+};
+
+static EngineFileAttributeStatus PublishEngineFileAttributes(bool detailed,
+    bool zeroAttributesMeansMissing, const WIN32_FILE_ATTRIBUTE_DATA& data,
+    DWORD attributes, WIN32_FILE_ATTRIBUTE_DATA* dataOut,
+    DWORD* attributesOut) {
+    if (detailed) {
+        if (zeroAttributesMeansMissing && data.dwFileAttributes == 0)
+            return EngineFileAttributeStatus::Missing;
+        if (dataOut) *dataOut = data;
+    } else if (attributesOut) {
+        *attributesOut = attributes;
+    }
+    return EngineFileAttributeStatus::Found;
+}
+
+static EngineFileAttributeStatus EngineQueryFileAttributesW(
+    const wchar_t* fileName, bool detailed,
+    WIN32_FILE_ATTRIBUTE_DATA* dataOut, DWORD* attributesOut) {
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    DWORD attributes = INVALID_FILE_ATTRIBUTES;
+    WIN32_FILE_ATTRIBUTE_DATA* dataProbe = detailed ? &data : NULL;
+    DWORD* attributesProbe = detailed ? NULL : &attributes;
+
+    if (DxLibTryGetFontCacheAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, true, data, attributes,
+            dataOut, attributesOut);
+    }
+    if (MajiroTryGetFontCacheAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, true, data, attributes,
+            dataOut, attributesOut);
+    }
+    if (MiraiTryGetRedirectedFontAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, false, data, attributes,
+            dataOut, attributesOut);
+    }
+    if (TyranoTryGetRedirectedFontAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, false, data, attributes,
+            dataOut, attributesOut);
+    }
+    if (TyranoTryGetAsarOverlayAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, false, data, attributes,
+            dataOut, attributesOut);
+    }
+    if (ArtemisLegacyTryGetVirtualAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, false, data, attributes,
+            dataOut, attributesOut);
+    }
+
+    if (ArtemisTryGetVirtualAttributesW(fileName, dataProbe, attributesProbe)) {
+        EngineFileAttributeStatus status = PublishEngineFileAttributes(
+            detailed, false, data, attributes, dataOut, attributesOut);
+        if (detailed) {
+            ArtemisTraceLimited("attrs-ex-virtual request='%s' size=%lu",
+                EngineCommon::WideToUtf8(fileName).c_str(), data.nFileSizeLow);
+        } else {
+            ArtemisTraceLimited("attrs-virtual request='%s' attrs=0x%08lX",
+                EngineCommon::WideToUtf8(fileName).c_str(), attributes);
+        }
+        return status;
+    }
+
+    return EngineFileAttributeStatus::Unhandled;
+}

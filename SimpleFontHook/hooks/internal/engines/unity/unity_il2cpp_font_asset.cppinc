@@ -1,0 +1,414 @@
+struct TmpSourceFontCandidate {
+    std::wstring face;
+    std::wstring sourcePath;
+};
+
+static std::vector<TmpSourceFontCandidate> TmpBuildSourceFontCandidates() {
+    std::vector<std::wstring> faces;
+    wchar_t ansiFace[LF_FACESIZE] = {};
+    if (Config::ForcedFontNameA[0]) {
+        MultiByteToWideChar(CP_ACP, 0, Config::ForcedFontNameA, -1,
+            ansiFace, _countof(ansiFace));
+    }
+    if (ansiFace[0]) faces.push_back(ansiFace);
+
+    std::wstring visibleFace = Config::ForcedFontNameW;
+    if (!visibleFace.empty()) {
+        bool duplicate = false;
+        for (const std::wstring& face : faces) {
+            if (_wcsicmp(face.c_str(), visibleFace.c_str()) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) faces.push_back(visibleFace);
+    }
+
+    std::vector<TmpSourceFontCandidate> resolved;
+    std::vector<TmpSourceFontCandidate> nameOnly;
+    resolved.reserve(faces.size());
+    nameOnly.reserve(faces.size());
+    for (const std::wstring& face : faces) {
+        TmpSourceFontCandidate candidate = {
+            face, EngineCommon::FindSystemFontFileByFace(face.c_str())
+        };
+        if (candidate.sourcePath.empty()) nameOnly.push_back(candidate);
+        else resolved.push_back(candidate);
+    }
+
+    // A TTC can expose an invariant family name to Unity while only its localized
+    // registry name resolves to the backing file. Try every file-backed alias first.
+    resolved.insert(resolved.end(), nameOnly.begin(), nameOnly.end());
+    return resolved;
+}
+
+static void* TryCreateDynamicFontAsset(LONG version) {
+    std::vector<TmpSourceFontCandidate> sourceCandidates =
+        TmpBuildSourceFontCandidates();
+
+    void* managedFace = NULL;
+    void* unityFont = NULL;
+    bool createdFromPath = false;
+    int samplingSize = 90;
+    for (const TmpSourceFontCandidate& source : sourceCandidates) {
+        const std::wstring& face = source.face;
+        const std::wstring& sourcePath = source.sourcePath;
+        unityFont = NULL;
+        createdFromPath = false;
+        managedFace = g_api.stringNewUtf16(face.c_str(), (int)face.size());
+        if (!managedFace) continue;
+        if (g_bindings.internalCreateFontFromPath && !sourcePath.empty()) {
+            void* managedPath = g_api.stringNewUtf16(sourcePath.c_str(),
+                (int)sourcePath.size());
+            unityFont = g_api.objectNew(g_bindings.fontClass);
+            if (managedPath && unityFont) {
+                g_bindings.internalCreateFontFromPath(unityFont, managedPath);
+                createdFromPath = true;
+            } else {
+                unityFont = NULL;
+            }
+        }
+        if (!unityFont && g_bindings.createDynamicFont) {
+            void* fontParameters[2] = { managedFace, &samplingSize };
+            if (!Invoke(g_bindings.createDynamicFont, NULL, fontParameters,
+                &unityFont, "Font.CreateDynamicFontFromOSFont")) {
+                unityFont = NULL;
+            }
+        } else if (!unityFont && g_bindings.internalCreateDynamicFont) {
+            Il2CppArrayLayout* fontNames = reinterpret_cast<Il2CppArrayLayout*>(
+                g_api.arrayNew(g_bindings.stringClass, 1));
+            if (!fontNames || fontNames->maxLength != 1) continue;
+            if (g_api.gcWbarrierSetField) {
+                g_api.gcWbarrierSetField(fontNames, &fontNames->vector[0], managedFace);
+            } else {
+                fontNames->vector[0] = managedFace;
+            }
+            unityFont = g_api.objectNew(g_bindings.fontClass);
+            if (!unityFont) continue;
+            g_bindings.internalCreateDynamicFont(unityFont, fontNames, samplingSize);
+        }
+        if (unityFont) {
+            bool isDynamic = createdFromPath || (g_bindings.getFontDynamic
+                ? g_bindings.getFontDynamic(unityFont)
+                : g_bindings.createDynamicFont != NULL);
+            Utils::Trace("[DEBUG][CatSystemUnity] Unity font created requested='%s' resolved='%s' object=%p source=%s dynamic=%d path='%s'",
+                EngineCommon::WideToUtf8(Config::ForcedFontNameW).c_str(),
+                EngineCommon::WideToUtf8(face).c_str(), unityFont,
+                createdFromPath ? "path" : "dynamic", isDynamic ? 1 : 0,
+                EngineCommon::WideToUtf8(sourcePath).c_str());
+            if (!isDynamic) unityFont = NULL;
+        }
+        if (!unityFont) createdFromPath = false;
+        else break;
+    }
+    if (!unityFont) {
+        TraceFontCreateFailure(version, "dynamic-font-invoke");
+        return NULL;
+    }
+    if (!RootManagedObject(unityFont, &g_sourceUnityFont, &g_sourceUnityFontHandle,
+        "dynamic UnityEngine.Font")) {
+        TraceFontCreateFailure(version, "root-unity-font");
+        return NULL;
+    }
+    unityFont = RootedTarget(g_sourceUnityFontHandle, g_sourceUnityFont);
+    if (!unityFont) {
+        TraceFontCreateFailure(version, "rooted-unity-font-null");
+        return NULL;
+    }
+    if (!unityFont || (!g_bindings.createTmpFontAsset &&
+        !g_bindings.createTmpFontAssetDetailed)) {
+        TraceFontCreateFailure(version, "unity-font-null");
+        return NULL;
+    }
+
+    void* fontAsset = NULL;
+    bool traceFactoryAttempts =
+        InterlockedExchange(&g_lastFactoryTraceVersion, version) != version;
+    if (g_bindings.createTmpFontAssetDetailed) {
+        // Unity's player uses the full runtime factory overload. The shorter
+        // overload is retained as a fallback for older TMP builds.
+        struct FactoryProfile {
+            int renderMode;
+            int atlasPopulationMode;
+        };
+        static const FactoryProfile profiles[] = {
+            { 4165, 1 }, // SDFAA, Dynamic
+            { 4134, 1 }, // SDF, Dynamic
+            { 4165, 0 }, // SDFAA, Static
+            { 4134, 0 }, // SDF, Static
+            { 4117, 1 }, // SMOOTH, Dynamic
+        };
+        for (const FactoryProfile& profile : profiles) {
+            int samplingPointSize = 90;
+            int atlasPadding = 9;
+            int renderMode = profile.renderMode;
+            int atlasWidth = 1024;
+            int atlasHeight = 1024;
+            int atlasPopulationMode = profile.atlasPopulationMode;
+            bool enableMultiAtlas = true;
+            void* detailedParameters[8] = {
+                unityFont, &samplingPointSize, &atlasPadding, &renderMode,
+                &atlasWidth, &atlasHeight, &atlasPopulationMode,
+                &enableMultiAtlas
+            };
+            Invoke(g_bindings.createTmpFontAssetDetailed, NULL,
+                detailedParameters, &fontAsset,
+                "TMP_FontAsset.CreateFontAsset(Font,int,int,GlyphRenderMode,int,int,AtlasPopulationMode,bool)");
+            if (fontAsset) break;
+            if (traceFactoryAttempts) {
+                Utils::Trace("[DEBUG][CatSystemUnity] TMP factory returned null renderMode=%d populationMode=%d",
+                    profile.renderMode, profile.atlasPopulationMode);
+            }
+        }
+    }
+    if (!fontAsset && g_bindings.createTmpFontAsset) {
+        void* assetParameters[1] = { unityFont };
+        if (!Invoke(g_bindings.createTmpFontAsset, NULL, assetParameters,
+            &fontAsset, "TMP_FontAsset.CreateFontAsset(Font)")) {
+            fontAsset = NULL;
+        }
+    }
+    if (!fontAsset) {
+        TraceFontCreateFailure(version, "tmp-font-asset");
+        return NULL;
+    }
+
+    bool enableMultiAtlas = true;
+    void* multiAtlasParameters[1] = { &enableMultiAtlas };
+    if (!Invoke(g_bindings.setMultiAtlasEnabled, fontAsset, multiAtlasParameters,
+        NULL, "TMP_FontAsset.set_isMultiAtlasTexturesEnabled")) {
+        TraceFontCreateFailure(version, "multi-atlas");
+        return NULL;
+    }
+
+    return fontAsset;
+}
+
+static bool MaterialIsUsable(void* material, void* atlasTexture) {
+    if (!material) return false;
+    void* mainTexture = NULL;
+    Invoke(g_bindings.getMaterialMainTexture, material, NULL, &mainTexture,
+        "Material.get_mainTexture");
+    if (!mainTexture && atlasTexture) {
+        void* textureParameters[1] = { atlasTexture };
+        Invoke(g_bindings.setMaterialMainTexture, material, textureParameters,
+            NULL, "Material.set_mainTexture");
+        Invoke(g_bindings.getMaterialMainTexture, material, NULL, &mainTexture,
+            "Material.get_mainTexture");
+    }
+    void* shader = NULL;
+    Invoke(g_bindings.getMaterialShader, material, NULL, &shader, "Material.get_shader");
+    return mainTexture && shader;
+}
+
+static bool GetFontAssetMaterial(void* fontAsset, void** material) {
+    if (material) *material = NULL;
+    if (!fontAsset || !material) return false;
+    if (g_bindings.getAssetMaterial) {
+        return Invoke(g_bindings.getAssetMaterial, fontAsset, NULL, material,
+            "TMP_Asset.get_material");
+    }
+    if (!g_bindings.assetMaterialField) return false;
+    g_api.fieldGetValue(fontAsset, g_bindings.assetMaterialField, material);
+    return true;
+}
+
+static void* GetIl2CppMethodPointer(const void* method) {
+    if (!method) return NULL;
+    const Il2CppMethodInfoHead* head =
+        reinterpret_cast<const Il2CppMethodInfoHead*>(method);
+    void* pointer = head->methodPointer;
+    if (!pointer) return NULL;
+
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (VirtualQuery(pointer, &memory, sizeof(memory)) != sizeof(memory)) return NULL;
+    DWORD protection = memory.Protect & 0xFF;
+    bool executable = protection == PAGE_EXECUTE ||
+        protection == PAGE_EXECUTE_READ ||
+        protection == PAGE_EXECUTE_READWRITE ||
+        protection == PAGE_EXECUTE_WRITECOPY;
+    return executable ? pointer : NULL;
+}
+
+static void __cdecl NewTmpSetFont(void* text, void* requestedFont,
+    const void* methodInfo) {
+    void* replacement = RootedTarget(
+        g_replacementFontAssetHandle, g_replacementFontAsset);
+    if (IsReplacementEnabled() && replacement) requestedFont = replacement;
+    if (g_originalTmpSetFont) g_originalTmpSetFont(text, requestedFont, methodInfo);
+}
+
+static void __cdecl NewTmpSetSharedMaterial(void* text, void* requestedMaterial,
+    const void* methodInfo) {
+    void* replacement = RootedTarget(
+        g_replacementMaterialHandle, g_replacementMaterial);
+    if (IsReplacementEnabled() && replacement) requestedMaterial = replacement;
+    if (g_originalTmpSetSharedMaterial) {
+        g_originalTmpSetSharedMaterial(text, requestedMaterial, methodInfo);
+    }
+}
+
+static bool InstallSynchronousTextSetterHooks() {
+    LONG state = InterlockedCompareExchange(&g_tmpSetterHooksState, 0, 0);
+    if (state == 1) return true;
+    if (state == 2 || !g_bindings.setTextFont || !g_bindings.setTextSharedMaterial)
+        return false;
+    if (InterlockedCompareExchange(&g_tmpSetterHooksState, -1, 0) != 0)
+        return false;
+
+    void* setFontPointer = GetIl2CppMethodPointer(g_bindings.setTextFont);
+    void* setMaterialPointer = GetIl2CppMethodPointer(
+        g_bindings.setTextSharedMaterial);
+    if (!setFontPointer || !setMaterialPointer) {
+        Utils::Trace("[DEBUG][CatSystemUnity] synchronous TMP setter hook deferred methodPointer font=%p material=%p",
+            setFontPointer, setMaterialPointer);
+        InterlockedExchange(&g_tmpSetterHooksState, 0);
+        return false;
+    }
+
+    g_originalTmpSetFont = reinterpret_cast<pTmpTextObjectSetter>(setFontPointer);
+    g_originalTmpSetSharedMaterial =
+        reinterpret_cast<pTmpTextObjectSetter>(setMaterialPointer);
+    LONG begin = DetourTransactionBegin();
+    if (begin == NO_ERROR) DetourUpdateThread(GetCurrentThread());
+    LONG fontAttach = begin == NO_ERROR
+        ? DetourAttach(&(PVOID&)g_originalTmpSetFont, NewTmpSetFont)
+        : begin;
+    LONG materialAttach = fontAttach == NO_ERROR
+        ? DetourAttach(&(PVOID&)g_originalTmpSetSharedMaterial,
+            NewTmpSetSharedMaterial)
+        : fontAttach;
+    LONG commit = begin != NO_ERROR
+        ? begin
+        : ((fontAttach == NO_ERROR && materialAttach == NO_ERROR)
+            ? DetourTransactionCommit()
+            : DetourTransactionAbort());
+    if (fontAttach != NO_ERROR || materialAttach != NO_ERROR || commit != NO_ERROR) {
+        Utils::Trace("[DEBUG][CatSystemUnity] synchronous TMP setter hook failed font=%ld material=%ld commit=%ld pointers=%p/%p",
+            fontAttach, materialAttach, commit, setFontPointer, setMaterialPointer);
+        g_originalTmpSetFont = NULL;
+        g_originalTmpSetSharedMaterial = NULL;
+        InterlockedExchange(&g_tmpSetterHooksState, 2);
+        return false;
+    }
+
+    InterlockedExchange(&g_tmpSetterHooksState, 1);
+    Utils::Trace("[DEBUG][CatSystemUnity] synchronous TMP setter hooks attached font=%p material=%p",
+        setFontPointer, setMaterialPointer);
+    return true;
+}
+
+static bool SetFontAssetMaterial(void* fontAsset, void* material) {
+    if (!fontAsset || !material) return false;
+    if (g_bindings.setAssetMaterial) {
+        void* parameters[1] = { material };
+        return Invoke(g_bindings.setAssetMaterial, fontAsset, parameters,
+            NULL, "TMP_Asset.set_material");
+    }
+    if (!g_bindings.assetMaterialField) return false;
+    g_api.fieldSetValue(fontAsset, g_bindings.assetMaterialField, &material);
+    return true;
+}
+
+static bool EnsureFontAssetMaterial(void* fontAsset) {
+    if (!fontAsset) return false;
+    void* atlasTexture = NULL;
+    if (!Invoke(g_bindings.getAtlasTexture, fontAsset, NULL, &atlasTexture,
+        "TMP_FontAsset.get_atlasTexture") || !atlasTexture) {
+        return false;
+    }
+
+    void* material = NULL;
+    GetFontAssetMaterial(fontAsset, &material);
+    if (MaterialIsUsable(material, atlasTexture)) return true;
+
+    void* tmpFontAssetTypeObject = RootedTarget(
+        g_bindings.tmpFontAssetTypeHandle, g_bindings.tmpFontAssetTypeObject);
+    if (!tmpFontAssetTypeObject) return false;
+    g_bindings.tmpFontAssetTypeObject = tmpFontAssetTypeObject;
+    void* findParameters[1] = { tmpFontAssetTypeObject };
+    void* result = NULL;
+    if (!Invoke(g_bindings.findAllObjects, NULL, findParameters, &result,
+        "Resources.FindObjectsOfTypeAll<TMP_FontAsset>") || !result) {
+        return false;
+    }
+
+    Il2CppArrayLayout* fonts = NULL;
+    size_t fontCount = 0;
+    if (!GetManagedObjectArray(result, &fonts, &fontCount, "TMP_FontAsset[]"))
+        return false;
+    void* templateMaterial = NULL;
+    for (size_t i = 0; i < fontCount; ++i) {
+        void* candidate = fonts->vector[i];
+        if (!candidate || candidate == fontAsset) continue;
+        void* candidateMaterial = NULL;
+        if (GetFontAssetMaterial(candidate, &candidateMaterial) &&
+            MaterialIsUsable(candidateMaterial, NULL)) {
+            templateMaterial = candidateMaterial;
+            break;
+        }
+    }
+    if (!templateMaterial) return false;
+
+    void* clonedMaterial = g_api.objectNew(g_bindings.materialClass);
+    if (!clonedMaterial) return false;
+    void* constructorParameters[1] = { templateMaterial };
+    if (!Invoke(g_bindings.materialCopyConstructor, clonedMaterial,
+        constructorParameters, NULL, "Material..ctor(Material)")) {
+        return false;
+    }
+    void* textureParameters[1] = { atlasTexture };
+    if (!Invoke(g_bindings.setMaterialMainTexture, clonedMaterial,
+        textureParameters, NULL, "Material.set_mainTexture")) {
+        return false;
+    }
+    if (!SetFontAssetMaterial(fontAsset, clonedMaterial)) {
+        return false;
+    }
+    bool repaired = MaterialIsUsable(clonedMaterial, atlasTexture);
+    if (repaired) {
+        Utils::Trace("[DEBUG][CatSystemUnity] dynamic TMP material repaired template=%p clone=%p atlas=%p",
+            templateMaterial, clonedMaterial, atlasTexture);
+    }
+    return repaired;
+}
+
+static bool CreateReplacementFontAsset(LONG version) {
+    g_replacementFontAsset = RootedTarget(
+        g_replacementFontAssetHandle, g_replacementFontAsset);
+    if (g_replacementFontAsset && g_replacementVersion == version &&
+        _wcsicmp(g_replacementFace, Config::ForcedFontNameW) == 0) {
+        return true;
+    }
+
+    DWORD now = GetTickCount();
+    if (g_lastFontAttemptVersion == version &&
+        static_cast<DWORD>(now - g_lastFontAttemptTick) < 1000) {
+        return false;
+    }
+    g_lastFontAttemptVersion = version;
+    g_lastFontAttemptTick = now;
+
+    void* fontAsset = TryCreateDynamicFontAsset(version);
+    if (!fontAsset) return false;
+    if (!RootManagedObject(fontAsset, &g_replacementFontAsset,
+        &g_replacementFontAssetHandle, "replacement TMP_FontAsset")) {
+        return TraceFontCreateFailure(version, "root-replacement-font");
+    }
+    if (!EnsureFontAssetMaterial(fontAsset)) {
+        return TraceFontCreateFailure(version, "dynamic-font-material");
+    }
+    g_replacementVersion = version;
+    wcsncpy_s(g_replacementFace, Config::ForcedFontNameW, _TRUNCATE);
+
+    void* globalFallbacks = NULL;
+    if (Invoke(g_bindings.getGlobalFallbacks, NULL, NULL, &globalFallbacks,
+        "TMP_Settings.get_fallbackFontAssets") && globalFallbacks) {
+        AddUniqueFallback(globalFallbacks, fontAsset);
+    }
+
+    Utils::Trace("[DEBUG][CatSystemUnity] TMP font ready version=%ld requestedFace='%s' mode=dynamic source=%p asset=%p",
+        version, EngineCommon::WideToUtf8(g_replacementFace).c_str(),
+        g_sourceUnityFont, g_replacementFontAsset);
+    return true;
+}

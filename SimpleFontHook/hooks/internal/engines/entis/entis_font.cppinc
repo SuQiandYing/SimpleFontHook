@@ -1,0 +1,8 @@
+// EntisGLS font compatibility.
+//
+// Keep the engine-specific implementation split so the registration patch and
+// runtime cache handling can evolve independently.
+
+#include "entis_state.cppinc"
+#include "entis_bitmap_font.cppinc"
+#include "entis_runtime.cppinc"

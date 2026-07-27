@@ -1,0 +1,177 @@
+namespace EntisCompat {
+
+struct ImageView {
+    HMODULE module;
+    BYTE* base;
+    size_t size;
+    IMAGE_NT_HEADERS* nt;
+};
+
+static volatile LONG g_probeResult = -1;
+static volatile LONG g_traceCount = 0;
+
+static const char kBitmapLoaderClassName[] =
+    "SakuraGL::SGLBitmapFontLoader";
+static const char kBitmapLoaderRuntimeClassExport[] =
+    "?m_RuntimeClass@SGLBitmapFontLoader@SakuraGL@@2UESLRuntimeClass@@B";
+static const char kFontStockExport[] =
+    "?m_pFontStock@SGLFont@SakuraGL@@1PAV?$SStrSortObjectArray@VSGLFontObject@SakuraGL@@@SSystem@@A";
+
+static void TraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_traceCount);
+    if (hit > 256) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][Entis] %s", message);
+}
+
+static bool QueryMainImage(ImageView* view) {
+    if (!view) return false;
+    ZeroMemory(view, sizeof(*view));
+
+    HMODULE module = GetModuleHandleW(NULL);
+    if (!module) return false;
+
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
+
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage == 0)
+        return false;
+
+    view->module = module;
+    view->base = base;
+    view->size = nt->OptionalHeader.SizeOfImage;
+    view->nt = nt;
+    return true;
+}
+
+static bool GetSectionRange(const ImageView& view, WORD index,
+    BYTE** sectionBegin, BYTE** sectionEnd) {
+    if (!view.nt || index >= view.nt->FileHeader.NumberOfSections ||
+        !sectionBegin || !sectionEnd) {
+        return false;
+    }
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    const IMAGE_SECTION_HEADER& section = sections[index];
+    size_t virtualSize = section.Misc.VirtualSize;
+    if (virtualSize == 0) virtualSize = section.SizeOfRawData;
+    if (section.VirtualAddress >= view.size || virtualSize == 0) return false;
+    if (virtualSize > view.size - section.VirtualAddress)
+        virtualSize = view.size - section.VirtualAddress;
+
+    *sectionBegin = view.base + section.VirtualAddress;
+    *sectionEnd = *sectionBegin + virtualSize;
+    return true;
+}
+
+static bool BytesEqual(const BYTE* left, const BYTE* right, size_t length) {
+    if (!left || !right) return false;
+    for (size_t i = 0; i < length; ++i) {
+        if (left[i] != right[i]) return false;
+    }
+    return true;
+}
+
+static BYTE* FindBytes(const BYTE* begin, const BYTE* end,
+    const BYTE* needle, size_t needleLength) {
+    if (!begin || !end || begin >= end || !needle || needleLength == 0 ||
+        static_cast<size_t>(end - begin) < needleLength) {
+        return NULL;
+    }
+
+    const BYTE* last = end - needleLength;
+    for (const BYTE* current = begin; current <= last; ++current) {
+        if (BytesEqual(current, needle, needleLength))
+            return const_cast<BYTE*>(current);
+    }
+    return NULL;
+}
+
+static BYTE* FindBytesInImage(const ImageView& view, const BYTE* needle,
+    size_t needleLength, bool executableOnly) {
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if (executableOnly &&
+            (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+            continue;
+        }
+
+        BYTE* begin = NULL;
+        BYTE* end = NULL;
+        if (!GetSectionRange(view, i, &begin, &end)) continue;
+        BYTE* match = FindBytes(begin, end, needle, needleLength);
+        if (match) return match;
+    }
+    return NULL;
+}
+
+static bool AddressIsExecutable(const ImageView& view, const void* address) {
+    const BYTE* target = reinterpret_cast<const BYTE*>(address);
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(view.nt);
+    for (WORD i = 0; i < view.nt->FileHeader.NumberOfSections; ++i) {
+        if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        BYTE* begin = NULL;
+        BYTE* end = NULL;
+        if (GetSectionRange(view, i, &begin, &end) &&
+            target >= begin && target < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsReadableMemory(const void* address, size_t length) {
+    if (!address || length == 0) return false;
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+    uintptr_t regionBegin = reinterpret_cast<uintptr_t>(memory.BaseAddress);
+    uintptr_t regionEnd = regionBegin + memory.RegionSize;
+    return begin >= regionBegin && begin <= regionEnd &&
+        length <= regionEnd - begin;
+}
+
+static bool LooksLikeEngine() {
+    LONG cached = InterlockedCompareExchange(&g_probeResult, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    ImageView view = {};
+    bool detected = false;
+    bool hasRuntimeClassExport = false;
+    bool hasFontStockExport = false;
+    bool hasLoaderClassName = false;
+    if (QueryMainImage(&view)) {
+        hasFontStockExport = GetProcAddress(view.module, kFontStockExport) != NULL;
+        if (hasFontStockExport) {
+            hasRuntimeClassExport =
+                GetProcAddress(view.module, kBitmapLoaderRuntimeClassExport) != NULL;
+            hasLoaderClassName = !hasRuntimeClassExport && FindBytesInImage(view,
+                reinterpret_cast<const BYTE*>(kBitmapLoaderClassName),
+                sizeof(kBitmapLoaderClassName) - 1, false) != NULL;
+            bool runtimeContract = hasRuntimeClassExport || hasLoaderClassName;
+            detected = EngineIdentityPolicy::Confirm({
+                false, runtimeContract, false, false });
+        }
+    }
+
+    InterlockedExchange(&g_probeResult, detected ? 1 : 0);
+    TraceLimited("engine-probe result=%d runtime-class=%d font-stock=%d loader-name=%d",
+        detected ? 1 : 0, hasRuntimeClassExport ? 1 : 0,
+        hasFontStockExport ? 1 : 0, hasLoaderClassName ? 1 : 0);
+    return detected;
+}
+
+} // namespace EntisCompat

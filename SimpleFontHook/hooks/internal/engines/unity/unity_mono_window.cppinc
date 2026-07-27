@@ -1,0 +1,394 @@
+static void MonoRevealUnityWindow();
+
+static bool MonoApplyFontOnUnityThread() {
+    if (Utils::IsShuttingDown() || !MonoIsReplacementEnabled()) return false;
+    if (!MonoManagedRuntimeReady()) return false;
+    LONG attempts = InterlockedIncrement(&g_monoApplyAttempts);
+    LONG version = Config::ConfigVersion;
+    DWORD now = GetTickCount();
+    LONG failedVersion = InterlockedCompareExchange(
+        &g_monoLastFailureVersion, LONG_MIN, LONG_MIN);
+    DWORD failedTick = static_cast<DWORD>(InterlockedCompareExchange(
+        &g_monoLastFailureTick, 0, 0));
+    if (failedVersion == version && failedTick &&
+        static_cast<DWORD>(now - failedTick) < 1000) return false;
+    bool glyphSetChanged = false;
+    bool runtimeReady = !Utils::IsShuttingDown() && MonoResolveBindings();
+    MonoGlyphMutationGuard mutation;
+    if (runtimeReady && !mutation.acquired) return false;
+    if (!runtimeReady ||
+        !MonoCreateReplacementFontAsset(version, &glyphSetChanged)) {
+        if (InterlockedExchange(&g_monoLastFailureVersion, version) != version) {
+            Utils::Trace("[DEBUG][UnityMono] apply deferred version=%ld face='%s' runtime/font not ready",
+                version, MonoWideToUtf8(Config::ForcedFontNameW).c_str());
+        }
+        InterlockedExchange(&g_monoLastFailureTick, static_cast<LONG>(now));
+        if (attempts >= 100 && !InterlockedCompareExchange(&g_monoFontReady, 0, 0))
+            MonoRevealUnityWindow();
+        return false;
+    }
+    if (Utils::IsShuttingDown()) return false;
+    void* fontAsset = g_monoApi.gcHandleGetTarget(g_monoReplacementFontAssetHandle);
+    void* material = g_monoApi.gcHandleGetTarget(g_monoReplacementMaterialHandle);
+    void* sourceFont = g_monoApi.gcHandleGetTarget(g_monoSourceFontHandle);
+    if (!fontAsset || !material || !sourceFont) {
+        InterlockedExchange(&g_monoLastFailureVersion, version);
+        InterlockedExchange(&g_monoLastFailureTick, static_cast<LONG>(now));
+        return false;
+    }
+    InterlockedExchange(&g_monoLastFailureVersion, LONG_MIN);
+    InterlockedExchange(&g_monoLastFailureTick, 0);
+    size_t tmpObjects = 0;
+    size_t tmpChanged = 0;
+    size_t tmpPreservedMaterials = 0;
+    size_t tmpFallbackMaterials = 0;
+    size_t uiObjects = 0;
+    size_t uiChanged = 0;
+    if (Utils::IsShuttingDown()) return false;
+    bool tmpApplied = MonoApplyTmpObjects(fontAsset, material,
+        glyphSetChanged, &tmpObjects, &tmpChanged,
+        &tmpPreservedMaterials, &tmpFallbackMaterials);
+    // Do not touch UI.Text after a failed TMP enumeration/apply.  A partial
+    // managed state is exactly the condition that tends to surface during
+    // Unity's shutdown sequence.
+    bool uiApplied = tmpApplied && MonoApplyUiTextObjects(sourceFont,
+        &uiObjects, &uiChanged);
+    if (!tmpApplied || !uiApplied) {
+        if (InterlockedExchange(&g_monoLastFailureVersion, version) != version) {
+            Utils::Trace("[DEBUG][UnityMono] object enumeration/apply deferred version=%ld tmp=%d ui=%d",
+                version, tmpApplied ? 1 : 0, uiApplied ? 1 : 0);
+        }
+        InterlockedExchange(&g_monoLastFailureTick, static_cast<LONG>(now));
+        return false;
+    }
+    LONG previousVersion = InterlockedExchange(&g_monoLastAppliedTraceVersion, version);
+    if (tmpChanged || uiChanged || glyphSetChanged || previousVersion != version) {
+        Utils::Trace("[DEBUG][UnityMono] replacement applied version=%ld face='%s' tmp=%llu/%llu ui=%llu/%llu mode=%s glyphRefresh=%d materialPreserved=%llu materialFallback=%llu",
+            version, MonoWideToUtf8(g_monoReplacementFace).c_str(),
+            (unsigned long long)tmpChanged, (unsigned long long)tmpObjects,
+            (unsigned long long)uiChanged, (unsigned long long)uiObjects,
+            g_monoBindings.legacyTmp ? "legacy-bitmap" : "dynamic",
+            glyphSetChanged ? 1 : 0,
+            (unsigned long long)tmpPreservedMaterials,
+            (unsigned long long)tmpFallbackMaterials);
+    }
+    if (!InterlockedCompareExchange(&g_monoFontReady, 0, 0) &&
+        (tmpChanged || uiChanged || attempts >= 100)) MonoRevealUnityWindow();
+    return true;
+}
+
+static void MonoTryApplyFromUnityThread(HWND window) {
+    if (!MonoIsReplacementEnabled()) return;
+    if (!MonoManagedRuntimeReady()) return;
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD mainThread = (DWORD)InterlockedCompareExchange(&g_monoMainThreadId, 0, 0);
+    if (window && mainThread != currentThread) {
+        InterlockedExchange(&g_monoMainThreadId, (LONG)currentThread);
+        mainThread = currentThread;
+    }
+    if (mainThread && currentThread != mainThread) return;
+    if (window) {
+        InterlockedExchangePointer(&g_monoApplyWindow, window);
+        InterlockedExchange(&g_monoApplyWindowThreadId, (LONG)currentThread);
+    }
+    DWORD now = GetTickCount();
+    DWORD previous = (DWORD)InterlockedCompareExchange(&g_monoLastInlineApplyTick, 0, 0);
+    if (previous && static_cast<DWORD>(now - previous) < 100) return;
+    InterlockedExchange(&g_monoLastInlineApplyTick, (LONG)now);
+    if (InterlockedCompareExchange(&g_monoApplyActive, 1, 0) == 0) {
+        MonoApplyFontOnUnityThread();
+        InterlockedExchange(&g_monoApplyActive, 0);
+    }
+}
+
+static bool MonoIsUnityWindow(HWND window) {
+    if (!window) return false;
+    wchar_t className[128] = {};
+    if (!GetClassNameW(window, className, _countof(className))) return false;
+    return _wcsicmp(className, L"UnityWndClass") == 0 ||
+        wcsstr(className, L"Unity") != NULL;
+}
+
+static bool MonoIsTargetUnityWindow(HWND window) {
+    if (!MonoIsUnityWindow(window)) return false;
+    DWORD processId = 0;
+    return GetWindowThreadProcessId(window, &processId) != 0 &&
+        processId == GetCurrentProcessId();
+}
+
+static LRESULT CALLBACK MonoUnityWindowSubclassProc(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR referenceData) {
+    UNREFERENCED_PARAMETER(referenceData);
+    if (message == WM_CLOSE &&
+        InterlockedCompareExchange(&g_monoApplyActive, 0, 0) != 0) {
+        Utils::RequestShutdown();
+        PostMessageW(window, WM_CLOSE, wParam, lParam);
+        return 0;
+    }
+    bool shuttingDown = message == WM_CLOSE || message == WM_DESTROY ||
+        message == WM_NCDESTROY || (message == WM_ENDSESSION && wParam != FALSE);
+    if (shuttingDown) FontHooks::PrepareForProcessExit();
+
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(window, MonoUnityWindowSubclassProc, subclassId);
+        InterlockedCompareExchangePointer(&g_monoShutdownWindow, NULL, window);
+        if (InterlockedCompareExchangePointer(&g_monoApplyWindow, NULL, window) == window)
+            InterlockedExchange(&g_monoApplyWindowThreadId, 0);
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+static void MonoEnsureShutdownWindowSubclass(HWND window) {
+    if (!window || Utils::IsShuttingDown() || !MonoIsTargetUnityWindow(window)) return;
+    DWORD windowThreadId = GetWindowThreadProcessId(window, NULL);
+    if (!windowThreadId || windowThreadId != GetCurrentThreadId()) return;
+
+    HWND current = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(&g_monoShutdownWindow, NULL, NULL));
+    if (current == window || current != NULL) return;
+    if (SetWindowSubclass(window, MonoUnityWindowSubclassProc,
+        kMonoShutdownSubclassId, 0)) {
+        InterlockedCompareExchangePointer(&g_monoShutdownWindow, window, NULL);
+        Utils::Trace("[DEBUG][UnityMono] shutdown subclass installed hwnd=%p tid=%lu",
+            window, windowThreadId);
+    }
+}
+
+static void MonoPrepareForDispatchedShutdown(const MSG* message) {
+    if (!message || !MonoIsTargetUnityWindow(message->hwnd)) return;
+    MonoEnsureShutdownWindowSubclass(message->hwnd);
+    if (message->message == WM_CLOSE || message->message == WM_DESTROY ||
+        message->message == WM_NCDESTROY ||
+        (message->message == WM_ENDSESSION && message->wParam != FALSE)) {
+        FontHooks::PrepareForProcessExit();
+    }
+}
+
+static BOOL WINAPI MonoNewShowWindow(HWND window, int command) {
+    bool targetWindow = MonoIsTargetUnityWindow(window);
+    if (targetWindow) MonoEnsureShutdownWindowSubclass(window);
+    if (MonoIsReplacementEnabled() && command != SW_HIDE && targetWindow) {
+        MonoTryApplyFromUnityThread(window);
+    }
+    if (MonoIsReplacementEnabled() &&
+        !InterlockedCompareExchange(&g_monoFontReady, 0, 0) &&
+        command != SW_HIDE && targetWindow) {
+        InterlockedExchange(&g_monoDeferredShowCommand, (LONG)command);
+        // Mono initialization can lag behind the native window. Keep the game
+        // visible and let later Unity callbacks complete the replacement.
+        return g_monoOriginalShowWindow(window, command);
+    }
+    return g_monoOriginalShowWindow(window, command);
+}
+
+static BOOL WINAPI MonoNewSetWindowPos(HWND window, HWND insertAfter, int x, int y,
+    int width, int height, UINT flags) {
+    bool targetWindow = MonoIsTargetUnityWindow(window);
+    if (targetWindow) MonoEnsureShutdownWindowSubclass(window);
+    if (MonoIsReplacementEnabled() && targetWindow) {
+        InterlockedExchangePointer(&g_monoApplyWindow, window);
+        InterlockedExchange(&g_monoApplyWindowThreadId, (LONG)GetCurrentThreadId());
+        // Some UnityPlayer builds do not import DispatchMessageW. SetWindowPos
+        // still runs on the Unity thread after managed startup, so use it as a
+        // bounded main-thread callback; MonoTryApplyFromUnityThread gates the
+        // first three seconds and prevents re-entrant applies.
+        MonoTryApplyFromUnityThread(window);
+    }
+    if (MonoIsReplacementEnabled() &&
+        !InterlockedCompareExchange(&g_monoFontReady, 0, 0) &&
+        (flags & SWP_SHOWWINDOW) != 0 && targetWindow) {
+        return g_monoOriginalSetWindowPos(window, insertAfter, x, y,
+            width, height, flags);
+    }
+    return g_monoOriginalSetWindowPos(window, insertAfter, x, y, width, height, flags);
+}
+
+static void MonoRevealUnityWindow() {
+    if (InterlockedExchange(&g_monoFontReady, 1) != 0) return;
+    HWND window = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(&g_monoApplyWindow, NULL, NULL));
+    if (window && MonoIsTargetUnityWindow(window) && g_monoOriginalShowWindow) {
+        LONG command = InterlockedCompareExchange(&g_monoDeferredShowCommand,
+            SW_SHOWDEFAULT, SW_SHOWDEFAULT);
+        if (command == SW_HIDE) command = SW_SHOW;
+        g_monoOriginalShowWindow(window, (int)command);
+        Utils::Trace("[DEBUG][UnityMono] Unity window revealed hwnd=%p command=%ld",
+            window, command);
+    } else if (window) {
+        InterlockedCompareExchangePointer(&g_monoApplyWindow, NULL, window);
+        InterlockedExchange(&g_monoApplyWindowThreadId, 0);
+    }
+}
+
+struct MonoWindowSearchContext {
+    HWND unityWindow;
+    DWORD unityThreadId;
+};
+
+static BOOL CALLBACK MonoFindGameWindowCallback(HWND window, LPARAM value) {
+    MonoWindowSearchContext* context = reinterpret_cast<MonoWindowSearchContext*>(value);
+    DWORD processId = 0;
+    DWORD threadId = GetWindowThreadProcessId(window, &processId);
+    if (!context || !threadId || processId != GetCurrentProcessId()) return TRUE;
+    wchar_t className[128] = {};
+    GetClassNameW(window, className, _countof(className));
+    if (_wcsicmp(className, L"FontPickerOverlay") == 0 ||
+        _wcsicmp(className, L"ConsoleWindowClass") == 0) return TRUE;
+    if (MonoIsUnityWindow(window)) {
+        context->unityWindow = window;
+        context->unityThreadId = threadId;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND MonoFindGameWindow(DWORD* threadId) {
+    if (threadId) *threadId = 0;
+    MonoWindowSearchContext context = {};
+    EnumWindows(MonoFindGameWindowCallback, reinterpret_cast<LPARAM>(&context));
+    if (threadId) *threadId = context.unityThreadId;
+    return context.unityWindow;
+}
+
+static bool MonoPostApplyMessage() {
+    if (Utils::IsShuttingDown() || !g_monoApplyMessage || !MonoIsReplacementEnabled()) return false;
+    DWORD threadId = 0;
+    HWND window = MonoFindGameWindow(&threadId);
+    InterlockedExchange(&g_monoApplyWindowThreadId, (LONG)threadId);
+    InterlockedExchangePointer(&g_monoApplyWindow, window);
+    return window && threadId &&
+        PostMessageW(window, g_monoApplyMessage, 0, 0) != FALSE;
+}
+
+static BOOL WINAPI MonoNewPeekMessageW(LPMSG message, HWND window,
+    UINT minimum, UINT maximum, UINT removeMessage) {
+    BOOL result = g_monoOriginalPeekMessageW(message, window, minimum,
+        maximum, removeMessage);
+    DWORD mainThread = (DWORD)InterlockedCompareExchange(&g_monoMainThreadId, 0, 0);
+    if (mainThread && GetCurrentThreadId() == mainThread &&
+        MonoIsReplacementEnabled()) {
+        MonoTryApplyFromUnityThread(NULL);
+    }
+    return result;
+}
+
+static BOOL WINAPI MonoNewPeekMessageA(LPMSG message, HWND window,
+    UINT minimum, UINT maximum, UINT removeMessage) {
+    BOOL result = g_monoOriginalPeekMessageA(message, window, minimum,
+        maximum, removeMessage);
+    DWORD mainThread = (DWORD)InterlockedCompareExchange(&g_monoMainThreadId, 0, 0);
+    if (mainThread && GetCurrentThreadId() == mainThread &&
+        MonoIsReplacementEnabled()) {
+        MonoTryApplyFromUnityThread(NULL);
+    }
+    return result;
+}
+
+static BOOL WINAPI MonoNewGetMessageA(LPMSG message, HWND window,
+    UINT minimum, UINT maximum) {
+    BOOL result = g_monoOriginalGetMessageA(message, window, minimum, maximum);
+    DWORD mainThread = (DWORD)InterlockedCompareExchange(&g_monoMainThreadId, 0, 0);
+    if (result > 0 && mainThread && GetCurrentThreadId() == mainThread &&
+        MonoIsReplacementEnabled()) {
+        MonoTryApplyFromUnityThread(NULL);
+    }
+    return result;
+}
+
+static bool MonoHandleApplyMessage(const MSG* message) {
+    if (Utils::IsShuttingDown()) return false;
+    HWND applyWindow = reinterpret_cast<HWND>(
+        InterlockedCompareExchangePointer(&g_monoApplyWindow, NULL, NULL));
+    DWORD applyThreadId = (DWORD)InterlockedCompareExchange(
+        &g_monoApplyWindowThreadId, 0, 0);
+    if (message && g_monoApplyMessage && message->message == g_monoApplyMessage &&
+        message->hwnd == applyWindow && applyThreadId &&
+        GetCurrentThreadId() == applyThreadId &&
+        GetWindowThreadProcessId(message->hwnd, NULL) == applyThreadId) {
+        if (InterlockedCompareExchange(&g_monoApplyActive, 1, 0) == 0) {
+            MonoApplyFontOnUnityThread();
+            InterlockedExchange(&g_monoApplyActive, 0);
+        }
+        return true;
+    }
+    return false;
+}
+
+static LRESULT WINAPI MonoNewDispatchMessageW(const MSG* message) {
+    MonoPrepareForDispatchedShutdown(message);
+    if (MonoHandleApplyMessage(message)) return 0;
+    return g_monoOriginalDispatchMessageW(message);
+}
+
+static LRESULT WINAPI MonoNewDispatchMessageA(const MSG* message) {
+    MonoPrepareForDispatchedShutdown(message);
+    if (MonoHandleApplyMessage(message)) return 0;
+    return g_monoOriginalDispatchMessageA(message);
+}
+
+static unsigned __stdcall MonoApplyThread(void*) {
+    InterlockedExchange(&g_monoApplyThread.threadId, (LONG)GetCurrentThreadId());
+    Sleep(250);
+    while (!Utils::IsShuttingDown() &&
+        InterlockedCompareExchange(&g_monoDispatchHookInstalled, 0, 0) != 0) {
+        MonoPostApplyMessage();
+        Sleep(100);
+    }
+    return 0;
+}
+
+static bool InstallInOpenDetourTransaction() {
+    if (Utils::IsShuttingDown() || !Config::EnableCatSystemUnityHook ||
+        !MonoLooksLikeEngineRoot()) return false;
+    g_monoProcessAttachTick = GetTickCount();
+    InterlockedExchange(&g_monoMainThreadId, (LONG)GetCurrentThreadId());
+    g_monoApplyMessage = RegisterWindowMessageW(L"SimpleFontHook.UnityMono.ApplyFont.v1");
+    if (!g_monoApplyMessage) g_monoApplyMessage = WM_APP + 0x3A2;
+    LONG dispatchResult = DetourAttach(
+        &(PVOID&)g_monoOriginalDispatchMessageW, MonoNewDispatchMessageW);
+    LONG dispatchAResult = DetourAttach(
+        &(PVOID&)g_monoOriginalDispatchMessageA, MonoNewDispatchMessageA);
+    if (dispatchResult != NO_ERROR && dispatchAResult != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] DispatchMessage hook failed wide=%ld ansi=%ld",
+            dispatchResult, dispatchAResult);
+        return false;
+    }
+    DetourAttach(&(PVOID&)g_monoOriginalPeekMessageW, MonoNewPeekMessageW);
+    DetourAttach(&(PVOID&)g_monoOriginalPeekMessageA, MonoNewPeekMessageA);
+    DetourAttach(&(PVOID&)g_monoOriginalGetMessageA, MonoNewGetMessageA);
+    LONG showResult = DetourAttach(&(PVOID&)g_monoOriginalShowWindow,
+        MonoNewShowWindow);
+    LONG positionResult = DetourAttach(&(PVOID&)g_monoOriginalSetWindowPos,
+        MonoNewSetWindowPos);
+    if (showResult != NO_ERROR || positionResult != NO_ERROR) {
+        Utils::Trace("[DEBUG][UnityMono] visibility hook incomplete show=%ld setWindowPos=%ld",
+            showResult, positionResult);
+    }
+    InterlockedExchange(&g_monoDispatchHookInstalled, 1);
+    Utils::Trace("[DEBUG][UnityMono] message-pump hooks attached dispatchW=%ld dispatchA=%ld applyMessage=0x%X",
+        dispatchResult, dispatchAResult, g_monoApplyMessage);
+    return true;
+}
+
+static void StartApplyThread() {
+    if (Utils::IsShuttingDown() || !g_monoDispatchHookInstalled) return;
+    if (!StartHookWorkerThread(&g_monoApplyThread, MonoApplyThread, NULL,
+        "unity-mono-apply") && !Utils::IsShuttingDown()) {
+        Utils::Trace("[DEBUG][UnityMono] failed to start apply thread");
+    }
+}
+
+static bool StopApplyThread(bool waitForExit) {
+    InterlockedExchange(&g_monoDispatchHookInstalled, 0);
+    InterlockedExchange(&g_monoApplyThreadStarted, 0);
+    InterlockedExchangePointer(&g_monoApplyWindow, NULL);
+    InterlockedExchange(&g_monoApplyWindowThreadId, 0);
+    return StopHookWorkerThread(&g_monoApplyThread, waitForExit, 2000,
+        "unity-mono-apply");
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (Utils::IsShuttingDown() || !g_monoDispatchHookInstalled) return;
+    (void)version;
+    MonoPostApplyMessage();
+}

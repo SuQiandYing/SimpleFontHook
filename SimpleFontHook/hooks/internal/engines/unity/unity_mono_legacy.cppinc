@@ -1,0 +1,3 @@
+#include "unity_mono_material.cppinc"
+#include "unity_mono_legacy_atlas.cppinc"
+#include "unity_mono_legacy_asset.cppinc"

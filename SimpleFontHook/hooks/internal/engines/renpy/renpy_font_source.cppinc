@@ -1,0 +1,122 @@
+static std::wstring ResolveSelectedFontFile(const std::wstring& face) {
+    std::wstring systemFont = EngineCommon::FindSystemFontFileByFace(face.c_str());
+    if (systemFont.empty() &&
+        _wcsicmp(face.c_str(), Config::ForcedFontNameW) == 0) {
+        std::wstring ansiFace = EngineCommon::WideFromAnsi(Config::ForcedFontNameA);
+        if (!ansiFace.empty()) {
+            systemFont = EngineCommon::FindSystemFontFileByFace(ansiFace.c_str());
+        }
+    }
+
+    TraceLimited("font resolve face='%s' source='%s'",
+        EngineCommon::WideToUtf8(face).c_str(), EngineCommon::WideToUtf8(systemFont).c_str());
+    if (!systemFont.empty()) return systemFont;
+
+    if (Config::FontFileName[0]) {
+        std::wstring configured = Config::FontFileName;
+        if (PathIsRelativeW(configured.c_str())) {
+            configured = EngineCommon::BuildRootPath(configured.c_str());
+        }
+        if (EngineCommon::IsFile(configured)) return configured;
+    }
+    return L"";
+}
+
+static bool ReadFontSource(const std::wstring& path, const std::wstring& face,
+    bool* collection, DWORD* faceIndex) {
+    if (collection) *collection = false;
+    if (faceIndex) *faceIndex = 0;
+    if (!EngineCommon::IsFile(path)) return false;
+
+    HANDLE file = orgCreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size = {};
+    BYTE header[12] = {};
+    DWORD headerRead = 0;
+    bool ok = GetFileSizeEx(file, &size) && size.QuadPart >= sizeof(header) &&
+        size.QuadPart <= 128ll * 1024 * 1024 &&
+        ReadFile(file, header, sizeof(header), &headerRead, NULL) &&
+        headerRead == sizeof(header);
+    if (!ok) {
+        CloseHandle(file);
+        return false;
+    }
+
+    if (FontPatcher::IsFontFile(header, sizeof(header))) {
+        CloseHandle(file);
+        return true;
+    }
+    if (!FontPatcher::IsFontCollection(header, sizeof(header))) {
+        CloseHandle(file);
+        return false;
+    }
+
+    std::vector<BYTE> bytes(static_cast<size_t>(size.QuadPart));
+    memcpy(bytes.data(), header, sizeof(header));
+    size_t total = sizeof(header);
+    while (total < bytes.size()) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(
+            bytes.size() - total, 16 * 1024 * 1024));
+        DWORD read = 0;
+        if (!ReadFile(file, bytes.data() + total, chunk, &read, NULL) || read == 0) {
+            ok = false;
+            break;
+        }
+        total += read;
+    }
+    CloseHandle(file);
+    if (!ok || total != bytes.size()) return false;
+
+    DWORD index = 0;
+    if (!FontPatcher::FindFontCollectionFaceIndex(bytes, face.c_str(), &index)) {
+        if (!FontPatcher::FindFontCollectionFaceIndex(bytes, NULL, &index)) {
+            return false;
+        }
+        TraceLimited("font collection face fallback face='%s' source='%s'",
+        EngineCommon::WideToUtf8(face).c_str(), EngineCommon::WideToUtf8(path).c_str());
+    }
+    if (collection) *collection = true;
+    if (faceIndex) *faceIndex = index;
+    return true;
+}
+
+static std::string SourceExtension(const std::wstring& path, bool collection) {
+    const wchar_t* extension = PathFindExtensionW(path.c_str());
+    if (extension && _wcsicmp(extension, L".otf") == 0 && !collection) return ".otf";
+    if (extension && _wcsicmp(extension, L".otc") == 0 && collection) return ".otc";
+    if (collection) return ".ttc";
+    return ".ttf";
+}
+
+static bool PrepareFontSource(LONG version, const std::wstring& face,
+    std::string* fontName, std::string* virtualPath, std::wstring* sourcePath) {
+    std::wstring source = ResolveSelectedFontFile(face);
+    bool collection = false;
+    DWORD faceIndex = 0;
+    if (source.empty() || !ReadFontSource(source, face, &collection, &faceIndex)) {
+        TraceLimited("font source failed version=%ld face='%s' source='%s'",
+        version, EngineCommon::WideToUtf8(face).c_str(),
+        EngineCommon::WideToUtf8(source).c_str());
+        return false;
+    }
+
+    std::string virtualName = "__simplefonthook__/selected" +
+        SourceExtension(source, collection);
+    std::string mappedName = virtualName;
+    if (collection) {
+        char indexText[32] = {};
+        sprintf_s(indexText, "%lu@", static_cast<unsigned long>(faceIndex));
+        mappedName = indexText + virtualName;
+    }
+
+    if (fontName) *fontName = mappedName;
+    if (virtualPath) *virtualPath = virtualName;
+    if (sourcePath) *sourcePath = source;
+    TraceLimited("font ready version=%ld face='%s' source='%s' mapped='%s'",
+        version, EngineCommon::WideToUtf8(face).c_str(),
+        EngineCommon::WideToUtf8(source).c_str(), mappedName.c_str());
+    return true;
+}

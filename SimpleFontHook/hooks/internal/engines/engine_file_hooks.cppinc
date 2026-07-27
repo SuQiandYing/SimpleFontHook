@@ -1,0 +1,187 @@
+// Win32 file API adapters for the shared engine dispatch.
+
+HANDLE WINAPI newCreateFileW(LPCWSTR fileName, DWORD desiredAccess,
+    DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery()) {
+        return orgCreateFileW(fileName, desiredAccess, shareMode,
+            securityAttributes, creationDisposition, flagsAndAttributes,
+            templateFile);
+    }
+
+    {
+        EngineFileHookGuard guard;
+        const bool readOnly = EngineCommon::IsReadOnlyOpen(desiredAccess,
+            creationDisposition);
+        if (EngineShouldHideFileW(fileName, readOnly, false)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        HANDLE redirected = INVALID_HANDLE_VALUE;
+        if (EngineTryOpenFileW(fileName, desiredAccess, shareMode,
+            securityAttributes, creationDisposition, flagsAndAttributes,
+            templateFile, &redirected)) {
+            return redirected;
+        }
+    }
+
+    return orgCreateFileW(fileName, desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes,
+        templateFile);
+}
+
+HANDLE WINAPI newCreateFileA(LPCSTR fileName, DWORD desiredAccess,
+    DWORD shareMode, LPSECURITY_ATTRIBUTES securityAttributes,
+    DWORD creationDisposition, DWORD flagsAndAttributes, HANDLE templateFile) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery()) {
+        return orgCreateFileA(fileName, desiredAccess, shareMode,
+            securityAttributes, creationDisposition, flagsAndAttributes,
+            templateFile);
+    }
+
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        const bool readOnly = EngineCommon::IsReadOnlyOpen(desiredAccess,
+            creationDisposition);
+        if (EngineShouldHideFileW(wide.c_str(), readOnly, false)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        HANDLE redirected = INVALID_HANDLE_VALUE;
+        if (EngineTryOpenFileW(wide.c_str(), desiredAccess, shareMode,
+            securityAttributes, creationDisposition, flagsAndAttributes,
+            templateFile, &redirected)) {
+            return redirected;
+        }
+    }
+
+    return orgCreateFileA(fileName, desiredAccess, shareMode,
+        securityAttributes, creationDisposition, flagsAndAttributes,
+        templateFile);
+}
+
+DWORD WINAPI newGetFileAttributesW(LPCWSTR fileName) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
+        return orgGetFileAttributesW(fileName);
+
+    EngineFileHookGuard guard;
+    if (EngineShouldHideFileW(fileName, true, false)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    DWORD attributes = INVALID_FILE_ATTRIBUTES;
+    EngineFileAttributeStatus status = EngineQueryFileAttributesW(fileName,
+        false, NULL, &attributes);
+    if (status == EngineFileAttributeStatus::Found) return attributes;
+    if (status == EngineFileAttributeStatus::Missing)
+        return INVALID_FILE_ATTRIBUTES;
+    return orgGetFileAttributesW(fileName);
+}
+
+DWORD WINAPI newGetFileAttributesA(LPCSTR fileName) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
+        return orgGetFileAttributesA(fileName);
+
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (EngineShouldHideFileW(wide.c_str(), true, false)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+
+        DWORD attributes = INVALID_FILE_ATTRIBUTES;
+        EngineFileAttributeStatus status = EngineQueryFileAttributesW(
+            wide.c_str(), false, NULL, &attributes);
+        if (status == EngineFileAttributeStatus::Found) return attributes;
+        if (status == EngineFileAttributeStatus::Missing)
+            return INVALID_FILE_ATTRIBUTES;
+    }
+    return orgGetFileAttributesA(fileName);
+}
+
+BOOL WINAPI newGetFileAttributesExW(LPCWSTR fileName,
+    GET_FILEEX_INFO_LEVELS infoLevel, LPVOID fileInformation) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery() ||
+        infoLevel != GetFileExInfoStandard) {
+        return orgGetFileAttributesExW(fileName, infoLevel, fileInformation);
+    }
+
+    EngineFileHookGuard guard;
+    if (EngineShouldHideFileW(fileName, true, false)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    EngineFileAttributeStatus status = EngineQueryFileAttributesW(fileName,
+        true, &data, NULL);
+    if (status == EngineFileAttributeStatus::Missing) return FALSE;
+    if (status == EngineFileAttributeStatus::Found) {
+        if (fileInformation)
+            *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(fileInformation) = data;
+        return TRUE;
+    }
+    return orgGetFileAttributesExW(fileName, infoLevel, fileInformation);
+}
+
+BOOL WINAPI newGetFileAttributesExA(LPCSTR fileName,
+    GET_FILEEX_INFO_LEVELS infoLevel, LPVOID fileInformation) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery() ||
+        infoLevel != GetFileExInfoStandard) {
+        return orgGetFileAttributesExA(fileName, infoLevel, fileInformation);
+    }
+
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (EngineShouldHideFileW(wide.c_str(), true, false)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        EngineFileAttributeStatus status = EngineQueryFileAttributesW(
+            wide.c_str(), true, &data, NULL);
+        if (status == EngineFileAttributeStatus::Missing) return FALSE;
+        if (status == EngineFileAttributeStatus::Found) {
+            if (fileInformation)
+                *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(fileInformation) = data;
+            return TRUE;
+        }
+    }
+    return orgGetFileAttributesExA(fileName, infoLevel, fileInformation);
+}
+
+HANDLE WINAPI newFindFirstFileW(LPCWSTR fileName,
+    LPWIN32_FIND_DATAW findFileData) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
+        return orgFindFirstFileW(fileName, findFileData);
+
+    EngineFileHookGuard guard;
+    if (EngineShouldHideFileW(fileName, true, true)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    return orgFindFirstFileW(fileName, findFileData);
+}
+
+HANDLE WINAPI newFindFirstFileA(LPCSTR fileName,
+    LPWIN32_FIND_DATAA findFileData) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
+        return orgFindFirstFileA(fileName, findFileData);
+
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    if (!wide.empty()) {
+        EngineFileHookGuard guard;
+        if (EngineShouldHideFileW(wide.c_str(), true, true)) {
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    return orgFindFirstFileA(fileName, findFileData);
+}

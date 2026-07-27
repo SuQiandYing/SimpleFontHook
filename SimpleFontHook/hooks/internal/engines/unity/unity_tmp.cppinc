@@ -1,0 +1,12 @@
+// CatSystem for Unity renders through TextMeshPro, so GDI font hooks never see
+// its text. This adapter drives the IL2CPP API on Unity's window thread and
+// replaces every live TMP text with one uniform font asset and base material.
+namespace Unity {
+
+#include "unity_il2cpp_state.cppinc"
+#include "unity_il2cpp_runtime.cppinc"
+#include "unity_il2cpp_font_asset.cppinc"
+#include "unity_il2cpp_apply.cppinc"
+#include "unity_il2cpp_window.cppinc"
+
+} // namespace Unity

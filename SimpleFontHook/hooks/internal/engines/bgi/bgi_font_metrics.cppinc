@@ -1,0 +1,216 @@
+static bool TryGetNormalizationFromCache(const LOGFONTW& sourceLogfont,
+    const LOGFONTW& replacementLogfont, LONG configVersion, MetricNormalizationEntry* entry) {
+    std::lock_guard<std::mutex> lock(g_metricNormalizationMutex);
+    for (auto it = g_metricNormalizationEntries.rbegin(); it != g_metricNormalizationEntries.rend(); ++it) {
+        if (it->configVersion == configVersion &&
+            ::SameSourceLogFont(it->sourceLogfont, sourceLogfont) &&
+            ::SameSourceLogFont(it->requestedReplacementLogfont, replacementLogfont)) {
+            if (entry) *entry = *it;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void CacheNormalization(const MetricNormalizationEntry& entry) {
+    std::lock_guard<std::mutex> lock(g_metricNormalizationMutex);
+    if (g_metricNormalizationEntries.size() >= kMaxMetricNormalizationEntries) {
+        g_metricNormalizationEntries.erase(g_metricNormalizationEntries.begin());
+    }
+    g_metricNormalizationEntries.push_back(entry);
+}
+
+static bool MeasureFontProbe(const LOGFONTW& logfont, FontProbeMetrics* metrics) {
+    if (!metrics) return false;
+    *metrics = {};
+    metrics->inkTop = std::numeric_limits<LONG>::max();
+    metrics->inkBottom = std::numeric_limits<LONG>::min();
+
+    ScopedInternalFontProbe hookBypass;
+    const DWORD savedError = GetLastError();
+    if (Config::EnableDebugLog) {
+        Utils::Trace("[DEBUG][BGI][MetricProbe] create face='%S' h=%ld w=%ld charset=%u",
+            logfont.lfFaceName, logfont.lfHeight, logfont.lfWidth, (unsigned)logfont.lfCharSet);
+    }
+    HDC hdc = CreateCompatibleDC(NULL);
+    HFONT font = orgCreateFontIndirectW(&logfont);
+    if (!hdc || !font) {
+        if (font) DeleteObject(font);
+        if (hdc) DeleteDC(hdc);
+        SetLastError(savedError);
+        return false;
+    }
+
+    HGDIOBJ oldFont = orgSelectObject(hdc, font);
+    if (!oldFont || oldFont == HGDI_ERROR) {
+        DeleteObject(font);
+        DeleteDC(hdc);
+        SetLastError(savedError);
+        return false;
+    }
+
+    SetMapMode(hdc, MM_TEXT);
+    SetGraphicsMode(hdc, GM_COMPATIBLE);
+    SetTextCharacterExtra(hdc, 0);
+    orgGetTextFaceW(hdc, LF_FACESIZE, metrics->actualFace);
+    if (Config::EnableDebugLog) {
+        Utils::Trace("[DEBUG][BGI][MetricProbe] selected hdc=%p font=%p old=%p actual='%S'",
+            hdc, font, oldFont, metrics->actualFace);
+    }
+
+    SIZE probeSize = {};
+    bool measured = orgGetTextMetricsW(hdc, &metrics->textMetric) != FALSE &&
+        orgGetTextExtentPoint32W(hdc, kMetricProbeText,
+            static_cast<int>(_countof(kMetricProbeText) - 1), &probeSize) != FALSE &&
+        probeSize.cx > 0;
+    metrics->totalWidth = probeSize.cx;
+
+    MAT2 matrix = {};
+    matrix.eM11.value = 1;
+    matrix.eM22.value = 1;
+    if (measured) {
+        for (size_t i = 0; i + 1 < _countof(kMetricProbeText); ++i) {
+            GLYPHMETRICS glyph = {};
+            if (orgGetGlyphOutlineW(hdc, kMetricProbeText[i], GGO_METRICS,
+                &glyph, 0, nullptr, &matrix) == GDI_ERROR || glyph.gmBlackBoxY == 0) {
+                continue;
+            }
+            const LONG top = metrics->textMetric.tmAscent - glyph.gmptGlyphOrigin.y;
+            const LONGLONG bottomValue = static_cast<LONGLONG>(top) + glyph.gmBlackBoxY;
+            if (bottomValue > std::numeric_limits<LONG>::max()) continue;
+            metrics->inkTop = std::min(metrics->inkTop, top);
+            metrics->inkBottom = std::max(metrics->inkBottom, static_cast<LONG>(bottomValue));
+            ++metrics->inkGlyphCount;
+        }
+
+        const int drawX = 32;
+        const int drawY = 32;
+        const LONGLONG widthCandidate = static_cast<LONGLONG>(probeSize.cx) + drawX * 2;
+        const int canvasWidth = static_cast<int>(std::max<LONGLONG>(128,
+            std::min<LONGLONG>(4096, widthCandidate)));
+        const LONGLONG heightCandidate = static_cast<LONGLONG>(
+            std::max<LONG>(1, metrics->textMetric.tmHeight)) * 3 + drawY * 2;
+        const int canvasHeight = static_cast<int>(std::max<LONGLONG>(128,
+            std::min<LONGLONG>(4096, heightCandidate)));
+
+        BITMAPINFO bitmapInfo = {};
+        bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
+        bitmapInfo.bmiHeader.biWidth = canvasWidth;
+        bitmapInfo.bmiHeader.biHeight = -canvasHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+        void* pixels = nullptr;
+        HBITMAP bitmap = CreateDIBSection(nullptr, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        HGDIOBJ oldBitmap = bitmap ? orgSelectObject(hdc, bitmap) : nullptr;
+        if (bitmap && pixels && oldBitmap && oldBitmap != HGDI_ERROR) {
+            memset(pixels, 0xFF,
+                static_cast<size_t>(canvasWidth) * canvasHeight * sizeof(DWORD));
+            SetTextAlign(hdc, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, RGB(0, 0, 0));
+            if (orgTextOutW(hdc, drawX, drawY, kMetricProbeText,
+                static_cast<int>(_countof(kMetricProbeText) - 1))) {
+                int rasterTop = canvasHeight;
+                int rasterBottom = -1;
+                const DWORD* image = static_cast<const DWORD*>(pixels);
+                for (int y = 0; y < canvasHeight; ++y) {
+                    for (int x = 0; x < canvasWidth; ++x) {
+                        if (image[y * canvasWidth + x] != 0xFFFFFFFFu) {
+                            rasterTop = std::min(rasterTop, y);
+                            rasterBottom = std::max(rasterBottom, y + 1);
+                        }
+                    }
+                }
+                if (rasterTop < rasterBottom) {
+                    metrics->inkTop = rasterTop - drawY;
+                    metrics->inkBottom = rasterBottom - drawY;
+                    metrics->inkGlyphCount = static_cast<int>(_countof(kMetricProbeText) - 1);
+                }
+            }
+        }
+        if (oldBitmap && oldBitmap != HGDI_ERROR) orgSelectObject(hdc, oldBitmap);
+        if (bitmap) DeleteObject(bitmap);
+    }
+
+    orgSelectObject(hdc, oldFont);
+    DeleteObject(font);
+    DeleteDC(hdc);
+    SetLastError(savedError);
+
+    if (!measured) return false;
+    if (Config::EnableDebugLog) {
+        Utils::Trace("[DEBUG][BGI][MetricProbe] measured face='%S' width=%ld ink=%ld..%ld tm=%ld/%ld/%ld",
+            logfont.lfFaceName, metrics->totalWidth, metrics->inkTop, metrics->inkBottom,
+            metrics->textMetric.tmHeight, metrics->textMetric.tmAscent, metrics->textMetric.tmDescent);
+    }
+    return true;
+}
+
+static bool IsReasonableProbeRatio(LONG desiredWidth, LONG measuredWidth) {
+    if (desiredWidth <= 0 || measuredWidth <= 0) return false;
+    const LONGLONG desired = desiredWidth;
+    const LONGLONG measured = measuredWidth;
+    return measured <= desired * 4 && desired <= measured * 4;
+}
+
+static LONG ScaleWidthForProbe(LONG currentWidth, LONG desiredProbeWidth, LONG measuredProbeWidth,
+    LONG minimumWidth, LONG maximumWidth) {
+    const LONGLONG numerator = static_cast<LONGLONG>(currentWidth) * desiredProbeWidth + measuredProbeWidth / 2;
+    LONGLONG scaled = numerator / measuredProbeWidth;
+    if (scaled < minimumWidth) scaled = minimumWidth;
+    if (scaled > maximumWidth) scaled = maximumWidth;
+    return static_cast<LONG>(scaled);
+}
+
+static LONG AbsLogFontValue(LONG value) {
+    if (value == std::numeric_limits<LONG>::min()) return std::numeric_limits<LONG>::max();
+    return value < 0 ? -value : value;
+}
+
+static LONG WithLogFontSign(LONG magnitude, LONG signSource) {
+    if (magnitude <= 0) magnitude = 1;
+    return signSource < 0 ? -magnitude : magnitude;
+}
+
+static LONG ScaleMetricRounded(LONG value, LONG numerator, LONG denominator) {
+    if (denominator <= 0) return value;
+    LONGLONG product = static_cast<LONGLONG>(value) * numerator;
+    if (product >= 0) product += denominator / 2;
+    else product -= denominator / 2;
+    LONGLONG scaled = product / denominator;
+    if (scaled < std::numeric_limits<LONG>::min()) return std::numeric_limits<LONG>::min();
+    if (scaled > std::numeric_limits<LONG>::max()) return std::numeric_limits<LONG>::max();
+    return static_cast<LONG>(scaled);
+}
+
+static LONG AverageDelta(LONG first, LONG second) {
+    LONGLONG sum = static_cast<LONGLONG>(first) + second;
+    if (sum >= 0) ++sum;
+    else --sum;
+    return static_cast<LONG>(sum / 2);
+}
+
+static LONG ClampToLong(LONGLONG value) {
+    if (value < std::numeric_limits<LONG>::min()) return std::numeric_limits<LONG>::min();
+    if (value > std::numeric_limits<LONG>::max()) return std::numeric_limits<LONG>::max();
+    return static_cast<LONG>(value);
+}
+
+static LONG AnchoredInkDelta(LONG sourceTop, LONG sourceBottom, LONG sourceAnchor,
+    LONG targetTop, LONG targetBottom, LONG targetAnchor) {
+    const LONG topDelta = ClampToLong(
+        static_cast<LONGLONG>(sourceTop) - sourceAnchor - targetTop + targetAnchor);
+    const LONG bottomDelta = ClampToLong(
+        static_cast<LONGLONG>(sourceBottom) - sourceAnchor - targetBottom + targetAnchor);
+    return AverageDelta(topDelta, bottomDelta);
+}
+
+static void AddUniqueCandidate(std::vector<LONG>& candidates, LONG value, LONG minimum, LONG maximum) {
+    value = std::max(minimum, std::min(maximum, value));
+    if (std::find(candidates.begin(), candidates.end(), value) == candidates.end()) {
+        candidates.push_back(value);
+    }
+}
+

@@ -1,0 +1,173 @@
+// Softpal default-font priority shim.
+//
+// Softpal's "default" option prefers the bundled DEFAULT_FONT.DAT bitmap font.
+// For hookable rendering we force that option onto the system-font branch and
+// let the normal GDI font hooks replace the selected HFONT.
+
+static volatile LONG g_softpalEngineProbe = -1;
+static volatile LONG g_softpalTraceCount = 0;
+static volatile LONG g_softpalPalFontHooksInstalled = 0;
+
+typedef int(__cdecl* pSoftpalPalFontBegin)();
+typedef int(__cdecl* pSoftpalPalFontSetType)(int);
+typedef int(__cdecl* pSoftpalPalFontGetType)();
+
+static pSoftpalPalFontBegin orgSoftpalPalFontBegin = NULL;
+static pSoftpalPalFontSetType orgSoftpalPalFontSetType = NULL;
+static pSoftpalPalFontGetType orgSoftpalPalFontGetType = NULL;
+
+static HMODULE SoftpalGetPalModule();
+
+static const WORD kSoftpalOriginalFontType = 4;
+static const WORD kSoftpalHookableFontType = 1;
+
+static void SoftpalTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_softpalTraceCount);
+    if (hit > 128) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][SOFTPAL] %s", message);
+}
+
+static bool SoftpalLooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_softpalEngineProbe, -1, -1);
+    if (cached == 1) return true;
+
+    static const char* const palExports[] = {
+        "PalFontBegin",
+        "PalFontSetType",
+        "PalFontGetType",
+    };
+    HMODULE palModule = SoftpalGetPalModule();
+    bool runtimeContract = EngineCommon::ModuleHasAllExports(palModule,
+        palExports, _countof(palExports));
+    if (runtimeContract) {
+        InterlockedExchange(&g_softpalEngineProbe, 1);
+        return true;
+    }
+
+    if (cached == 0) return false;
+    bool moduleContract = EngineCommon::MainModuleContainsAllAscii(
+        palExports, _countof(palExports));
+    bool detected = EngineIdentityPolicy::Confirm({
+        moduleContract, runtimeContract, false, false });
+    InterlockedExchange(&g_softpalEngineProbe, detected ? 1 : 0);
+    SoftpalTraceLimited("engine-probe result=%d module-contract=%d runtime-exports=%d",
+        detected ? 1 : 0, moduleContract ? 1 : 0, runtimeContract ? 1 : 0);
+    return detected;
+}
+
+static bool SoftpalShouldReplaceFontDataQueries() {
+    return Config::EnableSoftpalHook &&
+        Config::SoftpalForceDefaultOptionToSystemFont &&
+        SoftpalLooksLikeEngineRoot();
+}
+
+static bool SoftpalShouldUseNaturalReplacementWidth() {
+    return Config::EnableSoftpalHook &&
+        SoftpalLooksLikeEngineRoot();
+}
+
+static HMODULE SoftpalGetPalModule() {
+    HMODULE hPal = GetModuleHandleW(L"Pal.dll");
+    if (!hPal) hPal = GetModuleHandleW(L"PAL.dll");
+    return hPal;
+}
+
+static void SoftpalNormalizeFontType(const char* reason) {
+    if (!Config::EnableSoftpalHook || !Config::SoftpalForceDefaultOptionToSystemFont) return;
+    if (!orgSoftpalPalFontGetType || !orgSoftpalPalFontSetType) return;
+
+    __try {
+        int type = orgSoftpalPalFontGetType();
+        if (type == kSoftpalOriginalFontType) {
+            orgSoftpalPalFontSetType(kSoftpalHookableFontType);
+            SoftpalTraceLimited("font-type %s original=%u mapped=%u",
+                reason ? reason : "normalize", kSoftpalOriginalFontType, kSoftpalHookableFontType);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+static int __cdecl newSoftpalPalFontSetType(int type) {
+    int mappedType = type;
+    if (Config::EnableSoftpalHook && Config::SoftpalForceDefaultOptionToSystemFont &&
+        type == kSoftpalOriginalFontType) {
+        mappedType = kSoftpalHookableFontType;
+        SoftpalTraceLimited("PalFontSetType type=%d mapped=%d", type, mappedType);
+    }
+
+    int result = orgSoftpalPalFontSetType ? orgSoftpalPalFontSetType(mappedType) : 0;
+    SoftpalNormalizeFontType("after-set-type");
+    return result;
+}
+
+static int __cdecl newSoftpalPalFontBegin() {
+    SoftpalNormalizeFontType("before-begin");
+    return orgSoftpalPalFontBegin ? orgSoftpalPalFontBegin() : 0;
+}
+
+static void SoftpalInstallPalFontHooks() {
+    if (!Config::EnableSoftpalHook || !Config::SoftpalForceDefaultOptionToSystemFont) return;
+    if (!SoftpalLooksLikeEngineRoot()) return;
+    if (InterlockedCompareExchange(&g_softpalPalFontHooksInstalled, 1, 0) != 0) return;
+
+    HMODULE hPal = SoftpalGetPalModule();
+    FARPROC beginProc = hPal ? GetProcAddress(hPal, "PalFontBegin") : NULL;
+    FARPROC setTypeProc = hPal ? GetProcAddress(hPal, "PalFontSetType") : NULL;
+    FARPROC getTypeProc = hPal ? GetProcAddress(hPal, "PalFontGetType") : NULL;
+    if (!hPal || !beginProc || !setTypeProc || !getTypeProc) {
+        InterlockedExchange(&g_softpalPalFontHooksInstalled, 0);
+        return;
+    }
+
+    orgSoftpalPalFontBegin = (pSoftpalPalFontBegin)beginProc;
+    orgSoftpalPalFontSetType = (pSoftpalPalFontSetType)setTypeProc;
+    orgSoftpalPalFontGetType = (pSoftpalPalFontGetType)getTypeProc;
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&)orgSoftpalPalFontBegin, newSoftpalPalFontBegin);
+    DetourAttach(&(PVOID&)orgSoftpalPalFontSetType, newSoftpalPalFontSetType);
+    LONG status = DetourTransactionCommit();
+    if (status != NO_ERROR) {
+        orgSoftpalPalFontBegin = NULL;
+        orgSoftpalPalFontSetType = NULL;
+        orgSoftpalPalFontGetType = NULL;
+        InterlockedExchange(&g_softpalPalFontHooksInstalled, 0);
+        SoftpalTraceLimited("pal-font-hooks status=%ld", status);
+        return;
+    }
+
+    SoftpalTraceLimited("pal-font-hooks installed exports=PalFontBegin/PalFontSetType/PalFontGetType");
+    SoftpalNormalizeFontType("install");
+}
+
+static bool SoftpalIsDefaultFontRequestW(const wchar_t* fileName, std::wstring* fullPathOut) {
+    if (!fileName || !fileName[0]) return false;
+
+    std::wstring fullPath = EngineCommon::FullPath(fileName);
+    if (fullPath.empty() || !EngineCommon::IsUnderGameRoot(fullPath)) return false;
+
+    const wchar_t* baseName = PathFindFileNameW(fullPath.c_str());
+    if (!baseName || _wcsicmp(baseName, L"DEFAULT_FONT.DAT") != 0) return false;
+    if (fullPathOut) *fullPathOut = fullPath;
+    return true;
+}
+
+static bool SoftpalShouldHideDefaultFontDatW(const wchar_t* fileName) {
+    if (!Config::EnableSoftpalHook || !Config::SoftpalDisableDefaultFontDat) return false;
+
+    std::wstring fullPath;
+    if (!SoftpalIsDefaultFontRequestW(fileName, &fullPath)) return false;
+    if (!SoftpalLooksLikeEngineRoot()) return false;
+
+    SoftpalTraceLimited("hide-default-font-dat request='%s'",
+        EngineCommon::WideToUtf8(fullPath).c_str());
+    return true;
+}

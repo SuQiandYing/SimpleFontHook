@@ -1,0 +1,125 @@
+// KiriKiri / TVP pre-rendered font bypass.
+//
+// Some KRKR games map *.tft files through Layer.font.mapPrerenderedFont.
+// Those files are TVP pre-rendered glyph caches, not TrueType/OpenType fonts, so
+// GDI font replacement cannot affect text once they are mapped. Disabling the
+// script-visible mapPrerenderedFont entry makes the script's try/catch fall back
+// to normal font rendering. The file hiding path remains for loose-file builds.
+
+static volatile LONG g_krkrEngineProbe = -1;
+static volatile LONG g_krkrTraceCount = 0;
+static volatile LONG g_krkrMapPatchAttempted = 0;
+
+static const char kKrkrMapPrerenderedFontA[] = "mapPrerenderedFont";
+static const char kKrkrDisabledPrerenderedFontA[] = "sfhPrerenderedFont";
+static const wchar_t kKrkrMapPrerenderedFontW[] = L"mapPrerenderedFont";
+static const wchar_t kKrkrDisabledPrerenderedFontW[] = L"sfhPrerenderedFont";
+
+static void KrkrTraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_krkrTraceCount);
+    if (hit > 256) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][KRKR] %s", message);
+}
+
+static bool KrkrLooksLikeEngineRoot() {
+    LONG cached = InterlockedCompareExchange(&g_krkrEngineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    HMODULE mainModule = GetModuleHandleW(NULL);
+    const bool hasNativeMapMethod =
+        EngineCommon::ModuleContainsAscii(mainModule, kKrkrMapPrerenderedFontA) ||
+        EngineCommon::ModuleContainsWide(mainModule, kKrkrMapPrerenderedFontW);
+
+    const bool detected = EngineIdentityPolicy::Confirm({
+        hasNativeMapMethod, false, false, false });
+    InterlockedExchange(&g_krkrEngineProbe, detected ? 1 : 0);
+    KrkrTraceLimited(
+        "engine-probe result=%d mapPrerenderedFont=%d",
+        detected ? 1 : 0, hasNativeMapMethod ? 1 : 0);
+    return detected;
+}
+
+static bool KrkrIsPrerenderedFontPath(const std::wstring& normalizedFullPath) {
+    return EngineCommon::HasExtension(normalizedFullPath, L".tft");
+}
+
+static bool KrkrPatchBytes(BYTE* address, const BYTE* replacement, size_t len) {
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(address, len, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+
+    for (size_t i = 0; i < len; ++i) {
+        address[i] = replacement[i];
+    }
+
+    FlushInstructionCache(GetCurrentProcess(), address, len);
+    DWORD ignoredProtect = 0;
+    VirtualProtect(address, len, oldProtect, &ignoredProtect);
+    return true;
+}
+
+static DWORD KrkrPatchPatternInMainModule(const BYTE* pattern, const BYTE* replacement, size_t len) {
+    HMODULE hMain = GetModuleHandleW(NULL);
+    MODULEINFO moduleInfo = {};
+    if (!hMain || !GetModuleInformation(GetCurrentProcess(), hMain, &moduleInfo, sizeof(moduleInfo))) {
+        return 0;
+    }
+
+    BYTE* base = (BYTE*)moduleInfo.lpBaseOfDll;
+    size_t size = moduleInfo.SizeOfImage;
+    if (!base || size < len) return 0;
+
+    DWORD patched = 0;
+    for (size_t offset = 0; offset <= size - len; ++offset) {
+        BYTE* current = base + offset;
+        if (memcmp(current, pattern, len) != 0) continue;
+
+        if (KrkrPatchBytes(current, replacement, len)) {
+            ++patched;
+            offset += len - 1;
+        }
+    }
+    return patched;
+}
+
+static void KrkrPatchMapPrerenderedFontName() {
+    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts) return;
+    if (InterlockedExchange(&g_krkrMapPatchAttempted, 1) != 0) return;
+    if (!KrkrLooksLikeEngineRoot()) return;
+
+    DWORD patched = 0;
+    patched += KrkrPatchPatternInMainModule(
+        (const BYTE*)kKrkrMapPrerenderedFontA,
+        (const BYTE*)kKrkrDisabledPrerenderedFontA,
+        sizeof(kKrkrMapPrerenderedFontA) - 1);
+    patched += KrkrPatchPatternInMainModule(
+        (const BYTE*)kKrkrMapPrerenderedFontW,
+        (const BYTE*)kKrkrDisabledPrerenderedFontW,
+        sizeof(kKrkrMapPrerenderedFontW) - sizeof(wchar_t));
+
+    KrkrTraceLimited("mapPrerenderedFont registration disabled patches=%lu", patched);
+}
+
+static bool KrkrShouldHidePrerenderedFontW(const wchar_t* fileName) {
+    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts ||
+        IsPickerThread() || !fileName || !fileName[0]) {
+        return false;
+    }
+
+    std::wstring fullPath = EngineCommon::FullPath(fileName);
+    if (fullPath.empty() || !EngineCommon::IsUnderGameRoot(fullPath)) return false;
+
+    std::wstring normalized = EngineCommon::NormalizePath(fullPath);
+    if (!KrkrIsPrerenderedFontPath(normalized)) return false;
+    if (!KrkrLooksLikeEngineRoot()) return false;
+
+    KrkrTraceLimited("hide-prerendered-font request='%s'",
+        EngineCommon::WideToUtf8(fullPath).c_str());
+    return true;
+}
