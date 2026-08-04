@@ -23,6 +23,15 @@ static void AttachFontCreationHooks() {
 static void AttachRuntimeLibraryHooks() {
     DetourAttach(&(PVOID&)orgLoadLibraryW, newLoadLibraryW);
     DetourAttach(&(PVOID&)orgLoadLibraryExW, newLoadLibraryExW);
+    DetourAttach(&(PVOID&)orgGetProcAddress, newGetProcAddress);
+}
+
+static void AttachFontResourceHooks() {
+    DetourAttach(&(PVOID&)orgAddFontResourceA, newAddFontResourceA);
+    DetourAttach(&(PVOID&)orgAddFontResourceW, newAddFontResourceW);
+    DetourAttach(&(PVOID&)orgRemoveFontResourceA, newRemoveFontResourceA);
+    DetourAttach(&(PVOID&)orgRemoveFontResourceW, newRemoveFontResourceW);
+    Utils::Trace("[DEBUG][HookInstall] FontResources AddFontResourceA/W=on RemoveFontResourceA/W=on");
 }
 
 static void AttachCodepageConversionHooks() {
@@ -50,8 +59,10 @@ static void AttachEngineFileHooks() {
     DetourAttach(&(PVOID&)orgGetFileAttributesExW, newGetFileAttributesExW);
     DetourAttach(&(PVOID&)orgFindFirstFileA, newFindFirstFileA);
     DetourAttach(&(PVOID&)orgFindFirstFileW, newFindFirstFileW);
+    DetourAttach(&(PVOID&)orgFindFirstFileExA, newFindFirstFileExA);
+    DetourAttach(&(PVOID&)orgFindFirstFileExW, newFindFirstFileExW);
 
-    Utils::Trace("[DEBUG][HookInstall] EngineFileHooks CreateFileA/W=on GetFileAttributesA/W=on GetFileAttributesExA/W=on FindFirstFileA/W=on");
+    Utils::Trace("[DEBUG][HookInstall] EngineFileHooks CreateFileA/W=on GetFileAttributesA/W=on GetFileAttributesExA/W=on FindFirstFileA/W=on FindFirstFileExA/W=on");
 }
 
 static void AttachTextDrawingHooks() {
@@ -159,6 +170,7 @@ static void AttachDirectWriteHooks() {
 
 static void AttachHooksByCategory() {
     AttachFontCreationHooks();
+    AttachFontResourceHooks();
     AttachRuntimeLibraryHooks();
     AttachCodepageConversionHooks();
     AttachProfileHooks();
@@ -183,11 +195,13 @@ void Install(HMODULE hModule) {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     AttachHooksByCategory();
+    Yuris::InstallInOpenDetourTransaction();
     EntisCompat::InstallInOpenDetourTransaction();
     BgiCompat::InstallInOpenDetourTransaction();
     Unity::InstallInOpenDetourTransaction();
     UnityMono::InstallInOpenDetourTransaction();
     DetourTransactionCommit();
+    Yuris::Start();
     Unity::StartApplyThread();
     UnityMono::StartApplyThread();
     StartDirectWriteDelayedHookThread();
@@ -210,6 +224,7 @@ void PrepareForProcessExit() {
     UnityMono::StopApplyThread(true);
     Unity::StopApplyThread(true);
     RenPy::StopWorker(true);
+    Yuris::Stop(true);
     StopDirectWriteDelayedHookThread(true);
     StopFontPickerThread(true);
     Utils::ShutdownDiagnostics(false);
@@ -218,8 +233,10 @@ void PrepareForProcessExit() {
 
 void NotifyConfigChanged(LONG version) {
     MiraiNotifyConfigChanged(version);
+    CatSystem2Compat::NotifyConfigChanged(version);
     TyranoNotifyConfigChanged(version);
     RenPy::NotifyConfigChanged(version);
+    Yuris::NotifyConfigChanged(version);
     EntisCompat::NotifyConfigChanged(version);
     bool handledByLegacyArtemis = ArtemisLegacyNotifyConfigChanged(version);
     if (!handledByLegacyArtemis) {

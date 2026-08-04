@@ -274,6 +274,11 @@ HMODULE WINAPI newLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD fl) {
     return h;
 }
 
+FARPROC WINAPI newGetProcAddress(HMODULE module, LPCSTR name) {
+    FARPROC original = orgGetProcAddress(module, name);
+    return Yuris::MaybeWrapGetProcAddress(module, name, original);
+}
+
 // GDI+ hook installation.
 void InstallGdiPlusHooks() {
     if (g_GdiPlusHooksInstalled) return;

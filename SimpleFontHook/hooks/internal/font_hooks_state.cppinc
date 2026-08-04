@@ -271,9 +271,11 @@ static pIDWriteTextLayout_Draw orgIDWriteTextLayout_Draw = NULL;
 // Library hook types.
 typedef HMODULE(WINAPI* pLoadLibraryW)(LPCWSTR);
 typedef HMODULE(WINAPI* pLoadLibraryExW)(LPCWSTR, HANDLE, DWORD);
+typedef FARPROC(WINAPI* pGetProcAddress)(HMODULE, LPCSTR);
 
 static pLoadLibraryW orgLoadLibraryW = LoadLibraryW;
 static pLoadLibraryExW orgLoadLibraryExW = LoadLibraryExW;
+static pGetProcAddress orgGetProcAddress = GetProcAddress;
 
 // Codepage conversion API hook types.
 typedef int (WINAPI* pMultiByteToWideChar)(UINT, DWORD, LPCCH, int, LPWSTR, int);
@@ -302,6 +304,14 @@ typedef BOOL(WINAPI* pGetFileAttributesExA)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVO
 typedef BOOL(WINAPI* pGetFileAttributesExW)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
 typedef HANDLE(WINAPI* pFindFirstFileA)(LPCSTR, LPWIN32_FIND_DATAA);
 typedef HANDLE(WINAPI* pFindFirstFileW)(LPCWSTR, LPWIN32_FIND_DATAW);
+typedef HANDLE(WINAPI* pFindFirstFileExA)(LPCSTR, FINDEX_INFO_LEVELS, LPVOID,
+    FINDEX_SEARCH_OPS, LPVOID, DWORD);
+typedef HANDLE(WINAPI* pFindFirstFileExW)(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID,
+    FINDEX_SEARCH_OPS, LPVOID, DWORD);
+typedef int (WINAPI* pAddFontResourceA)(LPCSTR);
+typedef int (WINAPI* pAddFontResourceW)(LPCWSTR);
+typedef BOOL(WINAPI* pRemoveFontResourceA)(LPCSTR);
+typedef BOOL(WINAPI* pRemoveFontResourceW)(LPCWSTR);
 
 static pCreateFileA orgCreateFileA = CreateFileA;
 static pCreateFileW orgCreateFileW = CreateFileW;
@@ -311,6 +321,12 @@ static pGetFileAttributesExA orgGetFileAttributesExA = GetFileAttributesExA;
 static pGetFileAttributesExW orgGetFileAttributesExW = GetFileAttributesExW;
 static pFindFirstFileA orgFindFirstFileA = FindFirstFileA;
 static pFindFirstFileW orgFindFirstFileW = FindFirstFileW;
+static pFindFirstFileExA orgFindFirstFileExA = FindFirstFileExA;
+static pFindFirstFileExW orgFindFirstFileExW = FindFirstFileExW;
+static pAddFontResourceA orgAddFontResourceA = AddFontResourceA;
+static pAddFontResourceW orgAddFontResourceW = AddFontResourceW;
+static pRemoveFontResourceA orgRemoveFontResourceA = RemoveFontResourceA;
+static pRemoveFontResourceW orgRemoveFontResourceW = RemoveFontResourceW;
 
 // Forward declarations
 void InstallGdiPlusHooks();
@@ -417,6 +433,8 @@ static void TraceLogCurrentConfig(const char* prefix, LONG version) {
         Config::EnableBgiHook ? 1 : 0,
         Config::BgiPatchGdiImports ? 1 : 0,
         Config::BgiClearGlyphCacheOnSwitch ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] yuris atlasCodepage=%u (0=auto)",
+        version, Config::YurisAtlasCodepage);
     char artemisFontPath[MAX_PATH * 4] = {};
     WideCharToMultiByte(CP_UTF8, 0, Config::ArtemisFontPath, -1, artemisFontPath, sizeof(artemisFontPath), NULL, NULL);
     Utils::Trace("[TRACE][v%ld] artemis enabled=%d patchTables=%d redirectFonts=%d clearCacheOnSwitch=%d tableFontPath='%s' size=%d ruby=%d",

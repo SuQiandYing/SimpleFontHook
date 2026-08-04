@@ -6,6 +6,18 @@
 
 static volatile LONG g_codepageRedirectTraceCount = 0;
 static __declspec(thread) bool g_inCodepageRedirect = false;
+static __declspec(thread) bool g_suppressDecodedTextSubstitution = false;
+
+struct DecodedTextSubstitutionBypassScope {
+    bool previous;
+    DecodedTextSubstitutionBypassScope()
+        : previous(g_suppressDecodedTextSubstitution) {
+        g_suppressDecodedTextSubstitution = true;
+    }
+    ~DecodedTextSubstitutionBypassScope() {
+        g_suppressDecodedTextSubstitution = previous;
+    }
+};
 
 static bool CodepageRedirectIsUtfFamily(UINT codepage) {
     return codepage == CP_UTF8 || codepage == CP_UTF7 || codepage == 54936;
@@ -72,15 +84,23 @@ int WINAPI newMultiByteToWideChar(UINT CodePage, DWORD dwFlags, LPCCH lpMultiByt
     }
 
     UINT redirected = CodePage;
-    if (!ResolveRedirectCodepage(CodePage, &redirected))
-        return orgMultiByteToWideChar(CodePage, dwFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
+    bool codepageRedirected = ResolveRedirectCodepage(CodePage, &redirected);
+    DWORD useFlags = codepageRedirected ?
+        SanitizeMultiByteToWideFlags(redirected, dwFlags) : dwFlags;
+    if (codepageRedirected) {
+        TraceCodepageRedirect("MultiByteToWideChar", CodePage, redirected,
+            dwFlags, useFlags);
+    }
 
-    DWORD useFlags = SanitizeMultiByteToWideFlags(redirected, dwFlags);
-    TraceCodepageRedirect("MultiByteToWideChar", CodePage, redirected, dwFlags, useFlags);
-
-    g_inCodepageRedirect = true;
-    int ret = orgMultiByteToWideChar(redirected, useFlags, lpMultiByteStr, cbMultiByte, lpWideCharStr, cchWideChar);
-    g_inCodepageRedirect = false;
+    bool previousRedirectState = g_inCodepageRedirect;
+    if (codepageRedirected) g_inCodepageRedirect = true;
+    int ret = orgMultiByteToWideChar(redirected, useFlags, lpMultiByteStr,
+        cbMultiByte, lpWideCharStr, cchWideChar);
+    g_inCodepageRedirect = previousRedirectState;
+    if (ret > 0 && lpWideCharStr && cchWideChar > 0 &&
+        !g_suppressDecodedTextSubstitution) {
+        SubstituteDecodedTextInPlace(lpWideCharStr, ret);
+    }
     return ret;
 }
 
