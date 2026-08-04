@@ -157,6 +157,48 @@ BOOL WINAPI newGetFileAttributesExA(LPCSTR fileName,
     return orgGetFileAttributesExA(fileName, infoLevel, fileInformation);
 }
 
+static bool EngineConvertFindDataWToA(const WIN32_FIND_DATAW& source,
+    WIN32_FIND_DATAA* result) {
+    if (!result) return false;
+
+    WIN32_FIND_DATAA converted = {};
+    converted.dwFileAttributes = source.dwFileAttributes;
+    converted.ftCreationTime = source.ftCreationTime;
+    converted.ftLastAccessTime = source.ftLastAccessTime;
+    converted.ftLastWriteTime = source.ftLastWriteTime;
+    converted.nFileSizeHigh = source.nFileSizeHigh;
+    converted.nFileSizeLow = source.nFileSizeLow;
+    converted.dwReserved0 = source.dwReserved0;
+    converted.dwReserved1 = source.dwReserved1;
+    if (orgWideCharToMultiByte(CP_ACP, 0, source.cFileName, -1,
+        converted.cFileName, _countof(converted.cFileName), NULL, NULL) <= 0) {
+        return false;
+    }
+    if (source.cAlternateFileName[0] &&
+        orgWideCharToMultiByte(CP_ACP, 0, source.cAlternateFileName, -1,
+            converted.cAlternateFileName,
+            _countof(converted.cAlternateFileName), NULL, NULL) <= 0) {
+        return false;
+    }
+    *result = converted;
+    return true;
+}
+
+static HANDLE EngineTryPublishFindFirstFallbackA(const wchar_t* fileName,
+    LPWIN32_FIND_DATAA findFileData) {
+    WIN32_FIND_DATAW wideData = {};
+    HANDLE fallback = INVALID_HANDLE_VALUE;
+    if (!EngineTryFindFirstFileFallbackW(fileName, &wideData, &fallback))
+        return INVALID_HANDLE_VALUE;
+    if (!EngineConvertFindDataWToA(wideData, findFileData)) {
+        DWORD error = GetLastError();
+        FindClose(fallback);
+        SetLastError(error ? error : ERROR_NO_UNICODE_TRANSLATION);
+        return INVALID_HANDLE_VALUE;
+    }
+    return fallback;
+}
+
 HANDLE WINAPI newFindFirstFileW(LPCWSTR fileName,
     LPWIN32_FIND_DATAW findFileData) {
     if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
@@ -167,7 +209,15 @@ HANDLE WINAPI newFindFirstFileW(LPCWSTR fileName,
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    return orgFindFirstFileW(fileName, findFileData);
+    HANDLE original = orgFindFirstFileW(fileName, findFileData);
+    if (original != INVALID_HANDLE_VALUE) return original;
+
+    DWORD originalError = GetLastError();
+    HANDLE fallback = INVALID_HANDLE_VALUE;
+    if (EngineTryFindFirstFileFallbackW(fileName, findFileData, &fallback))
+        return fallback;
+    SetLastError(originalError);
+    return INVALID_HANDLE_VALUE;
 }
 
 HANDLE WINAPI newFindFirstFileA(LPCSTR fileName,
@@ -175,13 +225,80 @@ HANDLE WINAPI newFindFirstFileA(LPCSTR fileName,
     if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery())
         return orgFindFirstFileA(fileName, findFileData);
 
+    EngineFileHookGuard guard;
     std::wstring wide = EngineCommon::WideFromAnsi(fileName);
     if (!wide.empty()) {
-        EngineFileHookGuard guard;
         if (EngineShouldHideFileW(wide.c_str(), true, true)) {
             SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
         }
     }
-    return orgFindFirstFileA(fileName, findFileData);
+    HANDLE original = orgFindFirstFileA(fileName, findFileData);
+    if (original != INVALID_HANDLE_VALUE || wide.empty()) return original;
+
+    DWORD originalError = GetLastError();
+    HANDLE fallback = EngineTryPublishFindFirstFallbackA(wide.c_str(),
+        findFileData);
+    if (fallback != INVALID_HANDLE_VALUE) return fallback;
+    SetLastError(originalError);
+    return INVALID_HANDLE_VALUE;
+}
+
+HANDLE WINAPI newFindFirstFileExW(LPCWSTR fileName,
+    FINDEX_INFO_LEVELS infoLevel, LPVOID findFileData,
+    FINDEX_SEARCH_OPS searchOp, LPVOID searchFilter, DWORD additionalFlags) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery()) {
+        return orgFindFirstFileExW(fileName, infoLevel, findFileData, searchOp,
+            searchFilter, additionalFlags);
+    }
+
+    EngineFileHookGuard guard;
+    if (EngineShouldHideFileW(fileName, true, true)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE original = orgFindFirstFileExW(fileName, infoLevel, findFileData,
+        searchOp, searchFilter, additionalFlags);
+    if (original != INVALID_HANDLE_VALUE) return original;
+
+    DWORD originalError = GetLastError();
+    if ((infoLevel == FindExInfoStandard || infoLevel == FindExInfoBasic) &&
+        searchOp == FindExSearchNameMatch && findFileData) {
+        HANDLE fallback = INVALID_HANDLE_VALUE;
+        if (EngineTryFindFirstFileFallbackW(fileName,
+            static_cast<WIN32_FIND_DATAW*>(findFileData), &fallback)) {
+            return fallback;
+        }
+    }
+    SetLastError(originalError);
+    return INVALID_HANDLE_VALUE;
+}
+
+HANDLE WINAPI newFindFirstFileExA(LPCSTR fileName,
+    FINDEX_INFO_LEVELS infoLevel, LPVOID findFileData,
+    FINDEX_SEARCH_OPS searchOp, LPVOID searchFilter, DWORD additionalFlags) {
+    if (g_inEngineFileHook || EngineCommon::IsInternalFileQuery()) {
+        return orgFindFirstFileExA(fileName, infoLevel, findFileData, searchOp,
+            searchFilter, additionalFlags);
+    }
+
+    EngineFileHookGuard guard;
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    if (!wide.empty() && EngineShouldHideFileW(wide.c_str(), true, true)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    HANDLE original = orgFindFirstFileExA(fileName, infoLevel, findFileData,
+        searchOp, searchFilter, additionalFlags);
+    if (original != INVALID_HANDLE_VALUE || wide.empty()) return original;
+
+    DWORD originalError = GetLastError();
+    if ((infoLevel == FindExInfoStandard || infoLevel == FindExInfoBasic) &&
+        searchOp == FindExSearchNameMatch && findFileData) {
+        HANDLE fallback = EngineTryPublishFindFirstFallbackA(wide.c_str(),
+            static_cast<WIN32_FIND_DATAA*>(findFileData));
+        if (fallback != INVALID_HANDLE_VALUE) return fallback;
+    }
+    SetLastError(originalError);
+    return INVALID_HANDLE_VALUE;
 }

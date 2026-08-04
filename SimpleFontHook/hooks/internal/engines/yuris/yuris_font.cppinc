@@ -1,0 +1,6 @@
+// YU-RIS bitmap-font virtualization aggregate.
+#include "yuris_state.cppinc"
+#include "yuris_profiles.cppinc"
+#include "yuris_catalog.cppinc"
+#include "yuris_renderer.cppinc"
+#include "yuris_runtime.cppinc"

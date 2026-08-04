@@ -1,0 +1,674 @@
+namespace Yuris {
+namespace {
+
+struct PendingPngDecode {
+    int catalogIndex;
+    int width;
+    int height;
+};
+
+struct PendingYdgOutput {
+    BYTE* pixels;
+    int width;
+    int height;
+};
+
+struct PendingYdgCandidate {
+    int catalogIndex;
+    std::vector<PendingYdgOutput> outputs;
+    std::vector<BYTE> received;
+};
+
+struct PendingYdgAtlas {
+    BYTE* base;
+    unsigned __int64 useSerial;
+    std::vector<PendingYdgCandidate> candidates;
+};
+
+struct MatchedYdgSection {
+    BYTE* base;
+    int catalogIndex;
+    size_t sectionIndex;
+};
+
+constexpr size_t kPendingYdgAtlasLimit = 16;
+
+struct CompletedYdgAtlas {
+    int catalogIndex;
+    std::vector<PendingYdgOutput> outputs;
+};
+
+struct PendingYdgUpdateResult {
+    size_t candidateCount;
+    CompletedYdgAtlas completed;
+};
+
+static thread_local PendingPngDecode g_pendingPngDecode = { -1, 0, 0 };
+static std::mutex g_pendingYdgMutex;
+static std::vector<PendingYdgAtlas> g_pendingYdgAtlases;
+static unsigned __int64 g_pendingYdgUseSerial = 0;
+static volatile LONG g_reliriumDebugQoiCount = 0;
+static volatile LONG g_reliriumDebugMatchCount = 0;
+
+static DecodeWebp OriginalDecodeWebp() {
+    return reinterpret_cast<DecodeWebp>(InterlockedCompareExchangePointer(
+        &g_originalDecodeWebp, NULL, NULL));
+}
+
+static OpenPng OriginalOpenPng() {
+    return reinterpret_cast<OpenPng>(InterlockedCompareExchangePointer(
+        &g_originalOpenPng, NULL, NULL));
+}
+
+static DecodePng OriginalDecodePng() {
+    return reinterpret_cast<DecodePng>(InterlockedCompareExchangePointer(
+        &g_originalDecodePng, NULL, NULL));
+}
+
+static bool MeasurePngPayload(const void* source, int sourceCapacity,
+    DWORD* payloadSize) {
+    static const BYTE signature[] = {
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    if (!source || sourceCapacity < static_cast<int>(sizeof(signature)) ||
+        !payloadSize) {
+        return false;
+    }
+    const BYTE* bytes = static_cast<const BYTE*>(source);
+    size_t capacity = static_cast<size_t>(sourceCapacity);
+    if (memcmp(bytes, signature, sizeof(signature)) != 0) return false;
+
+    size_t cursor = sizeof(signature);
+    while (cursor <= capacity && capacity - cursor >= 12) {
+        DWORD chunkDataSize =
+            (static_cast<DWORD>(bytes[cursor]) << 24) |
+            (static_cast<DWORD>(bytes[cursor + 1]) << 16) |
+            (static_cast<DWORD>(bytes[cursor + 2]) << 8) |
+            static_cast<DWORD>(bytes[cursor + 3]);
+        size_t chunkSize = static_cast<size_t>(chunkDataSize) + 12;
+        if (chunkSize > capacity - cursor) return false;
+        bool isEnd = memcmp(bytes + cursor + 4, "IEND", 4) == 0;
+        cursor += chunkSize;
+        if (!isEnd) continue;
+        if (chunkDataSize != 0 || cursor > MAXDWORD) return false;
+        *payloadSize = static_cast<DWORD>(cursor);
+        return true;
+    }
+    return false;
+}
+
+static int WINAPI DecodeWebpHook(const void* compressedBytes, void* output,
+    int compressedSize, int width, int height) {
+    DecodeWebp original = OriginalDecodeWebp();
+    if (!original) return -1;
+    if (!Config::EnableFontHook || !output || compressedSize <= 0) {
+        return original(compressedBytes, output, compressedSize, width, height);
+    }
+
+    int catalogIndex = FindCatalogEntry(compressedBytes,
+        static_cast<DWORD>(compressedSize));
+    if (catalogIndex < 0 ||
+        !g_archiveProfile ||
+        g_archiveProfile->decoderKind != AtlasDecoderKind::WebpOrdinal3) {
+        return original(compressedBytes, output, compressedSize, width, height);
+    }
+    const CatalogEntry& entry = g_catalog[catalogIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    if (!atlasSet || width != atlasSet->profile->layout.width ||
+        height != atlasSet->profile->layout.height) {
+        return original(compressedBytes, output, compressedSize, width, height);
+    }
+
+    EnsureInitialized();
+    if (!RenderCatalogEntry(catalogIndex, output)) {
+        return original(compressedBytes, output, compressedSize, width, height);
+    }
+
+    LONG trace = InterlockedIncrement(&g_decodeTraceCount);
+    if (trace <= 16) {
+        Utils::Trace("[Yuris] WebP substituted version=%ld set='%s' page=%d style=0x%02X bytes=%d",
+            Config::ConfigVersion, atlasSet->profile->name,
+            entry.page, entry.style, compressedSize);
+    }
+    return 0;
+}
+
+static int WINAPI OpenPngHook(int sourceCapacity, const void* compressedBytes,
+    int* width, int* height, BYTE* format) {
+    OpenPng original = OriginalOpenPng();
+    if (!original) return -1;
+    g_pendingPngDecode = { -1, 0, 0 };
+    int result = original(sourceCapacity, compressedBytes, width, height, format);
+    DWORD payloadSize = 0;
+    bool canMatch = result == 0 && Config::EnableFontHook && width && height &&
+        MeasurePngPayload(compressedBytes, sourceCapacity, &payloadSize);
+    int catalogIndex = canMatch
+        ? FindCatalogEntry(compressedBytes, payloadSize)
+        : -1;
+    if (!canMatch || result != 0 || catalogIndex < 0 || !g_archiveProfile ||
+        g_archiveProfile->decoderKind != AtlasDecoderKind::PngOrdinals1And2) {
+        return result;
+    }
+    const CatalogEntry& entry = g_catalog[catalogIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    if (!atlasSet || *width != atlasSet->profile->layout.width ||
+        *height != atlasSet->profile->layout.height) {
+        return result;
+    }
+
+    g_pendingPngDecode = { catalogIndex, *width, *height };
+    return result;
+}
+
+static int WINAPI DecodePngHook(void* output, int rowCount, int rowStride) {
+    DecodePng original = OriginalDecodePng();
+    if (!original) return -1;
+    int result = original(output, rowCount, rowStride);
+
+    PendingPngDecode pending = g_pendingPngDecode;
+    g_pendingPngDecode = { -1, 0, 0 };
+    if (result != 0 || !Config::EnableFontHook || !output ||
+        pending.catalogIndex < 0 ||
+        static_cast<size_t>(pending.catalogIndex) >= g_catalog.size()) {
+        return result;
+    }
+
+    const CatalogEntry& entry = g_catalog[pending.catalogIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    if (!atlasSet) return result;
+    const AtlasLayout& layout = atlasSet->profile->layout;
+    int packedStride = layout.width * 4;
+    if (pending.width != layout.width || pending.height != layout.height ||
+        rowCount != layout.height || rowStride < packedStride) {
+        return result;
+    }
+
+    EnsureInitialized();
+    bool rendered = false;
+    if (rowStride == packedStride) {
+        rendered = RenderCatalogEntry(pending.catalogIndex, output);
+    } else {
+        std::vector<BYTE> pixels(DecodedAtlasBytes(*atlasSet->profile));
+        rendered = RenderCatalogEntry(pending.catalogIndex, pixels.data());
+        if (rendered) {
+            BYTE* destination = static_cast<BYTE*>(output);
+            for (int row = 0; row < layout.height; ++row) {
+                memcpy(destination + static_cast<size_t>(row) * rowStride,
+                    pixels.data() + static_cast<size_t>(row) * packedStride,
+                    packedStride);
+            }
+        }
+    }
+
+    if (rendered) {
+        LONG trace = InterlockedIncrement(&g_decodeTraceCount);
+        if (trace <= 16) {
+            Utils::Trace("[Yuris] PNG substituted version=%ld set='%s' page=%d rows=%d stride=%d",
+                Config::ConfigVersion, atlasSet->profile->name,
+                entry.page, rowCount, rowStride);
+        }
+    }
+    return result;
+}
+
+static bool CatalogSectionMatches(int catalogIndex, size_t sectionIndex,
+    unsigned __int64 fingerprint, DWORD compressedSize,
+    int width, int height) {
+    if (catalogIndex < 0 ||
+        static_cast<size_t>(catalogIndex) >= g_catalog.size()) {
+        return false;
+    }
+    const CatalogEntry& entry = g_catalog[catalogIndex];
+    if (sectionIndex >= entry.sections.size()) return false;
+    const CatalogEntry::Section& section = entry.sections[sectionIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    return atlasSet && width == atlasSet->profile->layout.width &&
+        height == section.sourceHeight &&
+        compressedSize == section.compressedSize &&
+        fingerprint == section.fingerprint;
+}
+
+static bool ApplyDecodedYdgAtlas(int catalogIndex,
+    const std::vector<PendingYdgOutput>& outputs) {
+    if (catalogIndex < 0 ||
+        static_cast<size_t>(catalogIndex) >= g_catalog.size()) {
+        return false;
+    }
+    const CatalogEntry& entry = g_catalog[catalogIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    if (!atlasSet || entry.sections.size() != outputs.size()) {
+        return false;
+    }
+    const AtlasLayout& layout = atlasSet->profile->layout;
+    std::vector<BYTE> pixels(DecodedAtlasBytes(*atlasSet->profile));
+    EnsureInitialized();
+    if (!RenderCatalogEntry(catalogIndex, pixels.data())) return false;
+
+    size_t rowBytes = static_cast<size_t>(layout.width) * 4;
+    for (size_t index = 0; index < entry.sections.size(); ++index) {
+        const CatalogEntry::Section& section = entry.sections[index];
+        const PendingYdgOutput& output = outputs[index];
+        if (!output.pixels || output.width != layout.width ||
+            output.height != section.sourceHeight || section.sourceRow < 0 ||
+            section.sourceHeight <= 0 ||
+            section.sourceRow > layout.height - section.sourceHeight) {
+            return false;
+        }
+        memcpy(output.pixels,
+            pixels.data() + static_cast<size_t>(section.sourceRow) * rowBytes,
+            static_cast<size_t>(section.sourceHeight) * rowBytes);
+    }
+
+    LONG trace = InterlockedIncrement(&g_decodeTraceCount);
+    if (trace <= 16) {
+        Utils::Trace("[Yuris] YDG atlas substituted version=%ld set='%s' page=%d style=0x%02X sections=%lu",
+            Config::ConfigVersion, atlasSet->profile->name,
+            entry.page, entry.style,
+            static_cast<unsigned long>(entry.sections.size()));
+    }
+    return true;
+}
+
+static void ClearPendingYdgAtlases() {
+    std::lock_guard<std::mutex> lock(g_pendingYdgMutex);
+    g_pendingYdgAtlases.clear();
+}
+
+static void AddPendingYdgCandidate(PendingYdgAtlas* pending,
+    const MatchedYdgSection& match, BYTE* output, int width, int height) {
+    if (!pending || match.catalogIndex < 0 ||
+        static_cast<size_t>(match.catalogIndex) >= g_catalog.size()) {
+        return;
+    }
+    auto candidate = std::find_if(pending->candidates.begin(),
+        pending->candidates.end(), [&](const PendingYdgCandidate& value) {
+            return value.catalogIndex == match.catalogIndex;
+        });
+    if (candidate == pending->candidates.end()) {
+        PendingYdgCandidate value = {};
+        value.catalogIndex = match.catalogIndex;
+        size_t sectionCount = g_catalog[match.catalogIndex].sections.size();
+        value.outputs.resize(sectionCount);
+        value.received.resize(sectionCount, 0);
+        pending->candidates.push_back(std::move(value));
+        candidate = pending->candidates.end() - 1;
+    }
+    if (match.sectionIndex >= candidate->outputs.size()) return;
+    candidate->outputs[match.sectionIndex] = { output, width, height };
+    candidate->received[match.sectionIndex] = 1;
+}
+
+static bool IsPendingYdgCandidateComplete(
+    const PendingYdgCandidate& candidate) {
+    return !candidate.received.empty() && std::find(
+        candidate.received.begin(), candidate.received.end(),
+        static_cast<BYTE>(0)) == candidate.received.end();
+}
+
+static PendingYdgUpdateResult UpdatePendingYdgAtlas(BYTE* base,
+    const std::vector<MatchedYdgSection>& matches, BYTE* output,
+    int width, int height) {
+    PendingYdgUpdateResult result = {};
+    result.completed.catalogIndex = -1;
+    std::lock_guard<std::mutex> lock(g_pendingYdgMutex);
+
+    auto pending = std::find_if(g_pendingYdgAtlases.begin(),
+        g_pendingYdgAtlases.end(), [&](const PendingYdgAtlas& value) {
+            return value.base == base;
+        });
+    if (pending != g_pendingYdgAtlases.end()) {
+        std::vector<PendingYdgCandidate> survivors;
+        survivors.reserve(pending->candidates.size());
+        for (PendingYdgCandidate& candidate : pending->candidates) {
+            bool matched = false;
+            for (const MatchedYdgSection& match : matches) {
+                if (match.catalogIndex != candidate.catalogIndex ||
+                    match.sectionIndex >= candidate.outputs.size()) {
+                    continue;
+                }
+                candidate.outputs[match.sectionIndex] = {
+                    output, width, height,
+                };
+                candidate.received[match.sectionIndex] = 1;
+                matched = true;
+            }
+            if (matched) survivors.push_back(std::move(candidate));
+        }
+        pending->candidates.swap(survivors);
+        if (pending->candidates.empty()) {
+            for (const MatchedYdgSection& match : matches) {
+                AddPendingYdgCandidate(&*pending, match,
+                    output, width, height);
+            }
+        }
+    } else {
+        PendingYdgAtlas value = {};
+        value.base = base;
+        g_pendingYdgAtlases.push_back(std::move(value));
+        pending = g_pendingYdgAtlases.end() - 1;
+        for (const MatchedYdgSection& match : matches) {
+            AddPendingYdgCandidate(&*pending, match, output, width, height);
+        }
+    }
+
+    pending->useSerial = ++g_pendingYdgUseSerial;
+    result.candidateCount = pending->candidates.size();
+    size_t completedCount = 0;
+    for (const PendingYdgCandidate& candidate : pending->candidates) {
+        if (!IsPendingYdgCandidateComplete(candidate)) continue;
+        ++completedCount;
+        result.completed.catalogIndex = candidate.catalogIndex;
+        result.completed.outputs = candidate.outputs;
+    }
+    if (completedCount != 1) result.completed.catalogIndex = -1;
+    if (completedCount != 0) g_pendingYdgAtlases.erase(pending);
+
+    while (g_pendingYdgAtlases.size() > kPendingYdgAtlasLimit) {
+        auto oldest = std::min_element(g_pendingYdgAtlases.begin(),
+            g_pendingYdgAtlases.end(),
+            [](const PendingYdgAtlas& left, const PendingYdgAtlas& right) {
+                return left.useSerial < right.useSerial;
+            });
+        g_pendingYdgAtlases.erase(oldest);
+    }
+    return result;
+}
+
+static void ProcessDecodedYdgSection(const BYTE* compressedBytes,
+    DWORD compressedSize, BYTE* output, int width, int height) {
+    if (!compressedBytes || compressedSize == 0 || !output ||
+        width <= 0 || height <= 0 || !WaitForCatalog() ||
+        !g_archiveProfile || g_archiveProfile->decoderKind !=
+            AtlasDecoderKind::MainModuleYdgSections) {
+        return;
+    }
+
+    unsigned __int64 fingerprint = HashBytes(compressedBytes, compressedSize);
+    std::vector<MatchedYdgSection> matches;
+    auto range = g_ydgBySectionSize.equal_range(compressedSize);
+    for (auto iterator = range.first; iterator != range.second; ++iterator) {
+        const YdgCatalogSectionRef& reference = iterator->second;
+        if (!CatalogSectionMatches(reference.catalogIndex,
+            reference.sectionIndex, fingerprint, compressedSize,
+            width, height)) continue;
+        const CatalogEntry& entry = g_catalog[reference.catalogIndex];
+        const CatalogEntry::Section& section =
+            entry.sections[reference.sectionIndex];
+        size_t outputOffset = static_cast<size_t>(section.sourceRow) *
+            static_cast<size_t>(width) * 4;
+        ULONG_PTR outputAddress = reinterpret_cast<ULONG_PTR>(output);
+        if (outputAddress < outputOffset) continue;
+        MatchedYdgSection match = {
+            reinterpret_cast<BYTE*>(outputAddress - outputOffset),
+            reference.catalogIndex,
+            reference.sectionIndex,
+        };
+        matches.push_back(match);
+    }
+    LONG debugTrace = InterlockedIncrement(&g_reliriumDebugMatchCount);
+    if (debugTrace <= 64) {
+        Utils::Trace("[DEBUG-yuris-relirium] section-match size=%lu dimensions=%dx%d matches=%lu",
+            compressedSize, width, height,
+            static_cast<unsigned long>(matches.size()));
+    }
+    if (matches.empty()) return;
+
+    for (size_t matchIndex = 0; matchIndex < matches.size(); ++matchIndex) {
+        BYTE* base = matches[matchIndex].base;
+        bool alreadyProcessed = false;
+        for (size_t previous = 0; previous < matchIndex; ++previous) {
+            if (matches[previous].base == base) {
+                alreadyProcessed = true;
+                break;
+            }
+        }
+        if (alreadyProcessed) continue;
+
+        std::vector<MatchedYdgSection> baseMatches;
+        for (const MatchedYdgSection& match : matches) {
+            if (match.base == base) baseMatches.push_back(match);
+        }
+        PendingYdgUpdateResult update = UpdatePendingYdgAtlas(base,
+            baseMatches, output, width, height);
+        if (update.completed.catalogIndex >= 0 &&
+            ApplyDecodedYdgAtlas(update.completed.catalogIndex,
+                update.completed.outputs)) {
+            return;
+        }
+    }
+}
+
+#if defined(_M_IX86)
+__declspec(noinline) static int InvokeOriginalDecodeYdgQoi(
+    const BYTE* compressedBytes, DWORD compressedSize, BYTE* output,
+    int* width, int* height) {
+    int result = -1;
+    __asm {
+        push ebx
+        sub esp, 14h
+        mov ebx, width
+        mov dword ptr [esp + 0Ch], ebx
+        mov ebx, height
+        mov dword ptr [esp + 10h], ebx
+        mov edx, compressedBytes
+        mov ecx, compressedSize
+        mov eax, output
+        call dword ptr [g_originalDecodeYdgQoi]
+        mov result, eax
+        add esp, 14h
+        pop ebx
+    }
+    return result;
+}
+
+static int __cdecl DecodeYdgQoiBridge(const BYTE* compressedBytes,
+    DWORD compressedSize, BYTE* output, int* widthOut, int* heightOut) {
+    int width = 0, height = 0;
+    int result = InvokeOriginalDecodeYdgQoi(compressedBytes, compressedSize,
+        output, widthOut, heightOut);
+    if (widthOut) width = *widthOut;
+    if (heightOut) height = *heightOut;
+    LONG debugTrace = InterlockedIncrement(&g_reliriumDebugQoiCount);
+    if (debugTrace <= 64) {
+        Utils::Trace("[DEBUG-yuris-relirium] qoi-core result=%d size=%lu dimensions=%dx%d source=%p output=%p",
+            result, compressedSize, width, height, compressedBytes, output);
+    }
+    if (result == 0 && Config::EnableFontHook && compressedBytes && output &&
+        g_installedMainModuleDecoder) {
+        ProcessDecodedYdgSection(compressedBytes, compressedSize,
+            output, width, height);
+    }
+    return result;
+}
+
+// Relirium passes output in EAX, source in EDX, size in ECX, and places the
+// width/height output pointers in nonstandard caller stack slots.
+static void __declspec(naked) DecodeYdgQoiHook() {
+    __asm {
+        push ebp
+        mov ebp, esp
+        push dword ptr [ebp + 18h]
+        push dword ptr [ebp + 14h]
+        push eax
+        push ecx
+        push edx
+        call DecodeYdgQoiBridge
+        add esp, 14h
+        mov esp, ebp
+        pop ebp
+        ret
+    }
+}
+#endif
+
+static BYTE* FindUniqueMainModuleSignature(
+    const MainModuleDecoderProfile& profile) {
+#if !defined(_M_IX86)
+    (void)profile;
+    return NULL;
+#else
+    if (!profile.signature || profile.signatureSize < 5) return NULL;
+    BYTE* imageBase = reinterpret_cast<BYTE*>(GetModuleHandleW(NULL));
+    if (!imageBase) return NULL;
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(imageBase);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+        return NULL;
+    IMAGE_NT_HEADERS32* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(
+        imageBase + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
+        return NULL;
+    }
+    BYTE* imageEnd = imageBase + nt->OptionalHeader.SizeOfImage;
+    BYTE* match = NULL;
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD sectionIndex = 0;
+        sectionIndex < nt->FileHeader.NumberOfSections; ++sectionIndex) {
+        const IMAGE_SECTION_HEADER& section = sections[sectionIndex];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        BYTE* begin = imageBase + section.VirtualAddress;
+        size_t sectionSize = section.Misc.VirtualSize != 0
+            ? section.Misc.VirtualSize : section.SizeOfRawData;
+        if (begin < imageBase || begin >= imageEnd ||
+            sectionSize > static_cast<size_t>(imageEnd - begin)) {
+            continue;
+        }
+        BYTE* end = begin + sectionSize;
+        if (sectionSize < profile.signatureSize) continue;
+        for (BYTE* cursor = begin;
+            cursor <= end - profile.signatureSize; ++cursor) {
+            if (memcmp(cursor, profile.signature,
+                profile.signatureSize) != 0) {
+                continue;
+            }
+            if (match) return NULL;
+            match = cursor;
+        }
+    }
+    return match;
+#endif
+}
+
+static bool IsNamedModule(HMODULE module, const wchar_t* expectedName) {
+    if (!module || !expectedName) return false;
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(module, path, _countof(path))) return false;
+    return _wcsicmp(PathFindFileNameW(path), expectedName) == 0;
+}
+
+struct RefreshWindowContext {
+    DWORD processId;
+};
+
+static BOOL CALLBACK RefreshWindow(HWND window, LPARAM parameter) {
+    RefreshWindowContext* context =
+        reinterpret_cast<RefreshWindowContext*>(parameter);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(window, &processId);
+    if (!context || processId != context->processId) return TRUE;
+    PostMessageW(window, WM_FONTCHANGE, 0, 0);
+    InvalidateRect(window, NULL, FALSE);
+    PostMessageW(window, WM_PAINT, 0, 0);
+    return TRUE;
+}
+
+} // namespace
+
+static void InstallInOpenDetourTransaction() {
+#if defined(_M_IX86)
+    if (!IsIdentityConfirmed() || g_originalDecodeYdgQoi) return;
+    for (const ArchiveProfile& archive : kArchiveProfiles) {
+        if (archive.decoderKind != AtlasDecoderKind::MainModuleYdgSections ||
+            !archive.mainModuleDecoder) {
+            continue;
+        }
+        BYTE* entry = FindUniqueMainModuleSignature(
+            *archive.mainModuleDecoder);
+        if (!entry) {
+            Utils::Trace("[Yuris] main-module decoder signature unavailable profile='%s'",
+                archive.mainModuleDecoder->name);
+            continue;
+        }
+        g_originalDecodeYdgQoi = entry;
+        g_installedMainModuleDecoder = archive.mainModuleDecoder;
+        LONG error = DetourAttach(
+            &g_originalDecodeYdgQoi, DecodeYdgQoiHook);
+        if (error != NO_ERROR) {
+            Utils::Trace("[Yuris] main-module decoder hook failed profile='%s' error=%ld",
+                archive.mainModuleDecoder->name, error);
+            g_originalDecodeYdgQoi = NULL;
+            g_installedMainModuleDecoder = NULL;
+            continue;
+        }
+        Utils::Trace("[Yuris] main-module QOI core wrapped profile='%s' entry=%p replacement=%p",
+            archive.mainModuleDecoder->name, entry, DecodeYdgQoiHook);
+        break;
+    }
+#endif
+}
+
+static FARPROC MaybeWrapGetProcAddress(HMODULE module, LPCSTR name,
+    FARPROC original) {
+    if (!original || !name || (reinterpret_cast<ULONG_PTR>(name) >> 16) != 0 ||
+        !IsIdentityConfirmed()) {
+        return original;
+    }
+    WORD ordinal = LOWORD(reinterpret_cast<ULONG_PTR>(name));
+
+    if (ordinal == 3 && IsNamedModule(module, L"YSWBP.DLL")) {
+        InterlockedCompareExchangePointer(&g_originalDecodeWebp,
+            reinterpret_cast<PVOID>(original), NULL);
+        if (InterlockedCompareExchange(&g_decoderWrapTraceCount, 1, 0) == 0) {
+            Utils::Trace("[Yuris] wrapped YSWBP ordinal=3 original=%p replacement=%p",
+                original, DecodeWebpHook);
+        }
+        return reinterpret_cast<FARPROC>(DecodeWebpHook);
+    }
+
+    if (ordinal == 1 && IsNamedModule(module, L"YSPNG.DLL")) {
+        InterlockedCompareExchangePointer(&g_originalOpenPng,
+            reinterpret_cast<PVOID>(original), NULL);
+        if (InterlockedCompareExchange(&g_pngOpenWrapTraceCount, 1, 0) == 0) {
+            Utils::Trace("[Yuris] wrapped YSPNG ordinal=1 original=%p replacement=%p",
+                original, OpenPngHook);
+        }
+        return reinterpret_cast<FARPROC>(OpenPngHook);
+    }
+
+    if (ordinal == 2 && IsNamedModule(module, L"YSPNG.DLL")) {
+        InterlockedCompareExchangePointer(&g_originalDecodePng,
+            reinterpret_cast<PVOID>(original), NULL);
+        if (InterlockedCompareExchange(&g_pngDecodeWrapTraceCount, 1, 0) == 0) {
+            Utils::Trace("[Yuris] wrapped YSPNG ordinal=2 original=%p replacement=%p",
+                original, DecodePngHook);
+        }
+        return reinterpret_cast<FARPROC>(DecodePngHook);
+    }
+    return original;
+}
+
+static void Start() {
+    StartCatalogWorker();
+}
+
+static void Stop(bool waitForExit) {
+    StopCatalogWorker(waitForExit);
+    ClearPendingYdgAtlases();
+    ClearRenderCache();
+}
+
+static void NotifyConfigChanged(LONG version) {
+    if (InterlockedExchange(&g_lastNotifyVersion, version) == version) return;
+    ClearPendingYdgAtlases();
+    ClearRenderCache();
+    if (InterlockedCompareExchange(&g_catalogState, 0, 0) != 2) return;
+
+    RefreshWindowContext context = { GetCurrentProcessId() };
+    EnumWindows(RefreshWindow, reinterpret_cast<LPARAM>(&context));
+    Utils::Trace("[Yuris] config refresh version=%ld face='%s' atlas-codepage=%u renderCache=cleared",
+        version, EngineCommon::WideToUtf8(Config::SourceFontNameW).c_str(),
+        Config::YurisAtlasCodepage);
+}
+
+} // namespace Yuris

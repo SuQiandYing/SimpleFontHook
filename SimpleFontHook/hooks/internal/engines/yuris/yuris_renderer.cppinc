@@ -1,0 +1,794 @@
+namespace Yuris {
+namespace {
+
+static BYTE Gray8ToAlpha(BYTE value) {
+    if (value >= 64) return 255;
+    return static_cast<BYTE>((static_cast<unsigned>(value) * 255 + 32) / 64);
+}
+
+static const AtlasSetState* AtlasSetForEntry(const CatalogEntry& entry) {
+    if (entry.atlasSetIndex < 0 ||
+        static_cast<size_t>(entry.atlasSetIndex) >= g_atlasSets.size()) {
+        return NULL;
+    }
+    const AtlasSetState& atlasSet = g_atlasSets[entry.atlasSetIndex];
+    return atlasSet.profile && !atlasSet.characterMaps.empty()
+        ? &atlasSet : NULL;
+}
+
+static const AtlasCharacterMapState* CharacterMapForAtlasSet(
+    const AtlasSetState& atlasSet) {
+    UINT requestedCodepage = Config::YurisAtlasCodepage != 0
+        ? Config::YurisAtlasCodepage : atlasSet.automaticCodepage;
+    for (const AtlasCharacterMapState& characterMap : atlasSet.characterMaps) {
+        if (characterMap.codepage == requestedCodepage) return &characterMap;
+    }
+    return NULL;
+}
+
+static bool IsLowerLeftPunctuation(UINT32 glyph) {
+    switch (glyph) {
+    case 0xFF0C:
+    case 0x3001:
+    case 0x3002:
+    case 0xFF0E:
+    case 0xFF1B:
+    case 0xFF1A:
+    case 0xFF01:
+    case 0xFF1F:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsToolLeftEdgeGlyph(UINT32 glyph) {
+    switch (glyph) {
+    case 0x201C:
+    case 0x201D:
+    case 0x2018:
+    case 0x2019:
+    case 0x0027:
+    case 0x0022:
+    case 0x00B0:
+    case 0x2032:
+    case 0x2033:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsBig5LeftEdgeGlyph(UINT32 glyph) {
+    return glyph == 0x3001 || glyph == 0x3002 || glyph == 0x00B7 ||
+        IsToolLeftEdgeGlyph(glyph);
+}
+
+static bool IsBig5HalfCellGlyph(UINT32 glyph) {
+    return (glyph >= 0xFE50 && glyph <= 0xFE6B) ||
+        (glyph >= 0xFF61 && glyph <= 0xFF65);
+}
+
+static bool IsBig5BearingPunctuation(UINT32 glyph) {
+    switch (glyph) {
+    case 0x00AB:
+    case 0x00BB:
+    case 0x2039:
+    case 0x203A:
+    case 0x3008:
+    case 0x3009:
+    case 0x300A:
+    case 0x300B:
+    case 0x3010:
+    case 0x3011:
+    case 0x3014:
+    case 0x3015:
+    case 0x3016:
+    case 0x3017:
+    case 0x3018:
+    case 0x3019:
+    case 0x301A:
+    case 0x301B:
+    case 0x301D:
+    case 0x301E:
+    case 0x301F:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool Big5CenterPermille(UINT32 glyph, int* centerPermille) {
+    if (!centerPermille) return false;
+    switch (glyph) {
+    case 0x300C:
+    case 0x300E:
+        *centerPermille = 575;
+        return true;
+    case 0x300D:
+    case 0x300F:
+        *centerPermille = 310;
+        return true;
+    case 0xFF09:
+        *centerPermille = 375;
+        return true;
+    case 0xFF3B:
+    case 0xFF5B:
+    case 0xFF5F:
+        *centerPermille = 450;
+        return true;
+    case 0xFF3D:
+    case 0xFF5D:
+    case 0xFF60:
+        *centerPermille = 425;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int CenterGlyphAtPermille(int glyphBoxX, int glyphBoxWidth,
+    int glyphWidth, int centerPermille) {
+    int destination = glyphBoxX +
+        (glyphBoxWidth * centerPermille + 500) / 1000 - glyphWidth / 2;
+    int maximum = glyphBoxX + std::max(0, glyphBoxWidth - glyphWidth);
+    return std::max(glyphBoxX, std::min(maximum, destination));
+}
+
+static bool IsToolBottomGlyph(UINT32 glyph,
+    AtlasGlyphPlacement placement) {
+    return placement == AtlasGlyphPlacement::ReliriumOpticalCell &&
+        (glyph == 0x2026 || glyph == 0x22EF);
+}
+
+static bool IsToolOpticalCenterGlyph(UINT32 glyph,
+    AtlasGlyphPlacement placement) {
+    if (placement == AtlasGlyphPlacement::Big5OpticalCell &&
+        (glyph == 0x2026 || glyph == 0x22EF)) {
+        return true;
+    }
+    switch (glyph) {
+    case 0x2025:
+    case 0x30FB:
+    case 0x00B7:
+    case 0x2022:
+    case 0xFF65:
+    case 0x2027:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int ToolOpticalCenterOffsetY(AtlasGlyphPlacement placement) {
+    if (placement == AtlasGlyphPlacement::Big5OpticalCell) return 0;
+    return FontToPicPreset::OpticalCenterOffsetY;
+}
+
+static bool IsOpeningPairedPunctuation(UINT32 glyph) {
+    switch (glyph) {
+    case 0x00AB: // LEFT-POINTING DOUBLE ANGLE QUOTATION MARK
+    case 0x2018: // LEFT SINGLE QUOTATION MARK
+    case 0x201C: // LEFT DOUBLE QUOTATION MARK
+    case 0x2039: // SINGLE LEFT-POINTING ANGLE QUOTATION MARK
+    case 0x3008: // LEFT ANGLE BRACKET
+    case 0x300A: // LEFT DOUBLE ANGLE BRACKET
+    case 0x300C: // LEFT CORNER BRACKET
+    case 0x300E: // LEFT WHITE CORNER BRACKET
+    case 0x3010: // LEFT BLACK LENTICULAR BRACKET
+    case 0x3014: // LEFT TORTOISE SHELL BRACKET
+    case 0x3016: // LEFT WHITE LENTICULAR BRACKET
+    case 0x3018: // LEFT WHITE TORTOISE SHELL BRACKET
+    case 0x301A: // LEFT WHITE SQUARE BRACKET
+    case 0x301D: // REVERSED DOUBLE PRIME QUOTATION MARK
+    case 0xFF08: // FULLWIDTH LEFT PARENTHESIS
+    case 0xFF3B: // FULLWIDTH LEFT SQUARE BRACKET
+    case 0xFF5B: // FULLWIDTH LEFT CURLY BRACKET
+    case 0xFF5F: // FULLWIDTH LEFT WHITE PARENTHESIS
+    case 0xFF62: // HALFWIDTH LEFT CORNER BRACKET
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsClosingPairedPunctuation(UINT32 glyph) {
+    switch (glyph) {
+    case 0x00BB: // RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK
+    case 0x2019: // RIGHT SINGLE QUOTATION MARK
+    case 0x201D: // RIGHT DOUBLE QUOTATION MARK
+    case 0x203A: // SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+    case 0x3009: // RIGHT ANGLE BRACKET
+    case 0x300B: // RIGHT DOUBLE ANGLE BRACKET
+    case 0x300D: // RIGHT CORNER BRACKET
+    case 0x300F: // RIGHT WHITE CORNER BRACKET
+    case 0x3011: // RIGHT BLACK LENTICULAR BRACKET
+    case 0x3015: // RIGHT TORTOISE SHELL BRACKET
+    case 0x3017: // RIGHT WHITE LENTICULAR BRACKET
+    case 0x3019: // RIGHT WHITE TORTOISE SHELL BRACKET
+    case 0x301B: // RIGHT WHITE SQUARE BRACKET
+    case 0x301E: // DOUBLE PRIME QUOTATION MARK
+    case 0x301F: // LOW DOUBLE PRIME QUOTATION MARK
+    case 0xFF09: // FULLWIDTH RIGHT PARENTHESIS
+    case 0xFF3D: // FULLWIDTH RIGHT SQUARE BRACKET
+    case 0xFF5D: // FULLWIDTH RIGHT CURLY BRACKET
+    case 0xFF60: // FULLWIDTH RIGHT WHITE PARENTHESIS
+    case 0xFF63: // HALFWIDTH RIGHT CORNER BRACKET
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool FontContainsGlyph(HDC hdc, UINT32 glyph) {
+    if (!hdc || glyph == 0 || glyph > 0xFFFF) return false;
+    wchar_t character = static_cast<wchar_t>(glyph);
+    WORD glyphIndex = 0xFFFF;
+    DWORD result = orgGetGlyphIndicesW(hdc, &character, 1, &glyphIndex,
+        GGI_MARK_NONEXISTING_GLYPHS);
+    return result != GDI_ERROR && glyphIndex != 0xFFFF;
+}
+
+static size_t CopySimilarGlyphs(const UINT32* source, size_t sourceCount,
+    UINT32* destination, size_t capacity) {
+    if (!source || !destination || capacity < sourceCount) return 0;
+    memcpy(destination, source, sourceCount * sizeof(UINT32));
+    return sourceCount;
+}
+
+static size_t SimilarGlyphCandidates(UINT32 glyph, UINT32* candidates,
+    size_t capacity) {
+    static const UINT32 waveDash[] = { 0xFF5E, 0x223C, 0x007E };
+    static const UINT32 fullwidthTilde[] = { 0x301C, 0x223C, 0x007E };
+    static const UINT32 tildeOperator[] = { 0xFF5E, 0x301C, 0x007E };
+    static const UINT32 asciiTilde[] = { 0xFF5E, 0x301C, 0x223C };
+    static const UINT32 boxDash[] = { 0x2014, 0x2015, 0xFF0D, 0x30FC, 0xFE63 };
+    static const UINT32 emDash[] = { 0x2500, 0x2015, 0xFF0D, 0x30FC, 0xFE63 };
+    static const UINT32 horizontalBar[] = { 0x2014, 0x2500, 0xFF0D, 0x30FC, 0xFE63 };
+    static const UINT32 fullwidthHyphen[] = { 0x2014, 0x2500, 0x2015, 0x30FC, 0xFE63 };
+    static const UINT32 prolongedSound[] = { 0x2014, 0x2500, 0x2015, 0xFF0D, 0xFE63 };
+    static const UINT32 smallHyphen[] = { 0xFF0D, 0x2014, 0x2500, 0x2015, 0x30FC };
+    static const UINT32 katakanaDot[] = { 0x00B7, 0x2022, 0xFF65, 0x2027 };
+    static const UINT32 middleDot[] = { 0x30FB, 0x2022, 0xFF65, 0x2027 };
+    static const UINT32 bullet[] = { 0x30FB, 0x00B7, 0xFF65, 0x2027 };
+    static const UINT32 halfwidthDot[] = { 0x30FB, 0x00B7, 0x2022, 0x2027 };
+    static const UINT32 hyphenationPoint[] = { 0x00B7, 0x30FB, 0x2022, 0xFF65 };
+
+    switch (glyph) {
+    case 0x301C: return CopySimilarGlyphs(waveDash, _countof(waveDash), candidates, capacity);
+    case 0xFF5E: return CopySimilarGlyphs(fullwidthTilde, _countof(fullwidthTilde), candidates, capacity);
+    case 0x223C: return CopySimilarGlyphs(tildeOperator, _countof(tildeOperator), candidates, capacity);
+    case 0x007E: return CopySimilarGlyphs(asciiTilde, _countof(asciiTilde), candidates, capacity);
+    case 0x2500: return CopySimilarGlyphs(boxDash, _countof(boxDash), candidates, capacity);
+    case 0x2014: return CopySimilarGlyphs(emDash, _countof(emDash), candidates, capacity);
+    case 0x2015: return CopySimilarGlyphs(horizontalBar, _countof(horizontalBar), candidates, capacity);
+    case 0xFF0D: return CopySimilarGlyphs(fullwidthHyphen, _countof(fullwidthHyphen), candidates, capacity);
+    case 0x30FC: return CopySimilarGlyphs(prolongedSound, _countof(prolongedSound), candidates, capacity);
+    case 0xFE63: return CopySimilarGlyphs(smallHyphen, _countof(smallHyphen), candidates, capacity);
+    case 0x30FB: return CopySimilarGlyphs(katakanaDot, _countof(katakanaDot), candidates, capacity);
+    case 0x00B7: return CopySimilarGlyphs(middleDot, _countof(middleDot), candidates, capacity);
+    case 0x2022: return CopySimilarGlyphs(bullet, _countof(bullet), candidates, capacity);
+    case 0xFF65: return CopySimilarGlyphs(halfwidthDot, _countof(halfwidthDot), candidates, capacity);
+    case 0x2027: return CopySimilarGlyphs(hyphenationPoint, _countof(hyphenationPoint), candidates, capacity);
+    default: return 0;
+    }
+}
+
+static BYTE CharsetForAtlasCodepage(UINT codepage) {
+    CHARSETINFO charset = {};
+    DWORD source = codepage;
+    if (TranslateCharsetInfo(&source, &charset, TCI_SRCCODEPAGE))
+        return static_cast<BYTE>(charset.ciCharset);
+    return DEFAULT_CHARSET;
+}
+
+static HFONT CreateAtlasFallbackFont(const LOGFONTW& request,
+    UINT codepage) {
+    LOGFONTW fallback = request;
+    fallback.lfCharSet = CharsetForAtlasCodepage(codepage);
+    fallback.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    fallback.lfFaceName[0] = L'\0';
+    return orgCreateFontIndirectW(&fallback);
+}
+
+static void MergeMask(std::vector<BYTE>* mask, int x, int y, int width,
+    int height, int clipLeft, int clipTop, int clipRight, int clipBottom,
+    BYTE alpha) {
+    if (!mask || alpha == 0 || x < clipLeft || y < clipTop ||
+        x >= clipRight || y >= clipBottom || x < 0 || y < 0 ||
+        x >= width || y >= height) {
+        return;
+    }
+    BYTE& destination = (*mask)[static_cast<size_t>(y) * width + x];
+    if (alpha > destination) destination = alpha;
+}
+
+static bool RasterizeGlyphPage(HDC hdc, HFONT font, HFONT fallbackFont,
+    int page,
+    unsigned char style, const AtlasSetState& atlasSet,
+    const AtlasCharacterMapState& characterMap,
+    std::vector<BYTE>* fillMask) {
+    const AtlasProfile& profile = *atlasSet.profile;
+    if (!hdc || !font || !fillMask || page < 1 ||
+        static_cast<size_t>(page) > characterMap.pages.size() ||
+        profile.layout.glyphWidth <= 0 ||
+        profile.layout.glyphHeight <= 0 ||
+        profile.layout.glyphWidth > profile.layout.cellWidth ||
+        profile.layout.glyphHeight > profile.layout.cellHeight ||
+        profile.layout.drawOffsetX < 0 ||
+        profile.layout.drawOffsetY < 0 ||
+        profile.layout.drawOffsetX + profile.layout.glyphWidth >
+            profile.layout.cellWidth ||
+        profile.layout.drawOffsetY + profile.layout.glyphHeight >
+            profile.layout.cellHeight) {
+        return false;
+    }
+    const AtlasLayout& layout = profile.layout;
+    fillMask->assign(static_cast<size_t>(layout.width) * layout.height, 0);
+
+    HGDIOBJ oldFont = orgSelectObject(hdc, font);
+    if (!oldFont || oldFont == HGDI_ERROR) return false;
+    TEXTMETRICW metrics = {};
+    bool haveMetrics = orgGetTextMetricsW(hdc, &metrics) != FALSE;
+
+    HDC fallbackDc = NULL;
+    HGDIOBJ oldFallbackFont = NULL;
+    TEXTMETRICW fallbackMetrics = {};
+    bool haveFallback = false;
+    if (fallbackFont) {
+        fallbackDc = CreateCompatibleDC(NULL);
+        if (fallbackDc) {
+            oldFallbackFont = orgSelectObject(fallbackDc, fallbackFont);
+            haveFallback = oldFallbackFont &&
+                oldFallbackFont != HGDI_ERROR &&
+                orgGetTextMetricsW(fallbackDc, &fallbackMetrics) != FALSE;
+        }
+    }
+    MAT2 transform = {};
+    transform.eM11.value = 1;
+    transform.eM22.value = 1;
+    std::vector<BYTE> glyphBytes;
+
+    const std::vector<UINT32>& pageGlyphs = characterMap.pages[page - 1];
+    if (pageGlyphs.size() > AtlasCellCapacity(profile)) {
+        if (oldFallbackFont && oldFallbackFont != HGDI_ERROR)
+            orgSelectObject(fallbackDc, oldFallbackFont);
+        if (fallbackDc) DeleteDC(fallbackDc);
+        orgSelectObject(hdc, oldFont);
+        return false;
+    }
+    for (size_t slot = 0; haveMetrics && slot < pageGlyphs.size(); ++slot) {
+        UINT32 glyph = pageGlyphs[slot];
+        if (glyph == 0) continue;
+        if (profile.encoding && profile.encoding->applyTextSubstitution &&
+            glyph <= 0xFFFF) {
+            wchar_t substituted = static_cast<wchar_t>(glyph);
+            SubstituteSingleTextCharW(substituted, &substituted);
+            glyph = static_cast<UINT32>(substituted);
+        }
+
+        UINT32 renderGlyph = glyph;
+        HDC glyphDc = NULL;
+        const TEXTMETRICW* glyphTextMetrics = NULL;
+        auto useGlyph = [&](HDC candidateDc,
+            const TEXTMETRICW* candidateMetrics, UINT32 candidateGlyph) {
+            if (!glyphDc && FontContainsGlyph(candidateDc, candidateGlyph)) {
+                glyphDc = candidateDc;
+                glyphTextMetrics = candidateMetrics;
+                renderGlyph = candidateGlyph;
+            }
+        };
+
+        useGlyph(hdc, &metrics, glyph);
+        UINT32 similarGlyphs[5] = {};
+        size_t similarCount = SimilarGlyphCandidates(glyph, similarGlyphs,
+            _countof(similarGlyphs));
+        for (size_t index = 0; !glyphDc && index < similarCount; ++index)
+            useGlyph(hdc, &metrics, similarGlyphs[index]);
+        if (haveFallback) {
+            useGlyph(fallbackDc, &fallbackMetrics, glyph);
+            for (size_t index = 0; !glyphDc && index < similarCount; ++index)
+                useGlyph(fallbackDc, &fallbackMetrics, similarGlyphs[index]);
+        }
+        if (!glyphDc && glyph != 0xFF65) {
+            useGlyph(hdc, &metrics, 0xFF65);
+            if (haveFallback)
+                useGlyph(fallbackDc, &fallbackMetrics, 0xFF65);
+        }
+        if (!glyphDc || !glyphTextMetrics) continue;
+        glyph = renderGlyph;
+
+        GLYPHMETRICS glyphMetrics = {};
+        DWORD glyphSize = orgGetGlyphOutlineW(glyphDc, glyph,
+            GGO_GRAY8_BITMAP, &glyphMetrics, 0, NULL, &transform);
+        if (glyphSize == GDI_ERROR || glyphSize == 0 ||
+            glyphMetrics.gmBlackBoxX == 0 || glyphMetrics.gmBlackBoxY == 0) {
+            continue;
+        }
+        glyphBytes.resize(glyphSize);
+        if (orgGetGlyphOutlineW(glyphDc, glyph, GGO_GRAY8_BITMAP,
+            &glyphMetrics, glyphSize, glyphBytes.data(), &transform) == GDI_ERROR) {
+            continue;
+        }
+
+        int column = static_cast<int>(slot % layout.columns);
+        int row = static_cast<int>(slot / layout.columns);
+        int cellX = layout.originX + column * layout.cellWidth;
+        int cellY = layout.originY + row * layout.cellHeight;
+        int glyphBoxX = cellX + layout.drawOffsetX;
+        int glyphBoxY = cellY + layout.drawOffsetY;
+        int glyphWidth = static_cast<int>(glyphMetrics.gmBlackBoxX);
+        int glyphHeight = static_cast<int>(glyphMetrics.gmBlackBoxY);
+        int destinationX = 0;
+        double baseline = 0.0;
+        if (profile.glyphPlacement == AtlasGlyphPlacement::TextOrigin) {
+            destinationX = glyphBoxX + glyphMetrics.gmptGlyphOrigin.x;
+            baseline = glyphBoxY + glyphTextMetrics->tmAscent;
+            int boldExtra = (style & StyleBold)
+                ? FontToPicPreset::BoldStrength : 0;
+            if (IsOpeningPairedPunctuation(glyph)) {
+                destinationX = glyphBoxX + layout.glyphWidth - glyphWidth -
+                    boldExtra - FontToPicPreset::PairedPunctuationEdgePadding;
+            } else if (IsClosingPairedPunctuation(glyph)) {
+                destinationX = glyphBoxX +
+                    FontToPicPreset::PairedPunctuationEdgePadding;
+            }
+        } else {
+            destinationX = glyphBoxX +
+                (layout.glyphWidth - glyphWidth) / 2;
+            baseline = glyphBoxY +
+                (layout.glyphHeight - (glyphTextMetrics->tmAscent +
+                    glyphTextMetrics->tmDescent)) / 2.0 +
+                glyphTextMetrics->tmAscent;
+        }
+        int destinationY = static_cast<int>(baseline -
+            glyphMetrics.gmptGlyphOrigin.y + 0.5);
+        if (profile.glyphPlacement == AtlasGlyphPlacement::Big5OpticalCell) {
+            int centerPermille = 0;
+            if (IsBig5LeftEdgeGlyph(glyph)) {
+                destinationX = glyphBoxX;
+            } else if (IsBig5HalfCellGlyph(glyph)) {
+                int halfWidth = layout.glyphWidth / 2;
+                destinationX = glyphBoxX +
+                    std::max(0, (halfWidth - glyphWidth) / 2);
+            } else if (Big5CenterPermille(glyph, &centerPermille)) {
+                destinationX = CenterGlyphAtPermille(glyphBoxX,
+                    layout.glyphWidth, glyphWidth, centerPermille);
+            } else if (IsBig5BearingPunctuation(glyph)) {
+                destinationX = glyphBoxX + glyphMetrics.gmptGlyphOrigin.x;
+                int maximum = glyphBoxX +
+                    std::max(0, layout.glyphWidth - glyphWidth);
+                destinationX = std::max(glyphBoxX,
+                    std::min(maximum, destinationX));
+            }
+        } else if (profile.glyphPlacement ==
+            AtlasGlyphPlacement::ReliriumOpticalCell) {
+            if (IsToolLeftEdgeGlyph(glyph)) destinationX = glyphBoxX;
+            if (IsLowerLeftPunctuation(glyph)) {
+                destinationX -= FontToPicPreset::PunctuationOffsetX;
+                destinationY += FontToPicPreset::PunctuationOffsetY;
+            }
+        }
+        if (profile.glyphPlacement != AtlasGlyphPlacement::TextOrigin) {
+            if (IsToolBottomGlyph(glyph, profile.glyphPlacement)) {
+                destinationY = glyphBoxY + layout.glyphHeight - glyphHeight -
+                    FontToPicPreset::BottomGlyphPadding;
+            } else if (IsToolOpticalCenterGlyph(glyph,
+                profile.glyphPlacement)) {
+                destinationY = glyphBoxY +
+                    (layout.glyphHeight - glyphHeight) / 2 +
+                    ToolOpticalCenterOffsetY(profile.glyphPlacement);
+            }
+        }
+        size_t sourceStride = (static_cast<size_t>(glyphWidth) + 3) & ~3ULL;
+        if (sourceStride * glyphHeight > glyphBytes.size()) continue;
+
+        bool useOutline = profile.forceOutline ||
+            (style & StyleOutline) != 0;
+        int outlineMargin = useOutline ? profile.outlineWidth : 0;
+        int shadowX = (style & StyleShadow)
+            ? FontToPicPreset::ShadowOffsetX : 0;
+        int shadowY = (style & StyleShadow)
+            ? FontToPicPreset::ShadowOffsetY : 0;
+        int clipLeft = cellX + outlineMargin + std::max(0, -shadowX);
+        int clipTop = cellY + outlineMargin + std::max(0, -shadowY);
+        int clipRight = cellX + layout.cellWidth - outlineMargin -
+            std::max(0, shadowX);
+        int clipBottom = cellY + layout.cellHeight - outlineMargin -
+            std::max(0, shadowY);
+        if (clipLeft >= clipRight || clipTop >= clipBottom) continue;
+
+        int boldCopies = (style & StyleBold)
+            ? FontToPicPreset::BoldStrength + 1 : 1;
+        for (int boldOffset = 0; boldOffset < boldCopies; ++boldOffset) {
+            for (int y = 0; y < glyphHeight; ++y) {
+                const BYTE* source = glyphBytes.data() + sourceStride * y;
+                for (int x = 0; x < glyphWidth; ++x) {
+                    MergeMask(fillMask, destinationX + x + boldOffset,
+                        destinationY + y, layout.width, layout.height,
+                        clipLeft, clipTop, clipRight, clipBottom,
+                        Gray8ToAlpha(source[x]));
+                }
+            }
+        }
+    }
+
+    if (oldFallbackFont && oldFallbackFont != HGDI_ERROR)
+        orgSelectObject(fallbackDc, oldFallbackFont);
+    if (fallbackDc) DeleteDC(fallbackDc);
+    orgSelectObject(hdc, oldFont);
+    return haveMetrics;
+}
+
+static void DilateMask(const std::vector<BYTE>& source,
+    std::vector<BYTE>* destination, int radius, int width, int height) {
+    destination->assign(source.size(), 0);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            BYTE maximum = 0;
+            for (int offsetY = -radius; offsetY <= radius; ++offsetY) {
+                int sampleY = y + offsetY;
+                if (sampleY < 0 || sampleY >= height) continue;
+                for (int offsetX = -radius; offsetX <= radius; ++offsetX) {
+                    int sampleX = x + offsetX;
+                    if (sampleX < 0 || sampleX >= width) continue;
+                    BYTE value = source[static_cast<size_t>(sampleY) *
+                        width + sampleX];
+                    if (value > maximum) maximum = value;
+                }
+            }
+            (*destination)[static_cast<size_t>(y) * width + x] = maximum;
+        }
+    }
+}
+
+static void AlphaCompositeMask(std::vector<BYTE>* destination,
+    const std::vector<BYTE>& mask, BYTE red, BYTE green, BYTE blue,
+    BYTE colorAlpha, const AtlasProfile& profile, int width, int height,
+    int shiftX = 0, int shiftY = 0) {
+    size_t decodedBytes = static_cast<size_t>(width) * height * 4;
+    if (!destination || destination->size() != decodedBytes ||
+        mask.size() != static_cast<size_t>(width) * height) {
+        return;
+    }
+    for (int y = 0; y < height; ++y) {
+        int sourceY = y - shiftY;
+        if (sourceY < 0 || sourceY >= height) continue;
+        for (int x = 0; x < width; ++x) {
+            int sourceX = x - shiftX;
+            if (sourceX < 0 || sourceX >= width) continue;
+            BYTE maskAlpha = mask[static_cast<size_t>(sourceY) *
+                width + sourceX];
+            BYTE sourceAlpha = static_cast<BYTE>(
+                (static_cast<unsigned>(maskAlpha) * colorAlpha + 127) / 255);
+            if (sourceAlpha == 0) continue;
+
+            BYTE* pixel = destination->data() +
+                (static_cast<size_t>(y) * width + x) * 4;
+            unsigned destinationAlpha = pixel[3];
+            unsigned inverseSource = 255 - sourceAlpha;
+            unsigned outputAlpha = sourceAlpha +
+                (destinationAlpha * inverseSource + 127) / 255;
+            if (outputAlpha == 0) continue;
+
+            auto blend = [&](BYTE sourceColor, BYTE destinationColor) -> BYTE {
+                unsigned premultiplied =
+                    static_cast<unsigned>(sourceColor) * sourceAlpha +
+                    (static_cast<unsigned>(destinationColor) * destinationAlpha *
+                        inverseSource + 127) / 255;
+                return static_cast<BYTE>((premultiplied + outputAlpha / 2) /
+                    outputAlpha);
+            };
+            BYTE first = profile.pixelOrder == AtlasPixelOrder::Rgba
+                ? red : blue;
+            BYTE third = profile.pixelOrder == AtlasPixelOrder::Rgba
+                ? blue : red;
+            pixel[0] = blend(first, pixel[0]);
+            pixel[1] = blend(green, pixel[1]);
+            pixel[2] = blend(third, pixel[2]);
+            pixel[3] = static_cast<BYTE>(outputAlpha);
+        }
+    }
+}
+
+static bool RenderAtlasPixels(const CatalogEntry& entry, LONG version,
+    const AtlasCharacterMapState& characterMap,
+    std::vector<BYTE>* pixels, std::wstring* actualFace) {
+    const AtlasSetState* atlasSet = AtlasSetForEntry(entry);
+    if (!pixels || !actualFace || !atlasSet) return false;
+    const AtlasProfile* profile = atlasSet->profile;
+    const AtlasLayout& layout = profile->layout;
+    wchar_t face[LF_FACESIZE] = {};
+    const wchar_t* configuredFace = Config::SourceFontNameW[0]
+        ? Config::SourceFontNameW : Config::ForcedFontNameW;
+    wcsncpy_s(face, configuredFace, _TRUNCATE);
+    if (!face[0]) return false;
+
+    int fontPixels = layout.fontPixels;
+    if (Config::EnableFontHeightScale) {
+        fontPixels = static_cast<int>(layout.fontPixels *
+            Config::FontHeightScale + 0.5f);
+        if (fontPixels < 8) fontPixels = 8;
+        if (fontPixels > layout.glyphHeight) fontPixels = layout.glyphHeight;
+    }
+
+    LOGFONTW request = {};
+    request.lfHeight = -fontPixels;
+    request.lfWeight = Config::EnableFontWeight ? Config::FontWeight : FW_NORMAL;
+    request.lfCharSet = DEFAULT_CHARSET;
+    request.lfOutPrecision = OUT_TT_PRECIS;
+    request.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    request.lfQuality = ANTIALIASED_QUALITY;
+    request.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+    wcsncpy_s(request.lfFaceName, face, _TRUNCATE);
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) return false;
+    HFONT font = orgCreateFontIndirectW(&request);
+    if (!font) {
+        DeleteDC(hdc);
+        return false;
+    }
+    HFONT fallbackFont = CreateAtlasFallbackFont(request,
+        characterMap.codepage);
+
+    HGDIOBJ oldFont = orgSelectObject(hdc, font);
+    if (oldFont && oldFont != HGDI_ERROR) {
+        wchar_t selected[LF_FACESIZE] = {};
+        if (orgGetTextFaceW(hdc, _countof(selected), selected) > 0)
+            *actualFace = selected;
+        orgSelectObject(hdc, oldFont);
+    }
+
+    std::vector<BYTE> fillMask;
+    bool rendered = RasterizeGlyphPage(hdc, font, fallbackFont, entry.page,
+        entry.style, *atlasSet, characterMap, &fillMask);
+    if (fallbackFont) DeleteObject(fallbackFont);
+    DeleteObject(font);
+    DeleteDC(hdc);
+    if (!rendered || version != Config::ConfigVersion) return false;
+
+    pixels->assign(DecodedAtlasBytes(*profile), 0);
+    std::vector<BYTE> outlineMask;
+    std::vector<BYTE> outlineOnly;
+    const std::vector<BYTE>* shadowSource = &fillMask;
+    bool useOutline = profile->forceOutline ||
+        (entry.style & StyleOutline) != 0;
+    if (useOutline) {
+        DilateMask(fillMask, &outlineMask, profile->outlineWidth,
+            layout.width, layout.height);
+        outlineOnly.resize(fillMask.size());
+        for (size_t index = 0; index < fillMask.size(); ++index) {
+            outlineOnly[index] = outlineMask[index] > fillMask[index]
+                ? static_cast<BYTE>(outlineMask[index] - fillMask[index]) : 0;
+        }
+        shadowSource = &outlineMask;
+    }
+    if ((entry.style & StyleShadow) != 0) {
+        AlphaCompositeMask(pixels, *shadowSource,
+            FontToPicPreset::ShadowRed, FontToPicPreset::ShadowGreen,
+            FontToPicPreset::ShadowBlue, 255, *profile,
+            layout.width, layout.height,
+            FontToPicPreset::ShadowOffsetX, FontToPicPreset::ShadowOffsetY);
+    }
+    if (useOutline) {
+        AlphaCompositeMask(pixels, outlineOnly,
+            profile->outlineRed, profile->outlineGreen,
+            profile->outlineBlue, profile->outlineAlpha, *profile,
+            layout.width, layout.height);
+    }
+    AlphaCompositeMask(pixels, fillMask,
+        FontToPicPreset::FillRed, FontToPicPreset::FillGreen,
+        FontToPicPreset::FillBlue, 255, *profile,
+        layout.width, layout.height);
+    return version == Config::ConfigVersion;
+}
+
+static bool CopyCachedAtlas(LONG version, int catalogIndex,
+    UINT characterCodepage, const AtlasProfile& profile, void* output) {
+    size_t decodedBytes = DecodedAtlasBytes(profile);
+    std::lock_guard<std::mutex> lock(g_renderCacheMutex);
+    for (RenderCacheEntry& entry : g_renderCache) {
+        if (entry.version != version || entry.catalogIndex != catalogIndex ||
+            entry.characterCodepage != characterCodepage ||
+            entry.pixels.size() != decodedBytes)
+            continue;
+        entry.useSerial = static_cast<unsigned __int64>(
+            InterlockedIncrement64(&g_renderUseSerial));
+        memcpy(output, entry.pixels.data(), decodedBytes);
+        return true;
+    }
+    return false;
+}
+
+static void StoreCachedAtlas(LONG version, int catalogIndex,
+    UINT characterCodepage, const AtlasProfile& profile,
+    const std::vector<BYTE>& pixels) {
+    if (pixels.size() != DecodedAtlasBytes(profile) ||
+        version != Config::ConfigVersion)
+        return;
+    std::lock_guard<std::mutex> lock(g_renderCacheMutex);
+    for (RenderCacheEntry& entry : g_renderCache) {
+        if (entry.version == version && entry.catalogIndex == catalogIndex &&
+            entry.characterCodepage == characterCodepage) {
+            entry.pixels = pixels;
+            entry.useSerial = static_cast<unsigned __int64>(
+                InterlockedIncrement64(&g_renderUseSerial));
+            return;
+        }
+    }
+    if (g_renderCache.size() >= kRenderCacheLimit) {
+        auto oldest = std::min_element(g_renderCache.begin(), g_renderCache.end(),
+            [](const RenderCacheEntry& left, const RenderCacheEntry& right) {
+                return left.useSerial < right.useSerial;
+            });
+        if (oldest != g_renderCache.end()) g_renderCache.erase(oldest);
+    }
+    RenderCacheEntry entry = {};
+    entry.version = version;
+    entry.catalogIndex = catalogIndex;
+    entry.characterCodepage = characterCodepage;
+    entry.useSerial = static_cast<unsigned __int64>(
+        InterlockedIncrement64(&g_renderUseSerial));
+    entry.pixels = pixels;
+    g_renderCache.push_back(std::move(entry));
+}
+
+} // namespace
+
+static bool RenderCatalogEntry(int catalogIndex, void* output) {
+    if (!output || catalogIndex < 0 ||
+        static_cast<size_t>(catalogIndex) >= g_catalog.size()) {
+        return false;
+    }
+    const CatalogEntry& catalogEntry = g_catalog[catalogIndex];
+    const AtlasSetState* atlasSet = AtlasSetForEntry(catalogEntry);
+    if (!atlasSet) return false;
+    const AtlasCharacterMapState* characterMap =
+        CharacterMapForAtlasSet(*atlasSet);
+    if (!characterMap) {
+        LONG trace = InterlockedIncrement(&g_encodingOverrideTraceCount);
+        if (trace <= 8) {
+            Utils::Trace("[Yuris] atlas-codepage override incompatible requested=%u set='%s' layout='%s'; original decoder retained",
+                Config::YurisAtlasCodepage, atlasSet->profile->name,
+                atlasSet->profile->encoding->name);
+        }
+        return false;
+    }
+    LONG version = Config::ConfigVersion;
+    if (CopyCachedAtlas(version, catalogIndex, characterMap->codepage,
+        *atlasSet->profile, output))
+        return true;
+
+    std::vector<BYTE> pixels;
+    std::wstring actualFace;
+    if (!RenderAtlasPixels(g_catalog[catalogIndex], version, *characterMap, &pixels,
+        &actualFace)) {
+        return false;
+    }
+    if (version != Config::ConfigVersion || !Config::EnableFontHook) return false;
+    memcpy(output, pixels.data(), pixels.size());
+    StoreCachedAtlas(version, catalogIndex, characterMap->codepage,
+        *atlasSet->profile, pixels);
+
+    LONG trace = InterlockedIncrement(&g_renderTraceCount);
+    if (trace <= 16) {
+        const CatalogEntry& entry = g_catalog[catalogIndex];
+        Utils::Trace("[Yuris] rendered version=%ld set='%s' codepage=%u page=%d style=0x%02X face='%s' actual='%s'",
+            version, atlasSet->profile->name, characterMap->codepage,
+            entry.page, entry.style,
+            EngineCommon::WideToUtf8(Config::SourceFontNameW).c_str(),
+            EngineCommon::WideToUtf8(actualFace).c_str());
+    }
+    return true;
+}
+
+static void ClearRenderCache() {
+    std::vector<RenderCacheEntry> retired;
+    {
+        std::lock_guard<std::mutex> lock(g_renderCacheMutex);
+        retired.swap(g_renderCache);
+    }
+}
+
+} // namespace Yuris

@@ -49,6 +49,14 @@ static bool EngineTryOpenFileW(const wchar_t* fileName, DWORD desiredAccess,
         return true;
     }
 
+    handle = CatSystem2Compat::TryOpenRedirectedFontFileW(fileName,
+        desiredAccess, shareMode, securityAttributes, creationDisposition,
+        flagsAndAttributes, templateFile);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
     handle = MiraiTryOpenRedirectedFontFileW(fileName, desiredAccess,
         shareMode, creationDisposition, flagsAndAttributes);
     if (handle != INVALID_HANDLE_VALUE) {
@@ -126,6 +134,11 @@ static EngineFileAttributeStatus EngineQueryFileAttributesW(
         return PublishEngineFileAttributes(detailed, true, data, attributes,
             dataOut, attributesOut);
     }
+    if (CatSystem2Compat::TryGetRedirectedFontAttributesW(fileName, dataProbe,
+        attributesProbe)) {
+        return PublishEngineFileAttributes(detailed, false, data, attributes,
+            dataOut, attributesOut);
+    }
     if (MiraiTryGetRedirectedFontAttributesW(fileName, dataProbe,
         attributesProbe)) {
         return PublishEngineFileAttributes(detailed, false, data, attributes,
@@ -161,4 +174,9 @@ static EngineFileAttributeStatus EngineQueryFileAttributesW(
     }
 
     return EngineFileAttributeStatus::Unhandled;
+}
+
+static bool EngineTryFindFirstFileFallbackW(const wchar_t* fileName,
+    WIN32_FIND_DATAW* findData, HANDLE* result) {
+    return CatSystem2Compat::TryFindFirstFallbackW(fileName, findData, result);
 }

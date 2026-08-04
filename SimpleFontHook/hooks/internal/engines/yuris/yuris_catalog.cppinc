@@ -1,0 +1,1120 @@
+namespace Yuris {
+namespace {
+
+class MappedArchive {
+public:
+    ~MappedArchive() {
+        if (view_) UnmapViewOfFile(view_);
+        if (mapping_) CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+
+    bool Open(const std::wstring& path) {
+        file_ = orgCreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (file_ == INVALID_HANDLE_VALUE) return false;
+
+        LARGE_INTEGER size = {};
+        if (!GetFileSizeEx(file_, &size) || size.QuadPart <= 0 ||
+            static_cast<unsigned __int64>(size.QuadPart) > SIZE_MAX) {
+            return false;
+        }
+        size_ = static_cast<size_t>(size.QuadPart);
+        mapping_ = CreateFileMappingW(file_, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!mapping_) return false;
+        view_ = static_cast<const BYTE*>(MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
+        return view_ != NULL;
+    }
+
+    const BYTE* data() const { return view_; }
+    size_t size() const { return size_; }
+
+private:
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = NULL;
+    const BYTE* view_ = NULL;
+    size_t size_ = 0;
+};
+
+struct ArchiveCandidate {
+    std::wstring path;
+    std::wstring relativePath;
+    std::vector<bool> possibleProfiles;
+};
+
+static bool EnumerateArchiveCandidates(
+    std::vector<ArchiveCandidate>* candidates) {
+    if (!candidates || !IsIdentityConfirmed()) return false;
+    candidates->clear();
+
+    std::wstring pacPath = EngineCommon::BuildRootPath(L"pac");
+    if (!EngineCommon::IsDirectory(pacPath)) return false;
+    std::wstring search = pacPath;
+    if (!search.empty() && search.back() != L'\\') search.push_back(L'\\');
+    search.append(L"*.ypf");
+
+    WIN32_FIND_DATAW data = {};
+    HANDLE find = orgFindFirstFileW(search.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return false;
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            continue;
+        ArchiveCandidate candidate;
+        candidate.path = pacPath;
+        if (!candidate.path.empty() && candidate.path.back() != L'\\')
+            candidate.path.push_back(L'\\');
+        candidate.path.append(data.cFileName);
+        candidate.relativePath.assign(L"pac\\");
+        candidate.relativePath.append(data.cFileName);
+        candidates->push_back(std::move(candidate));
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+
+    std::sort(candidates->begin(), candidates->end(),
+        [](const ArchiveCandidate& left, const ArchiveCandidate& right) {
+            return _wcsicmp(left.relativePath.c_str(),
+                right.relativePath.c_str()) < 0;
+        });
+    return !candidates->empty();
+}
+
+static bool ReadU32(const BYTE* data, size_t size, size_t offset, DWORD* value) {
+    if (!data || !value || offset > size || size - offset < sizeof(DWORD)) return false;
+    memcpy(value, data + offset, sizeof(DWORD));
+    return true;
+}
+
+static BYTE DecodeNameLength(BYTE value, const ArchiveProfile& profile) {
+    if (!profile.nameLengthSwaps || (profile.nameLengthSwapCount & 1) != 0)
+        return value;
+    for (size_t index = 0; index < profile.nameLengthSwapCount; ++index) {
+        if (profile.nameLengthSwaps[index] != value) continue;
+        return profile.nameLengthSwaps[(index & 1) ? index - 1 : index + 1];
+    }
+    return value;
+}
+
+static bool DecodeArchiveName(const BYTE* encrypted, size_t length, BYTE key,
+    UINT codepage, bool strictEncoding, const char* requiredPrefix,
+    std::wstring* decoded) {
+    if (!encrypted || length == 0 || !requiredPrefix || !decoded ||
+        length > INT_MAX || !IsValidCodePage(codepage)) {
+        return false;
+    }
+    size_t prefixLength = strlen(requiredPrefix);
+    if (prefixLength == 0 || length < prefixLength) return false;
+
+    std::vector<BYTE> name(length);
+    for (size_t index = 0; index < length; ++index) name[index] = encrypted[index] ^ key;
+    if (memcmp(name.data(), requiredPrefix, prefixLength) != 0) return false;
+
+    DWORD flags = strictEncoding ? MB_ERR_INVALID_CHARS : 0;
+    int wideLength = orgMultiByteToWideChar(codepage, flags,
+        reinterpret_cast<const char*>(name.data()), static_cast<int>(name.size()),
+        NULL, 0);
+    if (wideLength <= 0) return false;
+    decoded->resize(static_cast<size_t>(wideLength));
+    return orgMultiByteToWideChar(codepage, flags,
+        reinterpret_cast<const char*>(name.data()), static_cast<int>(name.size()),
+        &(*decoded)[0], wideLength) == wideLength;
+}
+
+static bool DecryptedNameStartsWithPrefix(const BYTE* encrypted, size_t length,
+    BYTE key, const char* requiredPrefix) {
+    if (!encrypted || !requiredPrefix) return false;
+    size_t prefixLength = strlen(requiredPrefix);
+    if (prefixLength == 0 || length < prefixLength) return false;
+    for (size_t index = 0; index < prefixLength; ++index) {
+        BYTE decoded = encrypted[index] ^ key;
+        BYTE expected = static_cast<BYTE>(requiredPrefix[index]);
+        if (decoded >= 'A' && decoded <= 'Z') decoded += 'a' - 'A';
+        if (expected >= 'A' && expected <= 'Z') expected += 'a' - 'A';
+        if (decoded != expected) return false;
+    }
+    return true;
+}
+
+static bool FindArchiveNameKey(const BYTE* encrypted, size_t length,
+    UINT codepage, bool strictEncoding, const char* requiredPrefix, BYTE* key,
+    std::wstring* decoded) {
+    if (!key || !decoded) return false;
+    for (unsigned candidate = 0; candidate <= 0xFF; ++candidate) {
+        std::wstring name;
+        if (!DecodeArchiveName(encrypted, length, static_cast<BYTE>(candidate),
+            codepage, strictEncoding, requiredPrefix, &name)) {
+            continue;
+        }
+        *key = static_cast<BYTE>(candidate);
+        *decoded = std::move(name);
+        return true;
+    }
+    return false;
+}
+
+static DWORD ReadU24(const BYTE* value) {
+    return static_cast<DWORD>(value[0]) |
+        (static_cast<DWORD>(value[1]) << 8) |
+        (static_cast<DWORD>(value[2]) << 16);
+}
+
+static bool ReadWebpDimensions(const BYTE* bytes, size_t byteCount,
+    int* width, int* height) {
+    if (!bytes || !width || !height || byteCount < 30 ||
+        memcmp(bytes, "RIFF", 4) != 0 || memcmp(bytes + 8, "WEBP", 4) != 0) {
+        return false;
+    }
+
+    const BYTE* chunk = bytes + 12;
+    size_t chunkBytes = byteCount - 12;
+    if (chunkBytes >= 18 && memcmp(chunk, "VP8X", 4) == 0) {
+        *width = static_cast<int>(ReadU24(chunk + 12) + 1);
+        *height = static_cast<int>(ReadU24(chunk + 15) + 1);
+        return true;
+    }
+    if (chunkBytes >= 18 && memcmp(chunk, "VP8 ", 4) == 0 &&
+        chunk[11] == 0x9D && chunk[12] == 0x01 && chunk[13] == 0x2A) {
+        *width = static_cast<int>((chunk[14] | (chunk[15] << 8)) & 0x3FFF);
+        *height = static_cast<int>((chunk[16] | (chunk[17] << 8)) & 0x3FFF);
+        return true;
+    }
+    if (chunkBytes >= 13 && memcmp(chunk, "VP8L", 4) == 0 && chunk[8] == 0x2F) {
+        const BYTE* bits = chunk + 9;
+        *width = 1 + static_cast<int>(bits[0] | ((bits[1] & 0x3F) << 8));
+        *height = 1 + static_cast<int>((bits[1] >> 6) | (bits[2] << 2) |
+            ((bits[3] & 0x0F) << 10));
+        return true;
+    }
+    return false;
+}
+
+static DWORD ReadBigEndianU32(const BYTE* value) {
+    return (static_cast<DWORD>(value[0]) << 24) |
+        (static_cast<DWORD>(value[1]) << 16) |
+        (static_cast<DWORD>(value[2]) << 8) |
+        static_cast<DWORD>(value[3]);
+}
+
+static bool ReadPngDimensions(const BYTE* bytes, size_t byteCount,
+    int* width, int* height) {
+    static const BYTE signature[] = {
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    if (!bytes || !width || !height || byteCount < 24 ||
+        memcmp(bytes, signature, sizeof(signature)) != 0 ||
+        memcmp(bytes + 12, "IHDR", 4) != 0) {
+        return false;
+    }
+    DWORD parsedWidth = ReadBigEndianU32(bytes + 16);
+    DWORD parsedHeight = ReadBigEndianU32(bytes + 20);
+    if (parsedWidth == 0 || parsedHeight == 0 ||
+        parsedWidth > INT_MAX || parsedHeight > INT_MAX) {
+        return false;
+    }
+    *width = static_cast<int>(parsedWidth);
+    *height = static_cast<int>(parsedHeight);
+    return true;
+}
+
+struct YdgSectionSpec {
+    DWORD offset;
+    DWORD size;
+    int sourceRow;
+    int sourceHeight;
+};
+
+static bool ReadYdgStructure(const BYTE* bytes, size_t byteCount,
+    int* width, int* height, std::vector<YdgSectionSpec>* sections) {
+    static const BYTE engineTag[] = {
+        'Y', 'U', '-', 'R', 'I', 'S', 0, 0,
+    };
+    if (!bytes || !width || !height || byteCount < 0x34 ||
+        memcmp(bytes, "YDG\0", 4) != 0 ||
+        memcmp(bytes + 4, engineTag, sizeof(engineTag)) != 0) {
+        return false;
+    }
+
+    WORD parsedWidth = 0, parsedHeight = 0;
+    DWORD sectionCount = 0;
+    memcpy(&parsedWidth, bytes + 0x20, sizeof(parsedWidth));
+    memcpy(&parsedHeight, bytes + 0x22, sizeof(parsedHeight));
+    memcpy(&sectionCount, bytes + 0x30, sizeof(sectionCount));
+    if (parsedWidth == 0 || parsedHeight == 0 || sectionCount == 0 ||
+        sectionCount > 64 || sectionCount > (byteCount - 0x34) / 0x10) {
+        return false;
+    }
+
+    size_t tableEnd = 0x34 + static_cast<size_t>(sectionCount) * 0x10;
+    int sourceRow = 0;
+    if (sections) {
+        sections->clear();
+        sections->reserve(sectionCount);
+    }
+    for (DWORD index = 0; index < sectionCount; ++index) {
+        size_t entryOffset = 0x34 + static_cast<size_t>(index) * 0x10;
+        DWORD offset = 0, size = 0, entryWord = 0;
+        memcpy(&offset, bytes + entryOffset, sizeof(offset));
+        memcpy(&size, bytes + entryOffset + 4, sizeof(size));
+        memcpy(&entryWord, bytes + entryOffset + 8, sizeof(entryWord));
+        int sectionHeight = static_cast<int>(entryWord >> 16);
+        if (size == 0 || sectionHeight <= 0 || offset < tableEnd ||
+            offset > byteCount || size > byteCount - offset ||
+            sourceRow > parsedHeight - sectionHeight) {
+            return false;
+        }
+        if (sections) {
+            sections->push_back({ offset, size, sourceRow, sectionHeight });
+        }
+        sourceRow += sectionHeight;
+    }
+    if (sourceRow != parsedHeight) return false;
+    *width = parsedWidth;
+    *height = parsedHeight;
+    return true;
+}
+
+static bool ReadAtlasDimensions(const ArchiveProfile& archive,
+    const BYTE* bytes, size_t byteCount, int* width, int* height) {
+    if (archive.decoderKind == AtlasDecoderKind::WebpOrdinal3)
+        return ReadWebpDimensions(bytes, byteCount, width, height);
+    if (archive.decoderKind == AtlasDecoderKind::PngOrdinals1And2)
+        return ReadPngDimensions(bytes, byteCount, width, height);
+    return ReadYdgStructure(bytes, byteCount, width, height, NULL);
+}
+
+static bool ParseNumberedLeaf(const wchar_t* leaf, const AtlasProfile& profile,
+    int* page) {
+    if (!leaf || !profile.filePrefix || !profile.fileExtension || !page)
+        return false;
+    size_t prefixLength = wcslen(profile.filePrefix);
+    if (_wcsnicmp(leaf, profile.filePrefix, prefixLength) != 0) return false;
+    const wchar_t* cursor = leaf + prefixLength;
+    if (*cursor < L'0' || *cursor > L'9') return false;
+
+    int parsedPage = 0;
+    while (*cursor >= L'0' && *cursor <= L'9') {
+        int digit = *cursor - L'0';
+        if (parsedPage > (INT_MAX - digit) / 10) return false;
+        parsedPage = parsedPage * 10 + digit;
+        ++cursor;
+    }
+    if (_wcsicmp(cursor, profile.fileExtension) != 0 ||
+        parsedPage < 1 || static_cast<DWORD>(parsedPage) > profile.pageCount) {
+        return false;
+    }
+    *page = parsedPage;
+    return true;
+}
+
+static std::wstring ParentDirectoryName(const std::wstring& name,
+    const wchar_t** leaf) {
+    const wchar_t* parsedLeaf = wcsrchr(name.c_str(), L'\\');
+    parsedLeaf = parsedLeaf ? parsedLeaf + 1 : name.c_str();
+    if (leaf) *leaf = parsedLeaf;
+    size_t leafOffset = static_cast<size_t>(parsedLeaf - name.c_str());
+    if (leafOffset == 0) return std::wstring();
+    size_t slash = leafOffset - 1;
+    size_t parentSlash = slash == 0 ? std::wstring::npos :
+        name.rfind(L'\\', slash - 1);
+    size_t start = parentSlash == std::wstring::npos ? 0 : parentSlash + 1;
+    return name.substr(start, slash - start);
+}
+
+static bool NamedFontDirectoryMatches(const std::wstring& name,
+    const wchar_t* leaf, const ArchiveProfile& archive,
+    const AtlasProfile& profile) {
+    if (!leaf || !archive.pathPrefix || !profile.directoryName) return false;
+    size_t leafOffset = static_cast<size_t>(leaf - name.c_str());
+    if (leafOffset == 0) return false;
+
+    std::wstring expectedParent;
+    size_t prefixLength = strlen(archive.pathPrefix);
+    expectedParent.reserve(prefixLength + wcslen(profile.directoryName));
+    for (size_t index = 0; index < prefixLength; ++index) {
+        expectedParent.push_back(
+            static_cast<unsigned char>(archive.pathPrefix[index]));
+    }
+    expectedParent.append(profile.directoryName);
+    size_t parentLength = leafOffset - 1;
+    return parentLength == expectedParent.size() &&
+        _wcsnicmp(name.c_str(), expectedParent.c_str(), parentLength) == 0;
+}
+
+static bool StyledDirectoryName(const std::wstring& name,
+    const wchar_t* leaf, const AtlasProfile& profile,
+    std::wstring* styleDirectory) {
+    if (!leaf || !profile.directoryName || !styleDirectory) return false;
+    size_t leafOffset = static_cast<size_t>(leaf - name.c_str());
+    if (leafOffset == 0) return false;
+    size_t slash = leafOffset - 1;
+    size_t parentSlash = slash == 0 ? std::wstring::npos :
+        name.rfind(L'\\', slash - 1);
+    size_t start = parentSlash == std::wstring::npos ? 0 : parentSlash + 1;
+    std::wstring sizeDirectory = name.substr(start, slash - start);
+    if (_wcsicmp(sizeDirectory.c_str(), profile.directoryName) != 0 ||
+        parentSlash == std::wstring::npos || parentSlash == 0) return false;
+    size_t styleSlash = name.rfind(L'\\', parentSlash - 1);
+    size_t styleStart = styleSlash == std::wstring::npos ? 0 : styleSlash + 1;
+    *styleDirectory = name.substr(styleStart, parentSlash - styleStart);
+    return !styleDirectory->empty();
+}
+
+enum class AtlasNameResult {
+    NotFont,
+    Invalid,
+    Matched,
+};
+
+static AtlasNameResult ParseAtlasName(const std::wstring& name,
+    const ArchiveProfile& archive, int* atlasSetIndex, int* page,
+    unsigned char* style) {
+    if (!atlasSetIndex || !page || !style) return AtlasNameResult::Invalid;
+    const wchar_t* leaf = NULL;
+    std::wstring parent = ParentDirectoryName(name, &leaf);
+
+    for (size_t index = 0; index < archive.atlasProfileCount; ++index) {
+        const AtlasProfile& profile = archive.atlasProfiles[index];
+        if (profile.pathKind == AtlasPathKind::NamedFontDirectory) {
+            if (!NamedFontDirectoryMatches(name, leaf, archive, profile)) {
+                continue;
+            }
+            int parsedPage = 0;
+            if (!ParseNumberedLeaf(leaf, profile, &parsedPage)) {
+                return archive.fontOnlyArchive
+                    ? AtlasNameResult::Invalid : AtlasNameResult::NotFont;
+            }
+            if (!IsAtlasPageConfigured(profile, parsedPage)) continue;
+            *atlasSetIndex = static_cast<int>(index);
+            *page = parsedPage;
+            *style = 0;
+            return AtlasNameResult::Matched;
+        }
+
+        int parsedPage = 0;
+        if (!ParseNumberedLeaf(leaf, profile, &parsedPage))
+            continue;
+        std::wstring folder;
+        if (profile.pathKind == AtlasPathKind::StyledDirectory) {
+            folder = parent;
+            if (folder.empty()) continue;
+        } else if (!StyledDirectoryName(name, leaf, profile, &folder)) {
+            continue;
+        }
+        unsigned char parsedStyle = 0;
+        if (folder.find(L'\u592A') != std::wstring::npos) parsedStyle |= StyleBold;
+        if (folder.find(L'\u5F71') != std::wstring::npos) parsedStyle |= StyleShadow;
+        if (folder.find(L'\u888B') != std::wstring::npos) parsedStyle |= StyleOutline;
+        if (FindStyleIndex(profile, parsedStyle) < 0 ||
+            !IsAtlasPageConfigured(profile, parsedPage)) {
+            continue;
+        }
+        *atlasSetIndex = static_cast<int>(index);
+        *page = parsedPage;
+        *style = parsedStyle;
+        return AtlasNameResult::Matched;
+    }
+    return archive.fontOnlyArchive
+        ? AtlasNameResult::Invalid : AtlasNameResult::NotFont;
+}
+
+static bool ParsePositiveDecimal(const wchar_t** cursor, unsigned* value) {
+    if (!cursor || !*cursor || !value || **cursor < L'0' ||
+        **cursor > L'9') {
+        return false;
+    }
+    unsigned parsed = 0;
+    do {
+        unsigned digit = static_cast<unsigned>(**cursor - L'0');
+        if (parsed > (UINT_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+        ++(*cursor);
+    } while (**cursor >= L'0' && **cursor <= L'9');
+    if (parsed == 0) return false;
+    *value = parsed;
+    return true;
+}
+
+static bool IsDirectCanonicalAtlasName(const std::wstring& name,
+    const ArchiveProfile& archive) {
+    if (!archive.pathPrefix) return false;
+    size_t prefixLength = strlen(archive.pathPrefix);
+    if (name.size() <= prefixLength) return false;
+    for (size_t index = 0; index < prefixLength; ++index) {
+        wchar_t actual = name[index];
+        wchar_t expected = static_cast<unsigned char>(archive.pathPrefix[index]);
+        if (actual >= L'A' && actual <= L'Z') actual += L'a' - L'A';
+        if (expected >= L'A' && expected <= L'Z') expected += L'a' - L'A';
+        if (actual != expected) return false;
+    }
+
+    const wchar_t* cursor = name.c_str() + prefixLength;
+    static const wchar_t directoryPrefix[] = L"font_c";
+    if (_wcsnicmp(cursor, directoryPrefix,
+        _countof(directoryPrefix) - 1) != 0) {
+        return false;
+    }
+    cursor += _countof(directoryPrefix) - 1;
+    unsigned directorySize = 0;
+    if (!ParsePositiveDecimal(&cursor, &directorySize) || *cursor != L'\\')
+        return false;
+    ++cursor;
+
+    static const wchar_t filePrefix[] = L"fnt_s";
+    if (_wcsnicmp(cursor, filePrefix, _countof(filePrefix) - 1) != 0)
+        return false;
+    cursor += _countof(filePrefix) - 1;
+    unsigned fileSize = 0;
+    if (!ParsePositiveDecimal(&cursor, &fileSize) ||
+        directorySize != fileSize || _wcsnicmp(cursor, L"_n", 2) != 0) {
+        return false;
+    }
+    cursor += 2;
+    unsigned page = 0;
+    return ParsePositiveDecimal(&cursor, &page) &&
+        _wcsicmp(cursor, L".png") == 0;
+}
+
+static bool AppendAsciiWide(const wchar_t* value, std::string* output) {
+    if (!value || !output) return false;
+    for (; *value; ++value) {
+        if (*value > 0x7F) return false;
+        output->push_back(static_cast<char>(*value));
+    }
+    return true;
+}
+
+static std::string BuildArchiveProbePrefix(const ArchiveProfile& profile) {
+    std::string prefix = profile.pathPrefix ? profile.pathPrefix : "";
+    if (profile.atlasProfileCount == 0 || !profile.atlasProfiles)
+        return prefix;
+    const AtlasProfile& atlas = profile.atlasProfiles[0];
+    if (atlas.pathKind != AtlasPathKind::NamedFontDirectory ||
+        !atlas.directoryName || !atlas.filePrefix) {
+        return prefix;
+    }
+
+    std::string specific = prefix;
+    if (!AppendAsciiWide(atlas.directoryName, &specific)) return prefix;
+    specific.push_back('\\');
+    if (!AppendAsciiWide(atlas.filePrefix, &specific)) return prefix;
+    return specific;
+}
+
+static bool EncryptedNameStartsWithPrefix(const BYTE* encryptedName,
+    size_t nameLength, const std::string& prefix) {
+    if (!encryptedName || prefix.empty() || nameLength < prefix.size())
+        return false;
+    BYTE key = encryptedName[0] ^ static_cast<BYTE>(prefix[0]);
+    return DecryptedNameStartsWithPrefix(encryptedName, nameLength,
+        key, prefix.c_str());
+}
+
+static bool ArchiveMayContainProfile(const ArchiveProfile& profile,
+    const BYTE* bytes, size_t byteCount, DWORD fileCount, DWORD dataOffset) {
+    std::string probePrefix = BuildArchiveProbePrefix(profile);
+    if (!bytes || probePrefix.empty() || dataOffset > byteCount) {
+        return false;
+    }
+
+    size_t cursor = 0x20;
+    for (DWORD index = 0; index < fileCount; ++index) {
+        if (cursor > dataOffset || dataOffset - cursor < 5) return false;
+        BYTE nameLength = DecodeNameLength(bytes[cursor + 4] ^ 0xFF, profile);
+        cursor += 5;
+        if (nameLength == 0 || cursor > dataOffset ||
+            dataOffset - cursor < static_cast<size_t>(nameLength) + 22) {
+            return false;
+        }
+
+        const BYTE* encryptedName = bytes + cursor;
+        if (EncryptedNameStartsWithPrefix(encryptedName, nameLength,
+            probePrefix)) return true;
+        cursor += static_cast<size_t>(nameLength) + 22;
+    }
+    return false;
+}
+
+static void ProbeArchiveCandidate(ArchiveCandidate* candidate) {
+    if (!candidate) return;
+    const size_t profileCount = _countof(kArchiveProfiles);
+    candidate->possibleProfiles.assign(profileCount, false);
+
+    MappedArchive archive;
+    if (!archive.Open(candidate->path)) return;
+    const BYTE* bytes = archive.data();
+    size_t byteCount = archive.size();
+    DWORD version = 0, fileCount = 0, dataOffset = 0;
+    if (byteCount < 0x20 || memcmp(bytes, "YPF\0", 4) != 0 ||
+        !ReadU32(bytes, byteCount, 4, &version) ||
+        !ReadU32(bytes, byteCount, 8, &fileCount) ||
+        !ReadU32(bytes, byteCount, 12, &dataOffset) ||
+        dataOffset < 0x20 || dataOffset > byteCount) {
+        return;
+    }
+
+    std::vector<std::string> probePrefixes(profileCount);
+    for (size_t index = 0; index < profileCount; ++index)
+        probePrefixes[index] = BuildArchiveProbePrefix(kArchiveProfiles[index]);
+
+    std::vector<bool> grouped(profileCount, false);
+    for (size_t representative = 0; representative < profileCount;
+        ++representative) {
+        if (grouped[representative]) continue;
+        const ArchiveProfile& lengthProfile = kArchiveProfiles[representative];
+        std::vector<size_t> group;
+        for (size_t profileIndex = representative;
+            profileIndex < profileCount; ++profileIndex) {
+            const ArchiveProfile& profile = kArchiveProfiles[profileIndex];
+            if (profile.nameLengthSwaps != lengthProfile.nameLengthSwaps ||
+                profile.nameLengthSwapCount !=
+                    lengthProfile.nameLengthSwapCount) {
+                continue;
+            }
+            grouped[profileIndex] = true;
+            if (profile.ypfVersion == version &&
+                !probePrefixes[profileIndex].empty()) {
+                group.push_back(profileIndex);
+            }
+        }
+        if (group.empty()) continue;
+
+        size_t cursor = 0x20;
+        for (DWORD fileIndex = 0; fileIndex < fileCount; ++fileIndex) {
+            if (cursor > dataOffset || dataOffset - cursor < 5) break;
+            BYTE nameLength = DecodeNameLength(bytes[cursor + 4] ^ 0xFF,
+                lengthProfile);
+            cursor += 5;
+            if (nameLength == 0 || cursor > dataOffset ||
+                dataOffset - cursor < static_cast<size_t>(nameLength) + 22) {
+                break;
+            }
+
+            const BYTE* encryptedName = bytes + cursor;
+            for (size_t profileIndex : group) {
+                if (!candidate->possibleProfiles[profileIndex] &&
+                    EncryptedNameStartsWithPrefix(encryptedName, nameLength,
+                        probePrefixes[profileIndex])) {
+                    candidate->possibleProfiles[profileIndex] = true;
+                }
+            }
+            cursor += static_cast<size_t>(nameLength) + 22;
+        }
+    }
+}
+
+static bool ArchiveNamesMatchProfile(const ArchiveProfile& profile,
+    const BYTE* bytes, size_t byteCount, DWORD fileCount, DWORD dataOffset,
+    UINT codepage) {
+    if (!bytes || dataOffset > byteCount) return false;
+    size_t cursor = 0x20;
+    BYTE nameKey = 0;
+    bool haveNameKey = false;
+    size_t matchedFontEntries = 0;
+
+    for (DWORD index = 0; index < fileCount; ++index) {
+        if (cursor > dataOffset || dataOffset - cursor < 5) return false;
+        BYTE nameLength = DecodeNameLength(bytes[cursor + 4] ^ 0xFF, profile);
+        cursor += 5;
+        if (nameLength == 0 || cursor > dataOffset ||
+            dataOffset - cursor < static_cast<size_t>(nameLength) + 22) {
+            return false;
+        }
+
+        const BYTE* encryptedName = bytes + cursor;
+        std::wstring name;
+        bool targetName = false;
+        if (!haveNameKey) {
+            if (FindArchiveNameKey(encryptedName, nameLength, codepage,
+                profile.strictArchiveNameEncoding, profile.pathPrefix,
+                &nameKey, &name)) {
+                haveNameKey = true;
+                targetName = true;
+            }
+        } else if (DecryptedNameStartsWithPrefix(encryptedName, nameLength,
+            nameKey, profile.pathPrefix)) {
+            if (!DecodeArchiveName(encryptedName, nameLength, nameKey,
+                codepage, profile.strictArchiveNameEncoding,
+                profile.pathPrefix, &name)) {
+                return false;
+            }
+            targetName = true;
+        }
+        cursor += static_cast<size_t>(nameLength) + 22;
+        if (!targetName) continue;
+
+        int atlasSetIndex = -1;
+        int page = 0;
+        unsigned char style = 0;
+        AtlasNameResult result = ParseAtlasName(name, profile,
+            &atlasSetIndex, &page, &style);
+        if (result == AtlasNameResult::Invalid) return false;
+        if (result == AtlasNameResult::NotFont &&
+            IsDirectCanonicalAtlasName(name, profile)) {
+            return false;
+        }
+        if (result == AtlasNameResult::Matched) ++matchedFontEntries;
+    }
+    return cursor == dataOffset && haveNameKey &&
+        matchedFontEntries == ExpectedFontEntryCount(profile);
+}
+
+using AtlasSlotMap = std::vector<std::vector<std::vector<bool>>>;
+
+static bool BuildAtlasSetStates(const ArchiveProfile& profile,
+    std::vector<AtlasSetState>* atlasSets) {
+    if (!atlasSets) return false;
+    atlasSets->clear();
+    atlasSets->reserve(profile.atlasProfileCount);
+    for (size_t index = 0; index < profile.atlasProfileCount; ++index) {
+        AtlasSetState state = {};
+        state.profile = &profile.atlasProfiles[index];
+        if (!BuildAtlasCharacterMaps(*state.profile, &state)) {
+            Utils::Trace("[Yuris] atlas encoding incompatible set='%s' layout='%s' pages=%lu cells=%lu",
+                state.profile->name,
+                state.profile->encoding ? state.profile->encoding->name : "none",
+                state.profile->pageCount,
+                static_cast<unsigned long>(AtlasCellCapacity(*state.profile)));
+            return false;
+        }
+        Utils::Trace("[Yuris] atlas encoding resolved set='%s' layout='%s' auto-codepage=%u compatible-codepages=%lu pages=%lu",
+            state.profile->name, state.profile->encoding->name,
+            state.automaticCodepage,
+            static_cast<unsigned long>(state.characterMaps.size()),
+            state.profile->pageCount);
+        for (const AtlasCharacterMapState& characterMap : state.characterMaps) {
+            Utils::Trace("[Yuris] atlas encoding candidate set='%s' codepage=%u",
+                state.profile->name, characterMap.codepage);
+        }
+        atlasSets->push_back(std::move(state));
+    }
+    return !atlasSets->empty();
+}
+
+static AtlasSlotMap CreateAtlasSlotMap(const ArchiveProfile& profile) {
+    AtlasSlotMap slots(profile.atlasProfileCount);
+    for (size_t setIndex = 0; setIndex < profile.atlasProfileCount; ++setIndex) {
+        const AtlasProfile& atlas = profile.atlasProfiles[setIndex];
+        slots[setIndex].assign(atlas.styleCount,
+            std::vector<bool>(atlas.pageCount, false));
+    }
+    return slots;
+}
+
+static bool AtlasSlotMapIsComplete(const ArchiveProfile& profile,
+    const AtlasSlotMap& slots) {
+    if (slots.size() != profile.atlasProfileCount) return false;
+    for (size_t setIndex = 0; setIndex < profile.atlasProfileCount; ++setIndex) {
+        const AtlasProfile& atlas = profile.atlasProfiles[setIndex];
+        if (slots[setIndex].size() != atlas.styleCount) return false;
+        for (size_t styleIndex = 0; styleIndex < atlas.styleCount; ++styleIndex) {
+            if (slots[setIndex][styleIndex].size() != atlas.pageCount)
+                return false;
+            for (DWORD pageIndex = 0; pageIndex < atlas.pageCount; ++pageIndex) {
+                if (IsAtlasPageConfigured(atlas,
+                    static_cast<int>(pageIndex + 1)) &&
+                    !slots[setIndex][styleIndex][pageIndex]) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool AppendCatalogEntry(const ArchiveProfile& profile,
+    const BYTE* bytes, size_t byteCount, int atlasSetIndex, int page,
+    unsigned char style, AtlasSlotMap* slots,
+    std::vector<CatalogEntry>* entries,
+    std::unordered_multimap<DWORD, int>* byCompressedSize) {
+    if (!bytes || byteCount == 0 || byteCount > MAXDWORD || !slots ||
+        !entries || !byCompressedSize || atlasSetIndex < 0 ||
+        static_cast<size_t>(atlasSetIndex) >= profile.atlasProfileCount ||
+        entries->size() >= static_cast<size_t>(INT_MAX)) {
+        return false;
+    }
+
+    const AtlasProfile& atlas = profile.atlasProfiles[atlasSetIndex];
+    int styleIndex = FindStyleIndex(atlas, style);
+    if (styleIndex < 0 || !IsAtlasPageConfigured(atlas, page) ||
+        static_cast<size_t>(atlasSetIndex) >= slots->size() ||
+        static_cast<size_t>(styleIndex) >= (*slots)[atlasSetIndex].size() ||
+        page < 1 || static_cast<DWORD>(page) > atlas.pageCount ||
+        (*slots)[atlasSetIndex][styleIndex][page - 1]) {
+        return false;
+    }
+
+    int width = 0, height = 0;
+    std::vector<YdgSectionSpec> ydgSections;
+    bool dimensionsValid = profile.decoderKind ==
+        AtlasDecoderKind::MainModuleYdgSections
+        ? ReadYdgStructure(bytes, byteCount, &width, &height, &ydgSections)
+        : ReadAtlasDimensions(profile, bytes, byteCount, &width, &height);
+    if (!dimensionsValid || width != atlas.layout.width ||
+        height != atlas.layout.height) {
+        return false;
+    }
+
+    DWORD compressedSize = static_cast<DWORD>(byteCount);
+    CatalogEntry entry = {};
+    entry.fingerprint = HashBytes(bytes, byteCount);
+    entry.compressedSize = compressedSize;
+    entry.page = page;
+    entry.style = style;
+    entry.atlasSetIndex = atlasSetIndex;
+    int catalogIndex = static_cast<int>(entries->size());
+    if (profile.decoderKind == AtlasDecoderKind::MainModuleYdgSections) {
+        entry.sections.reserve(ydgSections.size());
+        for (const YdgSectionSpec& section : ydgSections) {
+            CatalogEntry::Section catalogSection = {};
+            catalogSection.fingerprint = HashBytes(
+                bytes + section.offset, section.size);
+            catalogSection.compressedSize = section.size;
+            catalogSection.sourceRow = section.sourceRow;
+            catalogSection.sourceHeight = section.sourceHeight;
+            entry.sections.push_back(catalogSection);
+        }
+    }
+    entries->push_back(std::move(entry));
+    if (profile.decoderKind != AtlasDecoderKind::MainModuleYdgSections)
+        byCompressedSize->emplace(compressedSize, catalogIndex);
+    (*slots)[atlasSetIndex][styleIndex][page - 1] = true;
+    return true;
+}
+
+static bool LoadCatalogFromArchive(const ArchiveProfile& profile,
+    const std::wstring& archivePath,
+    std::vector<CatalogEntry>* entries,
+    std::unordered_multimap<DWORD, int>* byCompressedSize,
+    std::vector<AtlasSetState>* atlasSets,
+    UINT* resolvedArchiveNameCodepage,
+    DWORD* resolvedArchiveFileCount) {
+    if (!entries || !byCompressedSize || !atlasSets ||
+        !resolvedArchiveNameCodepage || !resolvedArchiveFileCount ||
+        archivePath.empty() || !IsIdentityConfirmed()) {
+        return false;
+    }
+    if (profile.decoderModule) {
+        std::wstring decoderPath =
+            EngineCommon::BuildRootPath(profile.decoderModule);
+        if (!EngineCommon::IsFile(decoderPath)) return false;
+    }
+
+    MappedArchive archive;
+    if (!archive.Open(archivePath)) return false;
+    const BYTE* bytes = archive.data();
+    size_t byteCount = archive.size();
+    DWORD version = 0, fileCount = 0, dataOffset = 0;
+    if (byteCount < 0x20 || memcmp(bytes, "YPF\0", 4) != 0 ||
+        !ReadU32(bytes, byteCount, 4, &version) ||
+        !ReadU32(bytes, byteCount, 8, &fileCount) ||
+        !ReadU32(bytes, byteCount, 12, &dataOffset) ||
+        version != profile.ypfVersion ||
+        dataOffset < 0x20 || dataOffset > byteCount) {
+        return false;
+    }
+    if (!ArchiveMayContainProfile(profile, bytes, byteCount, fileCount,
+        dataOffset)) {
+        return false;
+    }
+
+    std::vector<UINT> nameCodepageCandidates;
+    BuildCodepageCandidates(profile.preferredArchiveNameCodepage,
+        true, &nameCodepageCandidates);
+    UINT archiveNameCodepage = 0;
+    for (UINT codepage : nameCodepageCandidates) {
+        if (!ArchiveNamesMatchProfile(profile, bytes, byteCount, fileCount,
+            dataOffset, codepage)) {
+            continue;
+        }
+        archiveNameCodepage = codepage;
+        break;
+    }
+    if (archiveNameCodepage == 0) {
+        return false;
+    }
+    *resolvedArchiveNameCodepage = archiveNameCodepage;
+    *resolvedArchiveFileCount = fileCount;
+
+    if (!BuildAtlasSetStates(profile, atlasSets)) return false;
+    AtlasSlotMap slots = CreateAtlasSlotMap(profile);
+
+    size_t expectedFontEntries = ExpectedFontEntryCount(profile);
+    entries->reserve(expectedFontEntries);
+    byCompressedSize->reserve(expectedFontEntries * 2);
+    size_t cursor = 0x20;
+    BYTE nameKey = 0;
+    bool haveNameKey = false;
+
+    for (DWORD index = 0; index < fileCount; ++index) {
+        if (cursor > dataOffset || dataOffset - cursor < 5) return false;
+        BYTE nameLength = DecodeNameLength(bytes[cursor + 4] ^ 0xFF, profile);
+        cursor += 5;
+        if (nameLength == 0 || cursor > dataOffset ||
+            dataOffset - cursor < static_cast<size_t>(nameLength) + 22) {
+            return false;
+        }
+
+        const BYTE* encryptedName = bytes + cursor;
+        std::wstring name;
+        bool targetName = false;
+        if (!haveNameKey) {
+            if (FindArchiveNameKey(encryptedName, nameLength,
+                archiveNameCodepage, profile.strictArchiveNameEncoding,
+                profile.pathPrefix,
+                &nameKey, &name)) {
+                haveNameKey = true;
+                targetName = true;
+            }
+        } else if (DecryptedNameStartsWithPrefix(encryptedName, nameLength,
+            nameKey, profile.pathPrefix)) {
+            if (!DecodeArchiveName(encryptedName, nameLength, nameKey,
+                archiveNameCodepage,
+                profile.strictArchiveNameEncoding,
+                profile.pathPrefix, &name)) {
+                return false;
+            }
+            targetName = true;
+        }
+        cursor += nameLength;
+
+        const BYTE* metadata = bytes + cursor;
+        BYTE fileType = metadata[0];
+        BYTE packed = metadata[1];
+        DWORD unpackedSize = 0, compressedSize = 0, offset = 0;
+        memcpy(&unpackedSize, metadata + 2, sizeof(DWORD));
+        memcpy(&compressedSize, metadata + 6, sizeof(DWORD));
+        memcpy(&offset, metadata + 10, sizeof(DWORD));
+        cursor += 22;
+        if (compressedSize == 0 || offset > byteCount ||
+            compressedSize > byteCount - offset) {
+            return false;
+        }
+        if (!targetName) continue;
+
+        int atlasSetIndex = -1;
+        int page = 0;
+        unsigned char style = 0;
+        AtlasNameResult nameResult = ParseAtlasName(name, profile,
+            &atlasSetIndex, &page, &style);
+        if (nameResult == AtlasNameResult::Invalid) return false;
+        if (nameResult == AtlasNameResult::NotFont) {
+            if (IsDirectCanonicalAtlasName(name, profile)) return false;
+            continue;
+        }
+        if (fileType != profile.fileType || packed != 0 ||
+            unpackedSize != compressedSize ||
+            !AppendCatalogEntry(profile, bytes + offset, compressedSize,
+                atlasSetIndex, page, style, &slots, entries,
+                byCompressedSize)) {
+            return false;
+        }
+    }
+
+    return cursor == dataOffset && haveNameKey &&
+        entries->size() == expectedFontEntries &&
+        AtlasSlotMapIsComplete(profile, slots);
+}
+
+} // namespace
+
+static unsigned __stdcall CatalogWorker(void*) {
+    ULONGLONG scanStarted = GetTickCount64();
+    std::vector<CatalogEntry> entries;
+    std::unordered_multimap<DWORD, int> byCompressedSize;
+    std::vector<AtlasSetState> atlasSets;
+    const ArchiveProfile* loadedProfile = NULL;
+    UINT loadedArchiveNameCodepage = 0;
+    DWORD loadedArchiveCount = 0;
+    unsigned __int64 loadedSourceItems = 0;
+
+    std::vector<ArchiveCandidate> candidates;
+    if (EnumerateArchiveCandidates(&candidates)) {
+        for (ArchiveCandidate& candidate : candidates)
+            ProbeArchiveCandidate(&candidate);
+        for (size_t profileIndex = 0;
+            profileIndex < _countof(kArchiveProfiles); ++profileIndex) {
+            const ArchiveProfile& profile = kArchiveProfiles[profileIndex];
+            entries.clear();
+            byCompressedSize.clear();
+            atlasSets.clear();
+            UINT profileArchiveNameCodepage = 0;
+            DWORD profileArchiveCount = 0;
+            unsigned __int64 profileSourceItems = 0;
+
+            std::vector<size_t> candidateOrder;
+            candidateOrder.reserve(candidates.size());
+            if (profile.archiveHintPath) {
+                for (size_t index = 0; index < candidates.size(); ++index) {
+                    if (_wcsicmp(candidates[index].relativePath.c_str(),
+                        profile.archiveHintPath) == 0) {
+                        candidateOrder.push_back(index);
+                        break;
+                    }
+                }
+            }
+            for (size_t index = 0; index < candidates.size(); ++index) {
+                if (!candidateOrder.empty() && candidateOrder[0] == index)
+                    continue;
+                candidateOrder.push_back(index);
+            }
+
+            for (size_t candidateIndex : candidateOrder) {
+                const ArchiveCandidate& candidate = candidates[candidateIndex];
+                if (candidate.possibleProfiles.size() !=
+                    _countof(kArchiveProfiles) ||
+                    !candidate.possibleProfiles[profileIndex]) {
+                    continue;
+                }
+                std::vector<CatalogEntry> candidateEntries;
+                std::unordered_multimap<DWORD, int> candidateByCompressedSize;
+                std::vector<AtlasSetState> candidateAtlasSets;
+                UINT archiveNameCodepage = 0;
+                DWORD archiveFileCount = 0;
+                if (!LoadCatalogFromArchive(profile, candidate.path,
+                    &candidateEntries, &candidateByCompressedSize,
+                    &candidateAtlasSets, &archiveNameCodepage,
+                    &archiveFileCount)) {
+                    continue;
+                }
+
+                if (profileArchiveCount == 0) {
+                    atlasSets = std::move(candidateAtlasSets);
+                    profileArchiveNameCodepage = archiveNameCodepage;
+                }
+                entries.reserve(entries.size() + candidateEntries.size());
+                for (CatalogEntry& entry : candidateEntries) {
+                    int catalogIndex = static_cast<int>(entries.size());
+                    if (profile.decoderKind !=
+                        AtlasDecoderKind::MainModuleYdgSections) {
+                        byCompressedSize.emplace(
+                            entry.compressedSize, catalogIndex);
+                    }
+                    entries.push_back(std::move(entry));
+                }
+                ++profileArchiveCount;
+                profileSourceItems += archiveFileCount;
+                Utils::Trace("[Yuris] atlas archive matched profile='%s' archive='%s' source-items=%lu font-payloads=%lu archive-name-codepage=%u",
+                    profile.name,
+                    EngineCommon::WideToUtf8(candidate.relativePath).c_str(),
+                    archiveFileCount,
+                    static_cast<unsigned long>(candidateEntries.size()),
+                    archiveNameCodepage);
+            }
+
+            if (profileArchiveCount == 0) continue;
+            loadedProfile = &profile;
+            loadedArchiveNameCodepage = profileArchiveNameCodepage;
+            loadedArchiveCount = profileArchiveCount;
+            loadedSourceItems = profileSourceItems;
+            break;
+        }
+    }
+
+    if (loadedProfile && EngineIdentityPolicy::ConfirmCapability(true, true)) {
+        g_catalog = std::move(entries);
+        g_catalogByCompressedSize = std::move(byCompressedSize);
+        g_ydgBySectionSize.clear();
+        if (loadedProfile->decoderKind ==
+            AtlasDecoderKind::MainModuleYdgSections) {
+            g_ydgBySectionSize.reserve(g_catalog.size() * 4);
+            for (size_t index = 0; index < g_catalog.size(); ++index) {
+                const CatalogEntry& entry = g_catalog[index];
+                for (size_t sectionIndex = 0;
+                    sectionIndex < entry.sections.size(); ++sectionIndex) {
+                    YdgCatalogSectionRef reference = {
+                        static_cast<int>(index), sectionIndex,
+                    };
+                    g_ydgBySectionSize.emplace(
+                        entry.sections[sectionIndex].compressedSize,
+                        reference);
+                }
+            }
+        }
+        g_atlasSets = std::move(atlasSets);
+        g_archiveProfile = loadedProfile;
+        InterlockedExchange(&g_catalogState, 2);
+        Utils::Trace("[Yuris] bitmap-font capability confirmed profile='%s' source=%s archives=%lu source-items=%I64u logical-pages=%lu font-payloads=%lu sets=%lu archive-name-codepage=%u decoder=%s scan-ms=%I64u",
+            loadedProfile->name,
+            "ypf",
+            loadedArchiveCount,
+            loadedSourceItems,
+            static_cast<unsigned long>(ExpectedFontEntryCount(*loadedProfile)),
+            static_cast<unsigned long>(g_catalog.size()),
+            static_cast<unsigned long>(g_atlasSets.size()),
+            loadedArchiveNameCodepage,
+            loadedProfile->decoderKind == AtlasDecoderKind::WebpOrdinal3
+                ? "YSWBP-ordinal3"
+                : loadedProfile->decoderKind ==
+                    AtlasDecoderKind::PngOrdinals1And2
+                    ? "YSPNG-ordinal1+2"
+                    : "main-module-ydg-sections",
+            GetTickCount64() - scanStarted);
+    } else {
+        InterlockedExchange(&g_catalogState, -1);
+        Utils::Trace("[Yuris] bitmap-font capability unavailable; original decoder retained scan-ms=%I64u",
+            GetTickCount64() - scanStarted);
+    }
+    if (g_catalogReadyEvent) SetEvent(g_catalogReadyEvent);
+    return 0;
+}
+
+static void StartCatalogWorker() {
+    if (InterlockedCompareExchange(&g_catalogState, 1, 0) != 0) return;
+    g_catalogReadyEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_catalogReadyEvent ||
+        !StartHookWorkerThread(&g_catalogThread, CatalogWorker, NULL,
+            "yuris-catalog")) {
+        InterlockedExchange(&g_catalogState, -1);
+        if (g_catalogReadyEvent) SetEvent(g_catalogReadyEvent);
+    }
+}
+
+static bool WaitForCatalog() {
+    LONG state = InterlockedCompareExchange(&g_catalogState, 0, 0);
+    if (state == 2) return true;
+    if (state != 1 || !g_catalogReadyEvent) return false;
+    WaitForSingleObject(g_catalogReadyEvent, 5000);
+    return InterlockedCompareExchange(&g_catalogState, 0, 0) == 2;
+}
+
+static int FindCatalogEntry(const void* compressedBytes, DWORD compressedSize) {
+    if (!compressedBytes || compressedSize == 0 || !WaitForCatalog()) return -1;
+    auto range = g_catalogByCompressedSize.equal_range(compressedSize);
+    if (range.first == range.second) return -1;
+    unsigned __int64 fingerprint = HashBytes(compressedBytes, compressedSize);
+    int catalogIndex = -1;
+    for (auto iterator = range.first; iterator != range.second; ++iterator) {
+        const CatalogEntry& entry = g_catalog[iterator->second];
+        if (entry.compressedSize == compressedSize &&
+            entry.fingerprint == fingerprint) {
+            if (catalogIndex < 0) {
+                catalogIndex = iterator->second;
+                continue;
+            }
+            const CatalogEntry& first = g_catalog[catalogIndex];
+            if (entry.atlasSetIndex != first.atlasSetIndex ||
+                entry.page != first.page || entry.style != first.style) {
+                LONG traceIndex = InterlockedIncrement(
+                    &g_ambiguousCatalogTraceCount);
+                if (traceIndex <= 8) {
+                    Utils::Trace("[Yuris] atlas payload ambiguous size=%lu; original decoder retained",
+                        compressedSize);
+                }
+                return -1;
+            }
+        }
+    }
+    return catalogIndex;
+}
+
+static bool StopCatalogWorker(bool waitForExit) {
+    bool stopped = StopHookWorkerThread(&g_catalogThread, waitForExit, 5000,
+        "yuris-catalog");
+    if (stopped && g_catalogReadyEvent) {
+        CloseHandle(g_catalogReadyEvent);
+        g_catalogReadyEvent = NULL;
+    }
+    return stopped;
+}
+
+} // namespace Yuris

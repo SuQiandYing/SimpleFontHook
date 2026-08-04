@@ -1,0 +1,856 @@
+namespace Yuris {
+
+static const unsigned char kCp932Styles[] = {
+    0,
+    StyleBold,
+    StyleShadow,
+    static_cast<unsigned char>(StyleBold | StyleShadow),
+    StyleOutline,
+    static_cast<unsigned char>(StyleBold | StyleOutline),
+    static_cast<unsigned char>(StyleShadow | StyleOutline),
+    static_cast<unsigned char>(StyleBold | StyleShadow | StyleOutline),
+};
+
+static const unsigned char kGbkStyles[] = {
+    0,
+    StyleBold,
+};
+
+static const unsigned char kPlainStyle[] = {
+    0,
+};
+
+static const unsigned char kBoldStyle[] = {
+    StyleBold,
+};
+
+static const unsigned char kBoldShadowOutlineStyle[] = {
+    static_cast<unsigned char>(StyleBold | StyleShadow | StyleOutline),
+};
+
+static const BYTE kReliriumSparseS31Pages[] = {
+    1, 2, 3, 46,
+};
+
+static const BYTE kReliriumYdgQoiDecodeSignature[] = {
+    0x83, 0xEC, 0x20,
+    0x85, 0xC0,
+    0x74, 0x33,
+    0xC7, 0x44, 0x24, 0x0C, 0x04, 0x00, 0x00, 0x00,
+    0x89, 0x44, 0x24, 0x10,
+    0x8B, 0xC2,
+    0x8B, 0xD1,
+    0x8D, 0x4C, 0x24, 0x14,
+    0xE8, 0x30, 0x00, 0x00, 0x00,
+};
+
+static const MainModuleDecoderProfile kReliriumMainModuleDecoder = {
+    "relirium-ydg-qoi-core-x86",
+    kReliriumYdgQoiDecodeSignature,
+    _countof(kReliriumYdgQoiDecodeSignature),
+};
+
+static const BYTE kDefaultNameLengthSwaps[] = {
+    0x03, 0x48, 0x06, 0x35,
+    0x0C, 0x10, 0x11, 0x19, 0x1C, 0x1E,
+    0x09, 0x0B, 0x0D, 0x13, 0x15, 0x1B, 0x20, 0x23,
+    0x26, 0x29, 0x2C, 0x2F, 0x2E, 0x32,
+};
+
+static const BYTE kAlternateNameLengthSwaps[] = {
+    0x03, 0x48, 0x06, 0x35,
+    0x0C, 0x10, 0x11, 0x18, 0x1C, 0x1E,
+    0x09, 0x0B, 0x0D, 0x13, 0x15, 0x1B, 0x20, 0x23,
+    0x26, 0x29, 0x2C, 0x2F, 0x14, 0x2E,
+};
+
+static const AtlasEncodingProfile kDbcs188Encoding = {
+    "dbcs-188",
+    AtlasByteLayout::Dbcs188,
+    932,
+    0,
+    0xFF65,
+    false,
+    false,
+};
+
+static const AtlasEncodingProfile kDbcs188ExtendedEncoding = {
+    "dbcs-188+pua1",
+    AtlasByteLayout::Dbcs188,
+    932,
+    1,
+    0xFF65,
+    false,
+    false,
+};
+
+static const AtlasEncodingProfile kLinearDbcs192Encoding = {
+    "linear-dbcs-192+ascii",
+    AtlasByteLayout::LinearDbcs192WithAscii,
+    936,
+    0,
+    0,
+    false,
+    false,
+};
+
+static const AtlasEncodingProfile kSplitDbcs160Encoding = {
+    "split-dbcs-160",
+    AtlasByteLayout::SplitDbcs160,
+    950,
+    0,
+    0,
+    true,
+    true,
+};
+
+static const AtlasEncodingProfile kSplitDbcs160WithAsciiEncoding = {
+    "split-dbcs-160+ascii",
+    AtlasByteLayout::SplitDbcs160WithAscii,
+    950,
+    0,
+    0,
+    true,
+    true,
+};
+
+static const AtlasProfile kCp932AtlasProfiles[] = {
+    {
+        "cp932-s38",
+        45,
+        kCp932Styles,
+        _countof(kCp932Styles),
+        { 1024, 640, 5, 11, 48, 48, 5, 1, 38, 38, 19, 10, 38 },
+        AtlasGlyphPlacement::TextOrigin,
+        &kDbcs188Encoding,
+        AtlasPixelOrder::Bgra,
+        AtlasPathKind::StyledDirectory,
+        NULL,
+        L"fnt_s38_n",
+        L".webp",
+        false,
+        NULL,
+        0,
+        1,
+        0, 0, 0, 255,
+    },
+};
+
+static const AtlasProfile kGbkAtlasProfiles[] = {
+    {
+        "gbk-s38",
+        127,
+        kGbkStyles,
+        _countof(kGbkStyles),
+        // Pillow's source atlas leaves about six transparent rows above CJK
+        // strokes. GDI exposes this face three rows earlier at the same size.
+        { 816, 624, 5, 11, 48, 48, 5, 4, 38, 38, 16, 12, 38 },
+        AtlasGlyphPlacement::TextOrigin,
+        &kLinearDbcs192Encoding,
+        AtlasPixelOrder::Bgra,
+        AtlasPathKind::StyledSizeDirectory,
+        L"38",
+        L"fnt_s38_n",
+        L".webp",
+        false,
+        NULL,
+        0,
+        1,
+        0, 0, 0, 255,
+    },
+};
+
+static const AtlasProfile kBig5AtlasProfiles[] = {
+    {
+        "big5-c20",
+        89,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 6, 9, 30, 30, 5, 5, 20, 20, 16, 10, 20 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160Encoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c20",
+        L"fnt_s20_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c10",
+        38,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 8, 10, 26, 26, 8, 8, 10, 10, 16, 10, 10 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160Encoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c10",
+        L"fnt_s10_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+};
+
+static const AtlasProfile kBig5FourSizeAtlasProfiles[] = {
+    {
+        "big5-c10-89+ascii",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 8, 10, 26, 26, 8, 8, 10, 10, 16, 10, 10 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c10",
+        L"fnt_s10_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c20-89+ascii",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 6, 9, 30, 30, 5, 5, 20, 20, 16, 10, 20 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c20",
+        L"fnt_s20_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c30-89+ascii",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 440, 6, 11, 40, 40, 5, 5, 30, 30, 16, 10, 30 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c30",
+        L"fnt_s30_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c40-89+ascii",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 820, 520, 7, 13, 50, 50, 5, 5, 40, 40, 16, 10, 40 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c40",
+        L"fnt_s40_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+};
+
+static const AtlasProfile kBig5MixedFourSizeAtlasProfiles[] = {
+    {
+        "big5-c10-38-mixed",
+        38,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 8, 10, 26, 26, 8, 8, 10, 10, 16, 10, 10 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160Encoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c10",
+        L"fnt_s10_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c20-89-mixed",
+        89,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 400, 6, 9, 30, 30, 5, 5, 20, 20, 16, 10, 20 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160Encoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c20",
+        L"fnt_s20_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c30-89+ascii-mixed",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 720, 440, 6, 11, 40, 40, 5, 5, 30, 30, 16, 10, 30 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c30",
+        L"fnt_s30_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+    {
+        "big5-c40-89+ascii-mixed",
+        90,
+        kPlainStyle,
+        _countof(kPlainStyle),
+        { 820, 520, 7, 13, 50, 50, 5, 5, 40, 40, 16, 10, 40 },
+        AtlasGlyphPlacement::Big5OpticalCell,
+        &kSplitDbcs160WithAsciiEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::NamedFontDirectory,
+        L"font_c40",
+        L"fnt_s40_n",
+        L".png",
+        true,
+        NULL,
+        0,
+        1,
+        0x4B, 0x4B, 0x4B, 0xE0,
+    },
+};
+
+static const AtlasProfile kReliriumAtlasProfiles[] = {
+    {
+        "relirium-s38",
+        46,
+        kCp932Styles,
+        _countof(kCp932Styles),
+        { 1024, 640, 5, 11, 48, 48, 5, 5, 38, 38, 19, 10, 38 },
+        AtlasGlyphPlacement::ReliriumOpticalCell,
+        &kDbcs188ExtendedEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::StyledSizeDirectory,
+        L"38",
+        L"fnt_s38_n",
+        L".ydg",
+        false,
+        NULL,
+        0,
+        1,
+        0, 0, 0, 255,
+    },
+    {
+        "relirium-s31-bold",
+        46,
+        kBoldStyle,
+        _countof(kBoldStyle),
+        { 800, 440, 5, 10, 41, 41, 5, 5, 31, 31, 19, 10, 31 },
+        AtlasGlyphPlacement::ReliriumOpticalCell,
+        &kDbcs188ExtendedEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::StyledSizeDirectory,
+        L"31",
+        L"fnt_s31_n",
+        L".ydg",
+        false,
+        NULL,
+        0,
+        1,
+        0, 0, 0, 255,
+    },
+    {
+        "relirium-s31-bold-shadow-outline",
+        46,
+        kBoldShadowOutlineStyle,
+        _countof(kBoldShadowOutlineStyle),
+        { 800, 440, 5, 10, 41, 41, 5, 5, 31, 31, 19, 10, 31 },
+        AtlasGlyphPlacement::ReliriumOpticalCell,
+        &kDbcs188ExtendedEncoding,
+        AtlasPixelOrder::Rgba,
+        AtlasPathKind::StyledSizeDirectory,
+        L"31",
+        L"fnt_s31_n",
+        L".ydg",
+        false,
+        kReliriumSparseS31Pages,
+        _countof(kReliriumSparseS31Pages),
+        1,
+        0, 0, 0, 255,
+    },
+};
+
+static const ArchiveProfile kArchiveProfiles[] = {
+    {
+        "cgsysf-cp932-45x8",
+        L"pac\\cgsysf.ypf",
+        L"YSWBP.DLL",
+        "cgsysf\\",
+        kDefaultNameLengthSwaps,
+        _countof(kDefaultNameLengthSwaps),
+        0x1F4,
+        932,
+        10,
+        AtlasDecoderKind::WebpOrdinal3,
+        NULL,
+        kCp932AtlasProfiles,
+        _countof(kCp932AtlasProfiles),
+        true,
+        true,
+    },
+    {
+        "cgsysf-gbk-127x2",
+        L"pac\\cgsysf.ypf",
+        L"YSWBP.DLL",
+        "cgsysf\\",
+        kDefaultNameLengthSwaps,
+        _countof(kDefaultNameLengthSwaps),
+        0x1F4,
+        936,
+        10,
+        AtlasDecoderKind::WebpOrdinal3,
+        NULL,
+        kGbkAtlasProfiles,
+        _countof(kGbkAtlasProfiles),
+        true,
+        true,
+    },
+    {
+        "big5-89+38-direct",
+        L"pac\\cgsys_c.ypf",
+        L"YSPNG.DLL",
+        "cgsys_c\\",
+        kAlternateNameLengthSwaps,
+        _countof(kAlternateNameLengthSwaps),
+        0x1F4,
+        950,
+        2,
+        AtlasDecoderKind::PngOrdinals1And2,
+        NULL,
+        kBig5AtlasProfiles,
+        _countof(kBig5AtlasProfiles),
+        false,
+        false,
+    },
+    {
+        "big5-38+89+2x90-nested",
+        NULL,
+        L"YSPNG.DLL",
+        "cgsys_c\\font\\",
+        kAlternateNameLengthSwaps,
+        _countof(kAlternateNameLengthSwaps),
+        0x1F4,
+        932,
+        2,
+        AtlasDecoderKind::PngOrdinals1And2,
+        NULL,
+        kBig5MixedFourSizeAtlasProfiles,
+        _countof(kBig5MixedFourSizeAtlasProfiles),
+        true,
+        false,
+    },
+    {
+        "big5-89+38-nested",
+        NULL,
+        L"YSPNG.DLL",
+        "cgsys_c\\font\\",
+        kAlternateNameLengthSwaps,
+        _countof(kAlternateNameLengthSwaps),
+        0x1F4,
+        932,
+        2,
+        AtlasDecoderKind::PngOrdinals1And2,
+        NULL,
+        kBig5AtlasProfiles,
+        _countof(kBig5AtlasProfiles),
+        true,
+        false,
+    },
+    {
+        "big5-4x90-nested",
+        NULL,
+        L"YSPNG.DLL",
+        "cgsys_c\\font\\",
+        kAlternateNameLengthSwaps,
+        _countof(kAlternateNameLengthSwaps),
+        0x1F4,
+        932,
+        2,
+        AtlasDecoderKind::PngOrdinals1And2,
+        NULL,
+        kBig5FourSizeAtlasProfiles,
+        _countof(kBig5FourSizeAtlasProfiles),
+        true,
+        false,
+    },
+    {
+        "relirium-cgsys-cp932-ydg",
+        L"pac\\cgsys.ypf",
+        NULL,
+        "cgsysf\\",
+        kAlternateNameLengthSwaps,
+        _countof(kAlternateNameLengthSwaps),
+        0x1F4,
+        932,
+        5,
+        AtlasDecoderKind::MainModuleYdgSections,
+        &kReliriumMainModuleDecoder,
+        kReliriumAtlasProfiles,
+        _countof(kReliriumAtlasProfiles),
+        true,
+        false,
+    },
+};
+
+static size_t AtlasCellCapacity(const AtlasProfile& profile) {
+    return static_cast<size_t>(profile.layout.columns) * profile.layout.rows;
+}
+
+static size_t DecodedAtlasBytes(const AtlasProfile& profile) {
+    return static_cast<size_t>(profile.layout.width) * profile.layout.height * 4;
+}
+
+static size_t ExpectedFontEntryCount(const ArchiveProfile& profile) {
+    size_t count = 0;
+    for (size_t index = 0; index < profile.atlasProfileCount; ++index) {
+        const AtlasProfile& atlas = profile.atlasProfiles[index];
+        size_t pageCount = atlas.pageNumberCount != 0
+            ? atlas.pageNumberCount : static_cast<size_t>(atlas.pageCount);
+        count += pageCount * atlas.styleCount;
+    }
+    return count;
+}
+
+static bool IsAtlasPageConfigured(const AtlasProfile& profile, int page) {
+    if (page < 1 || static_cast<DWORD>(page) > profile.pageCount) return false;
+    if (!profile.pageNumbers || profile.pageNumberCount == 0) return true;
+    for (size_t index = 0; index < profile.pageNumberCount; ++index) {
+        if (profile.pageNumbers[index] == page) return true;
+    }
+    return false;
+}
+
+static int FindStyleIndex(const AtlasProfile& profile, unsigned char style) {
+    for (size_t index = 0; index < profile.styleCount; ++index) {
+        if (profile.styles[index] == style) return static_cast<int>(index);
+    }
+    return -1;
+}
+
+static bool DecodeDbcsGlyph(UINT codepage, BYTE lead, BYTE trail,
+    UINT32* glyph) {
+    if (!glyph) return false;
+    char encoded[2] = {
+        static_cast<char>(lead),
+        static_cast<char>(trail),
+    };
+    wchar_t decoded[2] = {};
+    int length = orgMultiByteToWideChar(codepage, MB_ERR_INVALID_CHARS,
+        encoded, _countof(encoded), decoded, _countof(decoded));
+    if (length != 1 || decoded[0] == L'\0' ||
+        (decoded[0] >= 0xD800 && decoded[0] <= 0xDFFF)) {
+        return false;
+    }
+    *glyph = static_cast<UINT32>(decoded[0]);
+    return true;
+}
+
+static void AppendCodepageCandidate(UINT codepage,
+    std::vector<UINT>* candidates) {
+    if (!candidates || codepage == 0 || !IsValidCodePage(codepage)) return;
+    for (UINT existing : *candidates) {
+        if (existing == codepage) return;
+    }
+    candidates->push_back(codepage);
+}
+
+static const std::vector<UINT>& InstalledCodepages() {
+    static const std::vector<UINT> codepages = []() {
+        std::vector<UINT> result;
+        for (UINT codepage = 1; codepage <= 0xFFFF; ++codepage) {
+            if (IsValidCodePage(codepage)) result.push_back(codepage);
+        }
+        return result;
+    }();
+    return codepages;
+}
+
+static void BuildCodepageCandidates(UINT preferredCodepage,
+    bool preferProcessCodepages, std::vector<UINT>* candidates) {
+    if (!candidates) return;
+    candidates->clear();
+    AppendCodepageCandidate(preferredCodepage, candidates);
+    if (preferProcessCodepages) {
+        AppendCodepageCandidate(GetACP(), candidates);
+        AppendCodepageCandidate(GetOEMCP(), candidates);
+        AppendCodepageCandidate(CP_UTF8, candidates);
+    }
+    for (UINT codepage : InstalledCodepages())
+        AppendCodepageCandidate(codepage, candidates);
+}
+
+static bool GetDbcsCodepageInfo(UINT codepage, CPINFOEXW* info) {
+    if (!info) return false;
+    ZeroMemory(info, sizeof(*info));
+    return GetCPInfoExW(codepage, 0, info) && info->MaxCharSize == 2;
+}
+
+static bool IsPrivateUseGlyph(UINT32 glyph) {
+    return glyph >= 0xE000 && glyph <= 0xF8FF;
+}
+
+static bool BuildDbcs188Pages(const AtlasProfile& profile, UINT codepage,
+    std::vector<std::vector<UINT32>>* pages) {
+    if (!pages || !profile.encoding || AtlasCellCapacity(profile) < 188)
+        return false;
+    CPINFOEXW codepageInfo = {};
+    if (!GetDbcsCodepageInfo(codepage, &codepageInfo)) return false;
+    pages->clear();
+    pages->reserve(profile.pageCount);
+
+    size_t privateUsePages = 0;
+    for (size_t range = 0; range + 1 < _countof(codepageInfo.LeadByte);
+        range += 2) {
+        BYTE firstLead = codepageInfo.LeadByte[range];
+        BYTE lastLead = codepageInfo.LeadByte[range + 1];
+        if (firstLead == 0 && lastLead == 0) break;
+        if (firstLead == 0 || lastLead < firstLead) return false;
+        for (unsigned lead = firstLead; lead <= lastLead; ++lead) {
+            std::vector<UINT32> page;
+            page.reserve(188);
+            size_t validGlyphs = 0;
+            size_t nonPrivateUseGlyphs = 0;
+            for (int trail = 0x40; trail <= 0xFC; ++trail) {
+                if (trail == 0x7F) continue;
+                UINT32 glyph = 0;
+                if (DecodeDbcsGlyph(codepage, static_cast<BYTE>(lead),
+                    static_cast<BYTE>(trail), &glyph)) {
+                    page.push_back(glyph);
+                    ++validGlyphs;
+                    if (!IsPrivateUseGlyph(glyph)) ++nonPrivateUseGlyphs;
+                } else {
+                    page.push_back(profile.encoding->invalidGlyph);
+                }
+            }
+            if (validGlyphs == 0) continue;
+            UINT32 outOfLayoutGlyph = 0;
+            if (DecodeDbcsGlyph(codepage, static_cast<BYTE>(lead), 0x7F,
+                &outOfLayoutGlyph)) {
+                return false;
+            }
+            for (int trail = 0xFD; trail <= 0xFF; ++trail) {
+                if (DecodeDbcsGlyph(codepage, static_cast<BYTE>(lead),
+                    static_cast<BYTE>(trail), &outOfLayoutGlyph)) {
+                    return false;
+                }
+            }
+            if (nonPrivateUseGlyphs == 0) {
+                if (privateUsePages >=
+                    profile.encoding->privateUseLeadPageLimit) {
+                    continue;
+                }
+                ++privateUsePages;
+            }
+            pages->push_back(std::move(page));
+            if (pages->size() > profile.pageCount) return false;
+        }
+    }
+    return pages->size() == profile.pageCount;
+}
+
+static bool BuildLinearDbcs192Pages(const AtlasProfile& profile, UINT codepage,
+    std::vector<std::vector<UINT32>>* pages) {
+    const size_t capacity = AtlasCellCapacity(profile);
+    if (!pages || capacity != 192 || profile.pageCount < 2) return false;
+    CPINFOEXW codepageInfo = {};
+    if (!GetDbcsCodepageInfo(codepage, &codepageInfo)) return false;
+    pages->clear();
+    pages->reserve(profile.pageCount);
+
+    for (size_t range = 0; range + 1 < _countof(codepageInfo.LeadByte);
+        range += 2) {
+        BYTE firstLead = codepageInfo.LeadByte[range];
+        BYTE lastLead = codepageInfo.LeadByte[range + 1];
+        if (firstLead == 0 && lastLead == 0) break;
+        if (firstLead == 0 || lastLead < firstLead) return false;
+        for (unsigned lead = firstLead; lead <= lastLead; ++lead) {
+            std::vector<UINT32> page;
+            page.reserve(capacity);
+            for (int trail = 0x40; trail <= 0xFF; ++trail) {
+                UINT32 glyph = 0;
+                DecodeDbcsGlyph(codepage, static_cast<BYTE>(lead),
+                    static_cast<BYTE>(trail), &glyph);
+                page.push_back(glyph);
+            }
+            pages->push_back(std::move(page));
+            if (pages->size() >= profile.pageCount) return false;
+        }
+    }
+
+    std::vector<UINT32> asciiPage(capacity, 0);
+    for (UINT32 glyph = 0x20; glyph <= 0x7E; ++glyph)
+        asciiPage[glyph - 0x20] = glyph;
+    pages->push_back(std::move(asciiPage));
+    return pages->size() == profile.pageCount;
+}
+
+static bool DecodeSplitDbcsGlyph(const AtlasEncodingProfile& encoding,
+    UINT codepage, BYTE lead, BYTE trail, UINT32* glyph) {
+    if (!glyph) return false;
+    // The supplied atlas generator uses the standard Big5 table. CP950 differs
+    // at these symbol slots and adds codes that must remain empty here.
+    if (encoding.useStandardBig5Symbols && codepage == 950) {
+        switch ((static_cast<unsigned>(lead) << 8) | trail) {
+        case 0xA145: *glyph = 0x2022; return true;
+        case 0xA14E: *glyph = 0xFF64; return true;
+        case 0xA1C2: *glyph = 0x203E; return true;
+        case 0xA1E3: *glyph = 0x223C; return true;
+        case 0xA1F2: *glyph = 0x2641; return true;
+        case 0xA1F3: *glyph = 0x2609; return true;
+        case 0xA241: *glyph = 0xFF0F; return true;
+        case 0xA242: *glyph = 0xFF3C; return true;
+        case 0xA244: *glyph = 0x00A5; return true;
+        case 0xA246: *glyph = 0x00A2; return true;
+        case 0xA247: *glyph = 0x00A3; return true;
+        case 0xA3E1:
+            return false;
+        default:
+            if (lead == 0xF9 && trail >= 0xD6) return false;
+            break;
+        }
+    }
+    return DecodeDbcsGlyph(codepage, lead, trail, glyph);
+}
+
+static bool BuildSplitDbcs160Pages(const AtlasProfile& profile, UINT codepage,
+    bool appendAsciiPage, std::vector<std::vector<UINT32>>* pages) {
+    const size_t capacity = AtlasCellCapacity(profile);
+    if (!pages || !profile.encoding || capacity != 160 ||
+        profile.pageCount == 0 ||
+        (appendAsciiPage && profile.pageCount < 2)) {
+        return false;
+    }
+    DWORD dbcsPageCount = profile.pageCount - (appendAsciiPage ? 1 : 0);
+    if (dbcsPageCount == 0 || dbcsPageCount > 95) return false;
+    CPINFOEXW codepageInfo = {};
+    if (!GetDbcsCodepageInfo(codepage, &codepageInfo)) return false;
+    pages->clear();
+    pages->reserve(profile.pageCount);
+
+    for (DWORD pageIndex = 0; pageIndex < dbcsPageCount; ++pageIndex) {
+        BYTE lead = static_cast<BYTE>(0xA1 + pageIndex);
+        std::vector<UINT32> page(capacity, 0);
+        size_t trailIndex = 0;
+        size_t validGlyphs = 0;
+        UINT32 gapGlyph = 0;
+        for (int trail = 0x7F; trail <= 0xA0; ++trail) {
+            if (DecodeDbcsGlyph(codepage, lead, static_cast<BYTE>(trail),
+                &gapGlyph)) {
+                return false;
+            }
+        }
+        for (int trail = 0x40; trail <= 0x7E; ++trail, ++trailIndex) {
+            if (DecodeSplitDbcsGlyph(*profile.encoding, codepage, lead,
+                static_cast<BYTE>(trail), &page[trailIndex])) {
+                ++validGlyphs;
+            }
+        }
+        for (int trail = 0xA1; trail <= 0xFE; ++trail, ++trailIndex) {
+            size_t slot = trailIndex + 2;
+            if (DecodeSplitDbcsGlyph(*profile.encoding, codepage, lead,
+                static_cast<BYTE>(trail), &page[slot])) {
+                ++validGlyphs;
+            }
+        }
+        if (validGlyphs == 0) return false;
+        pages->push_back(std::move(page));
+    }
+    if (appendAsciiPage) {
+        std::vector<UINT32> asciiPage(capacity, 0);
+        for (UINT32 glyph = 0x20; glyph <= 0x7E; ++glyph)
+            asciiPage[glyph - 0x20] = glyph;
+        pages->push_back(std::move(asciiPage));
+    }
+    return pages->size() == profile.pageCount;
+}
+
+static bool BuildAtlasPagesForCodepage(const AtlasProfile& profile,
+    UINT codepage, std::vector<std::vector<UINT32>>* pages) {
+    if (!profile.encoding || !pages) return false;
+    switch (profile.encoding->byteLayout) {
+    case AtlasByteLayout::Dbcs188:
+        return BuildDbcs188Pages(profile, codepage, pages);
+    case AtlasByteLayout::LinearDbcs192WithAscii:
+        return BuildLinearDbcs192Pages(profile, codepage, pages);
+    case AtlasByteLayout::SplitDbcs160:
+        return BuildSplitDbcs160Pages(profile, codepage, false, pages);
+    case AtlasByteLayout::SplitDbcs160WithAscii:
+        return BuildSplitDbcs160Pages(profile, codepage, true, pages);
+    default:
+        return false;
+    }
+}
+
+static bool BuildAtlasCharacterMaps(const AtlasProfile& profile,
+    AtlasSetState* state) {
+    if (!profile.encoding || !state) return false;
+    state->automaticCodepage = 0;
+    state->characterMaps.clear();
+
+    std::vector<UINT> candidates;
+    BuildCodepageCandidates(profile.encoding->preferredCodepage, false,
+        &candidates);
+    for (UINT codepage : candidates) {
+        AtlasCharacterMapState characterMap = {};
+        characterMap.codepage = codepage;
+        if (!BuildAtlasPagesForCodepage(profile, codepage,
+            &characterMap.pages)) {
+            continue;
+        }
+        if (state->automaticCodepage == 0)
+            state->automaticCodepage = codepage;
+        state->characterMaps.push_back(std::move(characterMap));
+    }
+    return state->automaticCodepage != 0 && !state->characterMaps.empty();
+}
+
+} // namespace Yuris

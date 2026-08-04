@@ -24,7 +24,8 @@ Electron 对 `app.asar` 与 `resources/app` 的选择，以及主进程和渲染
 Electron 运行时、`app.asar` 文件名和 `data/scenario` 目录可被其他应用复用，不参与独立
 身份判断。
 
-检测结果在进程生命周期内缓存。ASAR 无法可靠建立索引时，不隐藏原 `app.asar`。
+检测结果在进程生命周期内缓存。ASAR 头、JSON 长度或索引边界校验失败时，不改变
+`app.asar` 的可见性。
 
 ## 文件结构
 
@@ -63,7 +64,7 @@ Electron 可以从 `resources/app` 加载解包资源，ASAR 索引为同名文�
 内容。`main.js` 和 `tyrano/tyrano.js` 可附加带唯一标记的桥接脚本，重复读取共享同一
 注入结果。
 
-## 设计理由
+## 设计约束依据
 
 - ASAR 以只读索引和覆盖视图参与运行，不修改原归档，也不依赖 Electron 内部模块。
 - 只有索引可完整读取时才控制 `app.asar` 可见性，保证 `resources/app` 能获得权威内容。
@@ -86,6 +87,29 @@ Electron 可以从 `resources/app` 加载解包资源，ASAR 索引为同名文�
 - 只处理只读打开；写入、创建和截断请求交给真实文件 API。
 - JavaScript 桥接是增强路径，失败时原生 Web 字体重定向仍可独立工作。
 - 配置变化只清理缓存并通知桥接，不在文件钩子内重复导出字体。
+
+## 证据与复刻
+
+1. 固定 `resources/app`、`resources/app.asar`、`package.json`、`tyrano/` 和字体目录的
+   SHA-256；解包与 ASAR 样本分开记录。
+2. 对解包布局检查 `resources/app/tyrano`、`package.json` 标记和字体路径；对 ASAR 保存头大小、
+   JSON 大小、索引条目、偏移和长度的边界结果。
+3. 对 `.ttf`、`.otf`、`.ttc`、`.woff`、`.woff2` 依次执行只读打开、属性和 Web 字体回退，
+   记录 SFNT 字节哈希与 `ConfigVersion`。
+4. 在 `main.js` 和 `tyrano/tyrano.js` 中记录桥接标记、注入位置、重复读取结果及主/渲染进程
+   消息顺序；索引校验失败时检查 `app.asar` 是否保持真实文件。
+5. 对写入、创建、截断、非 Tyrano Electron 和损坏归档执行负向样本。
+
+| 场景 | 预期结果 |
+| --- | --- |
+| 解包框架 + Tyrano 标记 | 文件字体和桥接路径可用 |
+| ASAR 索引完整 + Tyrano 资源 | 归档视图与解包视图按请求路由 |
+| ASAR 边界/JSON/资源校验失败 | 不改变 `app.asar` 可见性，调用真实 API |
+| SFNT 准备完成 | Web 字体按配置重定向，压缩字体作为回退源处理 |
+| 写入或配置关闭 | 文件写入透传，缓存与桥接保持引擎状态 |
+
+证据目录包含 ASAR 索引摘要、字体哈希、桥接日志、主/渲染线程标识和非目标样本。
+记录模板见 [功能证据与复刻流程](../../../../../docs/reproduction.md)。
 
 ## 验证
 

@@ -1,0 +1,414 @@
+// Classic CatSystem2 loads loose font files into its FreeType renderer before
+// the normal GDI creation hooks can replace the selected face. Redirect those
+// files and provide one virtual directory entry when the loose font directory
+// is absent or empty.
+
+namespace CatSystem2Compat {
+
+enum class FontPathKind {
+    None,
+    Directory,
+    FontFile,
+    SearchPattern,
+};
+
+static volatile LONG g_engineProbe = -1;
+static volatile LONG g_traceCount = 0;
+static std::mutex g_fontSourceMutex;
+static LONG g_fontSourceVersion = LONG_MIN;
+static std::wstring g_fontSourceFace;
+static std::wstring g_fontSourcePath;
+
+static void TraceLimited(const char* format, ...) {
+    if (!Config::EnableDebugLog) return;
+    LONG hit = InterlockedIncrement(&g_traceCount);
+    if (hit > 256) return;
+
+    char message[2048] = {};
+    va_list args;
+    va_start(args, format);
+    vsprintf_s(message, format, args);
+    va_end(args);
+    Utils::Trace("[DEBUG][CatSystem2] %s", message);
+}
+
+static bool LooksLikeEngine() {
+    LONG cached = InterlockedCompareExchange(&g_engineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    static const char* const engineMarkers[] = {
+        "CatScene",
+        "cs2confx",
+    };
+    static const char* const fontBackendMarkers[] = {
+        "kcFontImage_Win",
+        "kcFontImage_FT",
+    };
+    HMODULE mainModule = GetModuleHandleW(NULL);
+    bool hasEngineMarker = EngineCommon::ModuleContainsAnyAscii(mainModule,
+        engineMarkers, _countof(engineMarkers));
+    bool hasFontBackends = EngineCommon::ModuleContainsAllAscii(mainModule,
+        fontBackendMarkers, _countof(fontBackendMarkers));
+    bool identityContract = EngineIdentityPolicy::ConfirmCapability(
+        hasEngineMarker, hasFontBackends);
+    bool detected = EngineIdentityPolicy::Confirm({
+        identityContract, false, false, false });
+    InterlockedExchange(&g_engineProbe, detected ? 1 : 0);
+
+    TraceLimited("engine-probe result=%d engine-marker=%d font-backends=%d renderer=FreeType",
+        detected ? 1 : 0, hasEngineMarker ? 1 : 0, hasFontBackends ? 1 : 0);
+    return detected;
+}
+
+static const wchar_t* SelectedSourceFace() {
+    return Config::SourceFontNameW[0] ? Config::SourceFontNameW :
+        Config::ForcedFontNameW;
+}
+
+static bool ReplacementEnabled() {
+    return Config::EnableFontHook && Config::EnableFaceNameReplace &&
+        SelectedSourceFace()[0] != L'\0' && !IsPickerThread() &&
+        LooksLikeEngine();
+}
+
+static bool IsSfntExtension(const std::wstring& path) {
+    return EngineCommon::HasExtension(path, L".ttf") ||
+        EngineCommon::HasExtension(path, L".otf") ||
+        EngineCommon::HasExtension(path, L".ttc") ||
+        EngineCommon::HasExtension(path, L".otc");
+}
+
+static bool IsFontSearchPattern(const std::wstring& leaf) {
+    if (leaf.find_first_of(L"*?") == std::wstring::npos) return false;
+    const wchar_t* extension = PathFindExtensionW(leaf.c_str());
+    if (!extension || !extension[0] || wcspbrk(extension, L"*?")) return true;
+    return _wcsicmp(extension, L".ttf") == 0 ||
+        _wcsicmp(extension, L".otf") == 0 ||
+        _wcsicmp(extension, L".ttc") == 0 ||
+        _wcsicmp(extension, L".otc") == 0;
+}
+
+static bool ClassifyAbsoluteFontPath(const std::wstring& fullPath,
+    FontPathKind* kindOut, std::wstring* fullPathOut,
+    std::wstring* leafOut) {
+    if (kindOut) *kindOut = FontPathKind::None;
+    if (fullPath.empty()) return false;
+
+    static const std::wstring fontRoot = EngineCommon::NormalizePath(
+        EngineCommon::BuildRootPath(L"font"));
+    std::wstring normalized = EngineCommon::NormalizePath(fullPath);
+    if (fontRoot.empty()) return false;
+
+    if (normalized == fontRoot) {
+        if (kindOut) *kindOut = FontPathKind::Directory;
+        if (fullPathOut) *fullPathOut = fullPath;
+        if (leafOut) leafOut->clear();
+        return true;
+    }
+    if (normalized.size() <= fontRoot.size() ||
+        normalized.compare(0, fontRoot.size(), fontRoot) != 0 ||
+        normalized[fontRoot.size()] != L'\\') {
+        return false;
+    }
+
+    std::wstring leaf = normalized.substr(fontRoot.size() + 1);
+    if (leaf.empty() || leaf.find(L'\\') != std::wstring::npos) return false;
+
+    FontPathKind kind = FontPathKind::None;
+    if (IsFontSearchPattern(leaf)) kind = FontPathKind::SearchPattern;
+    else if (IsSfntExtension(leaf)) kind = FontPathKind::FontFile;
+    if (kind == FontPathKind::None) return false;
+
+    if (kindOut) *kindOut = kind;
+    if (fullPathOut) *fullPathOut = fullPath;
+    if (leafOut) *leafOut = leaf;
+    return true;
+}
+
+static bool ClassifyFontPath(const wchar_t* fileName, FontPathKind* kindOut,
+    std::wstring* fullPathOut, std::wstring* leafOut) {
+    if (!fileName || !fileName[0]) return false;
+
+    std::wstring rootRelative = EngineCommon::FullPath(fileName);
+    if (ClassifyAbsoluteFontPath(rootRelative, kindOut, fullPathOut, leafOut))
+        return true;
+
+    // CatSystem2 may temporarily make the font directory current and pass only
+    // a leaf name to AddFontResource. Resolve that narrow case against the real
+    // process working directory as well as the stable game root.
+    if (!PathIsRelativeW(fileName) ||
+        (!IsSfntExtension(fileName) && !wcspbrk(fileName, L"*?"))) {
+        return false;
+    }
+    wchar_t currentRelative[MAX_PATH] = {};
+    DWORD length = GetFullPathNameW(fileName, _countof(currentRelative),
+        currentRelative, NULL);
+    if (length == 0 || length >= _countof(currentRelative)) return false;
+    return ClassifyAbsoluteFontPath(currentRelative, kindOut, fullPathOut,
+        leafOut);
+}
+
+static std::wstring ResolveFontSource() {
+    if (!ReplacementEnabled()) return L"";
+
+    LONG version = Config::ConfigVersion;
+    std::wstring face = SelectedSourceFace();
+    {
+        std::lock_guard<std::mutex> lock(g_fontSourceMutex);
+        if (g_fontSourceVersion == version && g_fontSourceFace == face)
+            return g_fontSourcePath;
+    }
+
+    std::wstring source = EngineCommon::FindSystemFontFileByFace(face.c_str());
+    if (source.empty() && _wcsicmp(face.c_str(), Config::ForcedFontNameW) != 0) {
+        source = EngineCommon::FindSystemFontFileByFace(
+            Config::ForcedFontNameW);
+    }
+    if (source.empty()) {
+        source = EngineCommon::FindLocalFontFile(Config::FontFileName);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_fontSourceMutex);
+        g_fontSourceVersion = version;
+        g_fontSourceFace = face;
+        g_fontSourcePath = source;
+    }
+
+    if (source.empty()) {
+        TraceLimited("font-source-missing version=%ld face='%s'",
+            version, EngineCommon::WideToUtf8(face).c_str());
+    } else {
+        TraceLimited("font-source-ready version=%ld face='%s' source='%s'",
+            version, EngineCommon::WideToUtf8(face).c_str(),
+            EngineCommon::WideToUtf8(source).c_str());
+    }
+    return source;
+}
+
+static std::wstring SourceExtension(const std::wstring& source) {
+    const wchar_t* extension = PathFindExtensionW(source.c_str());
+    if (extension && IsSfntExtension(extension)) return extension;
+    return L".ttf";
+}
+
+static bool BuildVirtualFileName(const std::wstring& requestLeaf,
+    const std::wstring& source, std::wstring* virtualNameOut) {
+    if (!virtualNameOut || requestLeaf.empty()) return false;
+    if (requestLeaf.find_first_of(L"*?") == std::wstring::npos) {
+        if (!IsSfntExtension(requestLeaf)) return false;
+        *virtualNameOut = requestLeaf;
+        return true;
+    }
+
+    std::wstring sourceExtension = SourceExtension(source);
+    const wchar_t* const extensions[] = {
+        sourceExtension.c_str(), L".ttf", L".otf", L".ttc", L".otc"
+    };
+    for (const wchar_t* extension : extensions) {
+        std::wstring candidate = L"SimpleFontHook";
+        candidate += extension;
+        if (PathMatchSpecW(candidate.c_str(), requestLeaf.c_str())) {
+            *virtualNameOut = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+static HANDLE TryOpenRedirectedFontFileW(const wchar_t* fileName,
+    DWORD desiredAccess, DWORD shareMode,
+    LPSECURITY_ATTRIBUTES securityAttributes, DWORD creationDisposition,
+    DWORD flagsAndAttributes, HANDLE templateFile) {
+    if (!EngineCommon::IsReadOnlyOpen(desiredAccess, creationDisposition))
+        return INVALID_HANDLE_VALUE;
+
+    FontPathKind kind = FontPathKind::None;
+    std::wstring requestPath;
+    if (!ClassifyFontPath(fileName, &kind, &requestPath, NULL) ||
+        kind != FontPathKind::FontFile || !ReplacementEnabled()) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    std::wstring source = ResolveFontSource();
+    if (source.empty() || EngineCommon::SamePath(requestPath, source))
+        return INVALID_HANDLE_VALUE;
+
+    HANDLE file = orgCreateFileW(source.c_str(), desiredAccess, shareMode,
+        securityAttributes, OPEN_EXISTING, flagsAndAttributes, templateFile);
+    if (file == INVALID_HANDLE_VALUE) {
+        TraceLimited("font-open-failed request='%s' source='%s' err=%lu",
+            EngineCommon::WideToUtf8(requestPath).c_str(),
+            EngineCommon::WideToUtf8(source).c_str(), GetLastError());
+        return INVALID_HANDLE_VALUE;
+    }
+    TraceLimited("font-open-redirect request='%s' source='%s'",
+        EngineCommon::WideToUtf8(requestPath).c_str(),
+        EngineCommon::WideToUtf8(source).c_str());
+    return file;
+}
+
+static bool TryGetRedirectedFontAttributesW(const wchar_t* fileName,
+    WIN32_FILE_ATTRIBUTE_DATA* data, DWORD* attributes) {
+    FontPathKind kind = FontPathKind::None;
+    std::wstring requestPath;
+    if (!ClassifyFontPath(fileName, &kind, &requestPath, NULL) ||
+        !ReplacementEnabled()) {
+        return false;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA localData = {};
+    if (kind == FontPathKind::Directory) {
+        DWORD realAttributes = orgGetFileAttributesW(requestPath.c_str());
+        if (realAttributes != INVALID_FILE_ATTRIBUTES) return false;
+        localData.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        GetSystemTimeAsFileTime(&localData.ftCreationTime);
+        localData.ftLastAccessTime = localData.ftCreationTime;
+        localData.ftLastWriteTime = localData.ftCreationTime;
+    } else if (kind == FontPathKind::FontFile) {
+        std::wstring source = ResolveFontSource();
+        if (source.empty() || !orgGetFileAttributesExW(source.c_str(),
+            GetFileExInfoStandard, &localData)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if (data) *data = localData;
+    if (attributes) *attributes = localData.dwFileAttributes;
+    TraceLimited("font-attrs-redirect request='%s' kind=%s",
+        EngineCommon::WideToUtf8(requestPath).c_str(),
+        kind == FontPathKind::Directory ? "directory" : "file");
+    return true;
+}
+
+static bool TryFindFirstFallbackW(const wchar_t* fileName,
+    WIN32_FIND_DATAW* findData, HANDLE* result) {
+    if (!findData || !result || !ReplacementEnabled()) return false;
+
+    FontPathKind kind = FontPathKind::None;
+    std::wstring requestPath;
+    std::wstring requestLeaf;
+    if (!ClassifyFontPath(fileName, &kind, &requestPath, &requestLeaf) ||
+        (kind != FontPathKind::SearchPattern &&
+         kind != FontPathKind::FontFile)) {
+        return false;
+    }
+
+    std::wstring source = ResolveFontSource();
+    std::wstring virtualName;
+    if (source.empty() ||
+        !BuildVirtualFileName(requestLeaf, source, &virtualName)) {
+        return false;
+    }
+
+    WIN32_FIND_DATAW sourceData = {};
+    HANDLE find = orgFindFirstFileW(source.c_str(), &sourceData);
+    if (find == INVALID_HANDLE_VALUE) return false;
+
+    wcsncpy_s(sourceData.cFileName, virtualName.c_str(), _TRUNCATE);
+    sourceData.cAlternateFileName[0] = L'\0';
+    *findData = sourceData;
+    *result = find;
+    TraceLimited("font-search-fallback request='%s' virtual='%s' source='%s'",
+        EngineCommon::WideToUtf8(requestPath).c_str(),
+        EngineCommon::WideToUtf8(virtualName).c_str(),
+        EngineCommon::WideToUtf8(source).c_str());
+    return true;
+}
+
+static bool TryAddFontResourceW(const wchar_t* fileName, int* result) {
+    if (!result || !ReplacementEnabled()) return false;
+
+    FontPathKind kind = FontPathKind::None;
+    std::wstring requestPath;
+    if (!ClassifyFontPath(fileName, &kind, &requestPath, NULL) ||
+        kind != FontPathKind::FontFile) {
+        return false;
+    }
+
+    std::wstring source = ResolveFontSource();
+    if (source.empty() || EngineCommon::SamePath(requestPath, source))
+        return false;
+
+    int added = orgAddFontResourceW(source.c_str());
+    TraceLimited("font-register-redirect request='%s' source='%s' result=%d",
+        EngineCommon::WideToUtf8(requestPath).c_str(),
+        EngineCommon::WideToUtf8(source).c_str(), added);
+    if (added <= 0) return false;
+    *result = added;
+    return true;
+}
+
+static bool TryRemoveFontResourceW(const wchar_t* fileName, BOOL* result) {
+    if (!result || !ReplacementEnabled()) return false;
+
+    FontPathKind kind = FontPathKind::None;
+    std::wstring requestPath;
+    if (!ClassifyFontPath(fileName, &kind, &requestPath, NULL) ||
+        kind != FontPathKind::FontFile) {
+        return false;
+    }
+
+    std::wstring source = ResolveFontSource();
+    if (source.empty() || EngineCommon::SamePath(requestPath, source))
+        return false;
+
+    BOOL removed = orgRemoveFontResourceW(source.c_str());
+    TraceLimited("font-unregister-redirect request='%s' source='%s' result=%d",
+        EngineCommon::WideToUtf8(requestPath).c_str(),
+        EngineCommon::WideToUtf8(source).c_str(), removed ? 1 : 0);
+    if (!removed) return false;
+    *result = removed;
+    return true;
+}
+
+static void NotifyConfigChanged(LONG version) {
+    {
+        std::lock_guard<std::mutex> lock(g_fontSourceMutex);
+        g_fontSourceVersion = LONG_MIN;
+        g_fontSourceFace.clear();
+        g_fontSourcePath.clear();
+    }
+    if (LooksLikeEngine()) {
+        TraceLimited("config-changed version=%ld face='%s' next-font-open=refresh",
+            version, EngineCommon::WideToUtf8(SelectedSourceFace()).c_str());
+    }
+}
+
+} // namespace CatSystem2Compat
+
+static int WINAPI newAddFontResourceW(LPCWSTR fileName) {
+    int result = 0;
+    if (CatSystem2Compat::TryAddFontResourceW(fileName, &result))
+        return result;
+    return orgAddFontResourceW(fileName);
+}
+
+static int WINAPI newAddFontResourceA(LPCSTR fileName) {
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    int result = 0;
+    if (!wide.empty() &&
+        CatSystem2Compat::TryAddFontResourceW(wide.c_str(), &result)) {
+        return result;
+    }
+    return orgAddFontResourceA(fileName);
+}
+
+static BOOL WINAPI newRemoveFontResourceW(LPCWSTR fileName) {
+    BOOL result = FALSE;
+    if (CatSystem2Compat::TryRemoveFontResourceW(fileName, &result))
+        return result;
+    return orgRemoveFontResourceW(fileName);
+}
+
+static BOOL WINAPI newRemoveFontResourceA(LPCSTR fileName) {
+    std::wstring wide = EngineCommon::WideFromAnsi(fileName);
+    BOOL result = FALSE;
+    if (!wide.empty() &&
+        CatSystem2Compat::TryRemoveFontResourceW(wide.c_str(), &result)) {
+        return result;
+    }
+    return orgRemoveFontResourceA(fileName);
+}

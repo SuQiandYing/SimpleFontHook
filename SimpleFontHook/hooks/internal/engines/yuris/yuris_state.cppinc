@@ -1,0 +1,241 @@
+namespace Yuris {
+
+namespace FontToPicPreset {
+constexpr int BoldStrength = 2;
+constexpr int OutlineWidth = 1;
+constexpr int ShadowOffsetX = 2;
+constexpr int ShadowOffsetY = 1;
+constexpr int PunctuationOffsetX = 2;
+constexpr int PunctuationOffsetY = 1;
+constexpr int BottomGlyphPadding = 0;
+constexpr int OpticalCenterOffsetY = 2;
+constexpr int PairedPunctuationEdgePadding = 1;
+constexpr BYTE FillRed = 255;
+constexpr BYTE FillGreen = 255;
+constexpr BYTE FillBlue = 255;
+constexpr BYTE OutlineRed = 0;
+constexpr BYTE OutlineGreen = 0;
+constexpr BYTE OutlineBlue = 0;
+constexpr BYTE ShadowRed = 0;
+constexpr BYTE ShadowGreen = 0;
+constexpr BYTE ShadowBlue = 0;
+}
+
+constexpr size_t kRenderCacheLimit = 12;
+
+enum StyleFlag : unsigned char {
+    StyleBold = 1,
+    StyleShadow = 2,
+    StyleOutline = 4,
+};
+
+enum class AtlasByteLayout : unsigned char {
+    Dbcs188,
+    LinearDbcs192WithAscii,
+    SplitDbcs160,
+    SplitDbcs160WithAscii,
+};
+
+enum class AtlasGlyphPlacement : unsigned char {
+    TextOrigin,
+    Big5OpticalCell,
+    ReliriumOpticalCell,
+};
+
+enum class AtlasPixelOrder : unsigned char {
+    Bgra,
+    Rgba,
+};
+
+enum class AtlasPathKind : unsigned char {
+    StyledDirectory,
+    StyledSizeDirectory,
+    NamedFontDirectory,
+};
+
+enum class AtlasDecoderKind : unsigned char {
+    WebpOrdinal3,
+    PngOrdinals1And2,
+    MainModuleYdgSections,
+};
+
+struct MainModuleDecoderProfile {
+    const char* name;
+    const BYTE* signature;
+    size_t signatureSize;
+};
+
+struct AtlasLayout {
+    int width;
+    int height;
+    int originX;
+    int originY;
+    int cellWidth;
+    int cellHeight;
+    int drawOffsetX;
+    int drawOffsetY;
+    int glyphWidth;
+    int glyphHeight;
+    int columns;
+    int rows;
+    int fontPixels;
+};
+
+struct AtlasEncodingProfile {
+    const char* name;
+    AtlasByteLayout byteLayout;
+    UINT preferredCodepage;
+    BYTE privateUseLeadPageLimit;
+    UINT32 invalidGlyph;
+    bool useStandardBig5Symbols;
+    bool applyTextSubstitution;
+};
+
+struct AtlasProfile {
+    const char* name;
+    DWORD pageCount;
+    const unsigned char* styles;
+    size_t styleCount;
+    AtlasLayout layout;
+    AtlasGlyphPlacement glyphPlacement;
+    const AtlasEncodingProfile* encoding;
+    AtlasPixelOrder pixelOrder;
+    AtlasPathKind pathKind;
+    const wchar_t* directoryName;
+    const wchar_t* filePrefix;
+    const wchar_t* fileExtension;
+    bool forceOutline;
+    const BYTE* pageNumbers;
+    size_t pageNumberCount;
+    BYTE outlineWidth;
+    BYTE outlineRed;
+    BYTE outlineGreen;
+    BYTE outlineBlue;
+    BYTE outlineAlpha;
+};
+
+struct ArchiveProfile {
+    const char* name;
+    const wchar_t* archiveHintPath;
+    const wchar_t* decoderModule;
+    const char* pathPrefix;
+    const BYTE* nameLengthSwaps;
+    size_t nameLengthSwapCount;
+    DWORD ypfVersion;
+    UINT preferredArchiveNameCodepage;
+    BYTE fileType;
+    AtlasDecoderKind decoderKind;
+    const MainModuleDecoderProfile* mainModuleDecoder;
+    const AtlasProfile* atlasProfiles;
+    size_t atlasProfileCount;
+    bool strictArchiveNameEncoding;
+    bool fontOnlyArchive;
+};
+
+struct AtlasCharacterMapState {
+    UINT codepage;
+    std::vector<std::vector<UINT32>> pages;
+};
+
+struct AtlasSetState {
+    const AtlasProfile* profile;
+    UINT automaticCodepage;
+    std::vector<AtlasCharacterMapState> characterMaps;
+};
+
+struct CatalogEntry {
+    struct Section {
+        unsigned __int64 fingerprint;
+        DWORD compressedSize;
+        int sourceRow;
+        int sourceHeight;
+    };
+
+    unsigned __int64 fingerprint;
+    DWORD compressedSize;
+    int page;
+    unsigned char style;
+    int atlasSetIndex;
+    std::vector<Section> sections;
+};
+
+struct YdgCatalogSectionRef {
+    int catalogIndex;
+    size_t sectionIndex;
+};
+
+struct RenderCacheEntry {
+    LONG version;
+    int catalogIndex;
+    UINT characterCodepage;
+    unsigned __int64 useSerial;
+    std::vector<BYTE> pixels;
+};
+
+typedef int (WINAPI* DecodeWebp)(const void*, void*, int, int, int);
+typedef int (WINAPI* OpenPng)(int, const void*, int*, int*, BYTE*);
+typedef int (WINAPI* DecodePng)(void*, int, int);
+
+static volatile LONG g_identityState = 0; // 0 unknown, 1 rejected, 2 confirmed
+static volatile LONG g_catalogState = 0;  // 0 idle, 1 loading, 2 ready, -1 failed
+static volatile LONG g_lastNotifyVersion = LONG_MIN;
+static volatile LONG g_decoderWrapTraceCount = 0;
+static volatile LONG g_pngOpenWrapTraceCount = 0;
+static volatile LONG g_pngDecodeWrapTraceCount = 0;
+static volatile LONG g_decodeTraceCount = 0;
+static volatile LONG g_renderTraceCount = 0;
+static volatile LONG g_encodingOverrideTraceCount = 0;
+static volatile LONG g_ambiguousCatalogTraceCount = 0;
+static volatile LONGLONG g_renderUseSerial = 0;
+static PVOID volatile g_originalDecodeWebp = NULL;
+static PVOID volatile g_originalOpenPng = NULL;
+static PVOID volatile g_originalDecodePng = NULL;
+static PVOID g_originalDecodeYdgQoi = NULL;
+static const MainModuleDecoderProfile* g_installedMainModuleDecoder = NULL;
+static HANDLE g_catalogReadyEvent = NULL;
+static HookWorkerThreadState g_catalogThread = {};
+
+static std::vector<CatalogEntry> g_catalog;
+static std::unordered_multimap<DWORD, int> g_catalogByCompressedSize;
+static std::unordered_multimap<DWORD, YdgCatalogSectionRef>
+    g_ydgBySectionSize;
+static std::vector<AtlasSetState> g_atlasSets;
+static const ArchiveProfile* g_archiveProfile = NULL;
+
+static std::mutex g_renderCacheMutex;
+static std::vector<RenderCacheEntry> g_renderCache;
+
+static unsigned __int64 HashBytes(const void* bytes, size_t byteCount) {
+    const BYTE* cursor = static_cast<const BYTE*>(bytes);
+    unsigned __int64 hash = 14695981039346656037ULL;
+    for (size_t index = 0; index < byteCount; ++index) {
+        hash ^= cursor[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static bool IsIdentityConfirmed() {
+    LONG state = InterlockedCompareExchange(&g_identityState, 0, 0);
+    if (state != 0) return state == 2;
+
+    static const char* const markers[] = {
+        "ysbin\\yscfg.ybn",
+        "yu-ris1",
+    };
+    bool confirmed = EngineIdentityPolicy::Confirm({
+        EngineCommon::MainModuleContainsAllAscii(markers, _countof(markers)),
+        false,
+        false,
+        false,
+        false,
+    });
+    InterlockedCompareExchange(&g_identityState, confirmed ? 2 : 1, 0);
+    state = InterlockedCompareExchange(&g_identityState, 0, 0);
+    if (state == 2) {
+        Utils::Trace("[Yuris] identity confirmed markers=ysbin/yscfg.ybn+yu-ris1");
+    }
+    return state == 2;
+}
+
+} // namespace Yuris
