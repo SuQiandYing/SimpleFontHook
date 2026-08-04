@@ -63,7 +63,7 @@
 文件型适配统一调用 `engine_file_dispatch.cppinc`。运行时型适配通过窗口消息、工作线程、
 Python pending call、Mono/IL2CPP 线程附加或引擎函数钩子执行。
 
-## 设计理由
+## 设计约束依据
 
 - 聚合 `.cppinc` 让原始 API 指针、递归保护和缓存状态保持内部链接，同时用文件边界
   分隔实现职责。
@@ -84,7 +84,7 @@ Python pending call、Mono/IL2CPP 线程附加或引擎函数钩子执行。
 
 ## 扩展规则
 
-1. 新 API 归入职责相符的 `Attach*Hooks` 类别。
+1. 扩展 API 归入职责相符的 `Attach*Hooks` 类别。
 2. 原始函数指针与钩子处理函数位于同一聚合翻译单元。
 3. 兼容决策集中在 `hook_policy.*`。
 4. 高频路径使用缓存状态、有界查找和采样日志。
@@ -96,3 +96,21 @@ Python pending call、Mono/IL2CPP 线程附加或引擎函数钩子执行。
 通用钩子覆盖字体创建、HDC 选择、绘制、查询、缓存命中、配置关闭和选择器线程。引擎
 适配覆盖正向检测、负向检测、配置版本刷新和目标架构。C++ 修改同时编译 Win32 与 x64
 Release。
+
+## 证据与复刻
+
+静态入口为 `font_hooks.cpp`、`font_hooks.h`、`hook_policy.*` 和各类
+`Attach*Hooks` 函数；运行时入口为 `FontHooks::Install`、配置通知和退出接口。复刻通用
+字体路径时固定进程架构与 `FontHook.ini`，先记录未安装适配时的创建/查询/绘制结果，
+再逐类启用钩子并对照 `ConfigVersion`、缓存命中和 `org*` 回退日志。
+
+| 场景 | 检查入口 | 预期结果 |
+| --- | --- | --- |
+| 字体创建 | `AttachFontCreationHooks` | 保存源 `LOGFONT`，返回带版本缓存的替换 `HFONT` |
+| 查询/度量 | `AttachFontIdentityQueryHooks`、`AttachTextLayoutMetricHooks` | 查询视图与绘制对象使用同一配置版本 |
+| 内部探测 | `EngineCommon::IsInternalFileQuery` | 适配器探测读取真实 API，不进入虚拟路径 |
+| 配置关闭 | `FontHooks::NotifyConfigChanged` | 缓存失效，未命中时调用 `org*` |
+| 非目标进程 | 身份策略缓存 | 不安装引擎专用逻辑 |
+
+日志、配置快照、样本哈希和命令按 [功能证据与复刻流程](../../docs/reproduction.md)
+记录；高频 API 只保留有界采样。

@@ -5,8 +5,10 @@
 #include "../ui/font_picker.h"
 #include "hook_policy.h"
 #include "internal/engines/common/engine_common.h"
+#include "internal/engines/common/engine_identity_policy.h"
 #include <detours.h>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -61,6 +63,7 @@ static void AdjustTextMetricForHdc(HDC hdc, LPTEXTMETRICW metric);
 }
 static bool ArtemisLegacyTrySubstituteMultiByteToWideChar(UINT codepage, DWORD flags,
     LPCCH multiByteText, int multiByteCount, LPWSTR wideText, int wideCount, int* result);
+static bool SubstituteDecodedTextInPlace(LPWSTR text, int count);
 static bool MajiroShouldPreserveDefaultCharset(const LOGFONTW& sourceLogfont);
 static bool SoftpalShouldUseNaturalReplacementWidth();
 
@@ -81,6 +84,7 @@ static bool SoftpalShouldUseNaturalReplacementWidth();
 #include "internal/engines/artemis_legacy/artemis_legacy_notify.cppinc"
 #include "internal/engines/artemis/artemis_paths.cppinc"
 #include "internal/engines/escude/escude_config.cppinc"
+#include "internal/engines/catsystem2/catsystem2_font.cppinc"
 #include "internal/engines/mirai/mirai_font_data.cppinc"
 #include "internal/engines/krkr/krkr_paths.cppinc"
 #include "internal/engines/entis/entis_font.cppinc"
@@ -93,6 +97,7 @@ static bool SoftpalShouldUseNaturalReplacementWidth();
 #include "internal/engines/artemis/artemis_file_hooks.cppinc"
 #include "internal/engines/tyrano/tyrano_web_fonts.cppinc"
 #include "internal/engines/renpy/renpy_font.cppinc"
+#include "internal/engines/yuris/yuris_font.cppinc"
 #include "internal/engines/engine_file_dispatch.cppinc"
 #include "internal/engines/engine_file_hooks.cppinc"
 #include "internal/font_hooks_text_render.cppinc"
