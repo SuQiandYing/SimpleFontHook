@@ -13,15 +13,45 @@ static void CreatePickerWindow() {
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
+    // Keep standard top-level window semantics for DWM transitions. The
+    // window procedure and DWM policy suppress all native frame rendering.
+    DWORD pickerStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+        WS_THICKFRAME | WS_MINIMIZEBOX;
     g_hWnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_LAYERED,
-        WND_CLASS, L"Font Selection Assistant", WS_POPUP,
+        WND_CLASS, L"Font Selection Assistant", pickerStyle,
         (screenW - WINDOW_WIDTH) / 2, (screenH - WINDOW_HEIGHT) / 2,
         WINDOW_WIDTH, WINDOW_HEIGHT,
         NULL, NULL, g_hModule, NULL);
 
+    if (!g_hWnd) return;
+
+    DWMNCRENDERINGPOLICY ncPolicy = DWMNCRP_DISABLED;
+    HRESULT ncResult = DwmSetWindowAttribute(g_hWnd,
+        DWMWA_NCRENDERING_POLICY, &ncPolicy, sizeof(ncPolicy));
+    if (FAILED(ncResult)) {
+        Utils::Trace("[Picker] DWM non-client policy failed hr=0x%08lX",
+            (unsigned long)ncResult);
+    }
+
+    BOOL transitionsForcedDisabled = FALSE;
+    HRESULT transitionResult = DwmSetWindowAttribute(g_hWnd,
+        DWMWA_TRANSITIONS_FORCEDISABLED,
+        &transitionsForcedDisabled, sizeof(transitionsForcedDisabled));
+    if (FAILED(transitionResult)) {
+        Utils::Trace("[Picker] DWM transition policy failed hr=0x%08lX",
+            (unsigned long)transitionResult);
+    }
+
+    // Force the custom client calculation before the initially hidden window
+    // is shown, so the native frame never reaches the screen.
+    SetWindowPos(g_hWnd, NULL, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+        SWP_FRAMECHANGED);
+
     // Make window slightly transparent without keeping the system resize frame.
-    SetLayeredWindowAttributes(g_hWnd, 0, 245, LWA_ALPHA);
+    SetLayeredWindowAttributes(g_hWnd, 0, PICKER_WINDOW_OPACITY, LWA_ALPHA);
+    g_pickerAnimationCurrentAlpha = PICKER_WINDOW_OPACITY;
 
     // Search edit
     g_hSearchEdit = CreateWindowExW(0, L"EDIT", L"",
@@ -42,16 +72,19 @@ static void CreatePickerWindow() {
         UINT modifiers;
         UINT vk;
         const char* name;
+        const wchar_t* displayName;
     };
     const HotKeyCandidate hotkeys[] = {
-        { HOTKEY_TOGGLE_PICKER, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'F', "Ctrl+Alt+F" },
-        { HOTKEY_TOGGLE_PICKER_ALT_SHIFT, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'F', "Ctrl+Alt+Shift+F" },
-        { HOTKEY_TOGGLE_PICKER_F8, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F8, "Ctrl+Alt+F8" },
+        { HOTKEY_TOGGLE_PICKER_INSERT, MOD_NOREPEAT, VK_INSERT, "Insert", L"Insert" },
+        { HOTKEY_TOGGLE_PICKER_PAUSE, MOD_NOREPEAT, VK_PAUSE, "Pause", L"Pause" },
+        { HOTKEY_TOGGLE_PICKER_SCROLL_LOCK, MOD_NOREPEAT, VK_SCROLL, "Scroll Lock", L"Scroll Lock" },
     };
     g_toggleHotkeyRegistered = false;
+    wcscpy_s(g_toggleHotkeyDisplayName, L"未注册");
     for (const HotKeyCandidate& hotkey : hotkeys) {
         if (RegisterHotKey(g_hWnd, hotkey.id, hotkey.modifiers, hotkey.vk)) {
             g_toggleHotkeyRegistered = true;
+            wcscpy_s(g_toggleHotkeyDisplayName, hotkey.displayName);
             Utils::Trace("[Picker] Registered toggle hotkey %s", hotkey.name);
             break;
         }
@@ -88,7 +121,6 @@ static void RestoreUIStateFromConfig() {
 
     // Restore spoof state
     g_spoofEnabled = Config::EnableCodepageSpoof;
-    g_spoofRuntimeReplaceEnabled = Config::EnableCodepageRuntimeReplace;
     g_textSubstitutionEnabled = Config::EnableTextSubstitution;
     g_codepageRedirectEnabled = Config::EnableCodepageRedirect;
     g_codepageRedirectPresetIdx = FindCodepageRedirectPresetIndex(
@@ -115,6 +147,10 @@ static void RestoreUIStateFromConfig() {
             break;
         }
     }
+    // Keep the UI and runtime on the same derived mode after config restore.
+    g_spoofRuntimeReplaceEnabled =
+        g_spoofEnabled && Config::SpoofFromCharset != Config::SpoofToCharset;
+    Config::EnableCodepageRuntimeReplace = g_spoofRuntimeReplaceEnabled;
 
     // Try to select the applied font in the list
     UpdateFilter();
@@ -186,10 +222,9 @@ void Init(HMODULE hModule) {
         ShowWindow(g_hWnd, SW_HIDE);
         g_visible = false;
     } else {
-        ShowWindow(g_hWnd, SW_SHOWNORMAL);
+        ShowPickerWindowAnimated(g_hWnd);
         SetForegroundWindow(g_hWnd);
-        SetFocus(g_hSearchEdit);
-        g_visible = true;
+        SetFocus(g_pickerPage == PICKER_PAGE_FONTS ? g_hSearchEdit : g_hWnd);
     }
 
     MSG msg = {};
@@ -205,11 +240,13 @@ void Init(HMODULE hModule) {
 
 void Toggle() {
     if (!g_hWnd) return;
-    g_visible = !g_visible;
-    ShowWindow(g_hWnd, g_visible ? SW_RESTORE : SW_HIDE);
+    if (g_visible)
+        HidePickerWindowAnimated(g_hWnd);
+    else
+        ShowPickerWindowAnimated(g_hWnd);
     if (g_visible) {
         SetForegroundWindow(g_hWnd);
-        SetFocus(g_hSearchEdit);
+        SetFocus(g_pickerPage == PICKER_PAGE_FONTS ? g_hSearchEdit : g_hWnd);
         InvalidateRect(g_hWnd, NULL, FALSE);
     }
 }

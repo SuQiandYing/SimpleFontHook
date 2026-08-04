@@ -1,0 +1,146 @@
+static void ClampGuideScroll() {
+    int maxScroll = GetGuideMaxScroll();
+    g_guideScrollOffset = max(0, min(maxScroll, g_guideScrollOffset));
+}
+
+static void ClearFontPageHoverState() {
+    g_hoveredIndex = -1;
+    g_hoveredCharset = -1;
+    g_scrollbarHovered = false;
+    g_spoofToggleHovered = false;
+    g_spoofCharsetHovered = false;
+    g_textSubstitutionHovered = false;
+    g_textSubstitutionModeHovered = false;
+    g_codepageRedirectHovered = false;
+    g_codepageRedirectPresetHovered = false;
+    g_metricHovered = METRIC_NONE;
+}
+
+static bool ClearGuidePageHoverState() {
+    bool dirty = g_guideHoveredSection >= 0 || g_guideScrollbarHovered;
+    g_guideHoveredSection = -1;
+    g_guideScrollbarHovered = false;
+    return dirty;
+}
+
+static void EndGuideScrollbarDrag() {
+    if (!g_guideScrollbarDragging) return;
+    g_guideScrollbarDragging = false;
+    ReleaseCapture();
+}
+
+static void SetPickerPage(HWND hWnd, PickerPage page) {
+    if (g_pickerPage == page)
+        return;
+
+    if (g_hMetricEdit)
+        FinishMetricEdit(true);
+    if (g_scrollbarDragging) {
+        g_scrollbarDragging = false;
+        ReleaseCapture();
+    }
+    EndGuideScrollbarDrag();
+
+    g_pickerPage = page;
+    ClearFontPageHoverState();
+    ClearGuidePageHoverState();
+    if (g_hSearchEdit) {
+        ShowWindow(g_hSearchEdit,
+            page == PICKER_PAGE_FONTS ? SW_SHOWNA : SW_HIDE);
+    }
+
+    if (page == PICKER_PAGE_FONTS && g_hSearchEdit)
+        SetFocus(g_hSearchEdit);
+    else
+        SetFocus(hWnd);
+    InvalidateRect(hWnd, NULL, FALSE);
+}
+
+static void SetGuideSection(HWND hWnd, PickerGuideSection section) {
+    if (section < PICKER_GUIDE_QUICK_START ||
+        section >= PICKER_GUIDE_SECTION_COUNT)
+        return;
+    if (g_guideSection == section)
+        return;
+
+    g_guideSection = section;
+    g_guideScrollOffset = 0;
+    g_guideContentHeight = 0;
+    EndGuideScrollbarDrag();
+    InvalidateRect(hWnd, NULL, FALSE);
+}
+
+static bool HandleGuidePageClick(HWND hWnd, int x, int y) {
+    int sectionHit = GuideSectionHitTest(x, y);
+    if (sectionHit >= 0) {
+        SetGuideSection(hWnd, (PickerGuideSection)sectionHit);
+        return true;
+    }
+
+    RECT thumb = {}, track = {};
+    GetGuideScrollbarRect(&thumb, &track);
+    if (PointInRect(x, y, thumb)) {
+        g_guideScrollbarDragging = true;
+        g_guideScrollDragStartY = y;
+        g_guideScrollDragStartOffset = g_guideScrollOffset;
+        SetCapture(hWnd);
+        InvalidateUiRect(hWnd, track, 2);
+        return true;
+    }
+    if (PointInRect(x, y, track) && GetGuideMaxScroll() > 0) {
+        RECT viewport = GetGuideViewportRect();
+        int page = max(40, (int)(viewport.bottom - viewport.top) - 40);
+        g_guideScrollOffset += y < thumb.top ? -page : page;
+        ClampGuideScroll();
+        InvalidateUiRect(hWnd, viewport, 1);
+        return true;
+    }
+    return false;
+}
+
+static void HandleGuidePageMouseMove(HWND hWnd, int x, int y) {
+    if (g_guideScrollbarDragging) {
+        RECT thumb = {}, track = {};
+        GetGuideScrollbarRect(&thumb, &track);
+        int maxScroll = GetGuideMaxScroll();
+        int thumbHeight = max(1, (int)(thumb.bottom - thumb.top));
+        int scrollRange = max(1,
+            (int)(track.bottom - track.top) - thumbHeight);
+        int dy = y - g_guideScrollDragStartY;
+        g_guideScrollOffset = g_guideScrollDragStartOffset +
+            dy * maxScroll / scrollRange;
+        ClampGuideScroll();
+        InvalidateUiRect(hWnd, GetGuideViewportRect(), 1);
+        return;
+    }
+
+    int sectionHit = GuideSectionHitTest(x, y);
+    RECT thumb = {}, track = {};
+    GetGuideScrollbarRect(&thumb, &track);
+    bool scrollbarHovered = PointInRect(x, y, thumb);
+    if (sectionHit != g_guideHoveredSection ||
+        scrollbarHovered != g_guideScrollbarHovered) {
+        bool sectionDirty = sectionHit != g_guideHoveredSection;
+        bool scrollbarDirty = scrollbarHovered != g_guideScrollbarHovered;
+        g_guideHoveredSection = sectionHit;
+        g_guideScrollbarHovered = scrollbarHovered;
+        if (sectionDirty)
+            InvalidateUiRect(hWnd, GetGuideSectionTabsRect(), 1);
+        if (scrollbarDirty)
+            InvalidateUiRect(hWnd, track, 2);
+    }
+}
+
+static void HandleGuidePageWheel(HWND hWnd, int delta) {
+    g_guideWheelRemainder += delta;
+    int notches = g_guideWheelRemainder / WHEEL_DELTA;
+    if (notches == 0)
+        return;
+    g_guideWheelRemainder -= notches * WHEEL_DELTA;
+
+    int oldOffset = g_guideScrollOffset;
+    g_guideScrollOffset -= notches * max(48, SF(52));
+    ClampGuideScroll();
+    if (oldOffset != g_guideScrollOffset)
+        InvalidateUiRect(hWnd, GetGuideViewportRect(), 1);
+}

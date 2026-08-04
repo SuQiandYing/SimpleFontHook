@@ -29,26 +29,48 @@ static void PaintTitleBar(HDC mem, const RECT& rc)
     DrawSparkle(mem, rc.right - 116, 12, 3, MixColor(COL_ACCENT2, COL_TITLE_TOP, 0.4f));
     DrawSparkle(mem, 50, 8, 2, COL_ACCENT3);
 
-    // Title text
-    HFONT titleFont = GetCachedPickerFont(L"MS UI Gothic", SF(15), 0, FW_BOLD, DEFAULT_CHARSET);
-    HGDIOBJ oldTitleFont = SelectObject(mem, titleFont);
-    SetTextColor(mem, COL_ACCENT);
-    RECT ttRc = { 45, 0, rc.right - 168, TITLE_HEIGHT };
-    DrawTextW(mem, L"✧ 字体选择 ✧", -1, &ttRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);  // ✧ 字体选择 ✧
-
-    // Font count in title (subtle)
-    HFONT countFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_NORMAL, DEFAULT_CHARSET);
-    SelectObject(mem, countFont);
-    SetTextColor(mem, COL_TEXT_DIM);
-    wchar_t countBuf[64];
-    wsprintfW(countBuf, L"%d 个字体", (int)g_filteredIndices.size());  // 个字体
-    RECT cntRc = { 40, 0, rc.right - 168, TITLE_HEIGHT };
-    DrawTextW(mem, countBuf, -1, &cntRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-
-    // Zoom A-/A+ buttons (before close/minimize)
+    // Page tabs and compact page context.
     int zoomBtnW = 34;
     int zoomOutLeft = rc.right - 88 - zoomBtnW * 2 - 4;
     int zoomInLeft = zoomOutLeft + zoomBtnW + 2;
+    PickerPageTabRects pageTabs = GetPickerPageTabRects();
+    HFONT tabFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0, FW_BOLD, DEFAULT_CHARSET);
+    HGDIOBJ oldTitleFont = SelectObject(mem, tabFont);
+
+    auto drawPageTab = [&](const RECT& tabRc, const wchar_t* label,
+        PickerPage page, bool hovered) {
+        bool active = g_pickerPage == page;
+        COLORREF fill = active ? RGB(90, 42, 82) : RGB(42, 30, 62);
+        if (hovered) fill = active ? RGB(112, 52, 98) : COL_BTN_HOV;
+        FillRoundRect(mem, tabRc, 8, fill);
+        DrawRoundRectOutline(mem, tabRc, 8,
+            active ? COL_ACCENT : MixColor(COL_BORDER, COL_TITLE_TOP, 0.2f));
+        SetTextColor(mem, active ? COL_TEXT : COL_TEXT_DIM);
+        RECT textRc = tabRc;
+        DrawTextW(mem, label, -1, &textRc,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    };
+
+    drawPageTab(pageTabs.fonts, L"字体", PICKER_PAGE_FONTS,
+        g_fontsPageTabHovered);
+    drawPageTab(pageTabs.guide, L"指南", PICKER_PAGE_GUIDE,
+        g_guidePageTabHovered);
+
+    HFONT countFont = GetCachedPickerFont(L"Segoe UI", SF(10), 0, FW_NORMAL, DEFAULT_CHARSET);
+    SelectObject(mem, countFont);
+    SetTextColor(mem, COL_TEXT_DIM);
+    wchar_t contextBuf[64] = {};
+    if (g_pickerPage == PICKER_PAGE_FONTS)
+        wsprintfW(contextBuf, L"%d 个字体", (int)g_filteredIndices.size());
+    else
+        wcscpy_s(contextBuf, L"快速上手");
+    RECT contextRc = { pageTabs.guide.right + 8, 0, zoomOutLeft - 4, TITLE_HEIGHT };
+    if (contextRc.right - contextRc.left >= 42) {
+        DrawTextW(mem, contextBuf, -1, &contextRc,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+
+    // Zoom A-/A+ buttons (before close/minimize)
     RECT zoomOutRc = { zoomOutLeft, 0, zoomOutLeft + zoomBtnW, TITLE_HEIGHT };
     RECT zoomInRc  = { zoomInLeft, 0, zoomInLeft + zoomBtnW, TITLE_HEIGHT };
     if (g_zoomOutHovered)

@@ -8,6 +8,7 @@
 #include "paint/font_picker_paint_font_list.cppinc"
 #include "paint/font_picker_paint_scrollbar.cppinc"
 #include "paint/font_picker_paint_preview.cppinc"
+#include "paint/font_picker_paint_guide.cppinc"
 #include "paint/font_picker_paint_border.cppinc"
 
 static void PaintWindow(HWND hWnd) {
@@ -46,14 +47,18 @@ static void PaintWindow(HWND hWnd) {
 
     PaintBackground(mem, rc);
     PaintTitleBar(mem, rc);
-    PaintSearchArea(mem, rc);
-    PaintCharsetBar(mem, rc);
-    PaintSpoofBar(mem, rc);
-    PaintTextSubstitutionBar(mem, rc);
-    PaintMetricsBar(mem, rc);
-    PaintFontList(mem, rc);
-    PaintScrollbar(mem);
-    PaintPreviewPanel(mem, rc);
+    if (g_pickerPage == PICKER_PAGE_GUIDE) {
+        PaintGuidePage(mem, rc);
+    } else {
+        PaintSearchArea(mem, rc);
+        PaintCharsetBar(mem, rc);
+        PaintSpoofBar(mem, rc);
+        PaintTextSubstitutionBar(mem, rc);
+        PaintMetricsBar(mem, rc);
+        PaintFontList(mem, rc);
+        PaintScrollbar(mem);
+        PaintPreviewPanel(mem, rc);
+    }
     PaintWindowBorder(mem, rc);
 
     RestoreDC(mem, savedDc);

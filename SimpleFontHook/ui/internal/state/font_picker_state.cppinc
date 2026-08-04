@@ -7,10 +7,37 @@ static HWND g_hSearchEdit = NULL;
 static HMODULE g_hModule = NULL;
 static volatile LONG g_messageThreadId = 0;
 static bool g_visible = false;
-static const int HOTKEY_TOGGLE_PICKER = 1;
-static const int HOTKEY_TOGGLE_PICKER_ALT_SHIFT = 2;
-static const int HOTKEY_TOGGLE_PICKER_F8 = 3;
+static const int HOTKEY_TOGGLE_PICKER_INSERT = 1;
+static const int HOTKEY_TOGGLE_PICKER_PAUSE = 2;
+static const int HOTKEY_TOGGLE_PICKER_SCROLL_LOCK = 3;
 static bool g_toggleHotkeyRegistered = false;
+static wchar_t g_toggleHotkeyDisplayName[32] = L"未注册";
+
+enum PickerPage {
+    PICKER_PAGE_FONTS = 0,
+    PICKER_PAGE_GUIDE,
+};
+static PickerPage g_pickerPage = PICKER_PAGE_FONTS;
+static bool g_fontsPageTabHovered = false;
+static bool g_guidePageTabHovered = false;
+
+enum PickerGuideSection {
+    PICKER_GUIDE_QUICK_START = 0,
+    PICKER_GUIDE_FEATURES,
+    PICKER_GUIDE_SHORTCUTS,
+    PICKER_GUIDE_TROUBLESHOOTING,
+    PICKER_GUIDE_SECTION_COUNT,
+};
+static PickerGuideSection g_guideSection = PICKER_GUIDE_QUICK_START;
+static int g_guideHoveredSection = -1;
+static int g_guideScrollOffset = 0;
+static int g_guideContentHeight = 0;
+static int g_guideWheelRemainder = 0;
+static bool g_guideScrollbarHovered = false;
+static bool g_guideScrollbarDragging = false;
+static int g_guideScrollDragStartY = 0;
+static int g_guideScrollDragStartOffset = 0;
+
 struct FontInfo {
     std::wstring name;
     std::unordered_set<BYTE> charsets;
@@ -63,14 +90,13 @@ static const SpoofCharsetEntry g_spoofCharsets[] = {
 };
 static const int g_spoofCharsetCount = _countof(g_spoofCharsets);
 static bool g_spoofEnabled = false;
-static bool g_spoofRuntimeReplaceEnabled = false;
+static bool g_spoofRuntimeReplaceEnabled = false;  // derived from enabled state and source/target
 static int g_spoofCharsetIdx = 0;
 static bool g_textSubstitutionEnabled = false;
-static int g_spoofFromIdx = 1;   // index into g_charsets, default 日文
-static int g_spoofToIdx = 2;     // index into g_charsets, default 中文
+static int g_spoofFromIdx = 1;   // source charset, default Chinese
+static int g_spoofToIdx = 2;     // target charset, default Japanese
 static bool g_spoofToggleHovered = false;
 static bool g_spoofCharsetHovered = false;
-static bool g_spoofModeHovered = false;
 static bool g_textSubstitutionHovered = false;
 
 struct TextSubstitutionModeEntry {
@@ -180,8 +206,8 @@ enum MetricValueKind {
 };
 
 // Resize support
-static const int MIN_WIDTH        = 360;
-static const int MIN_HEIGHT       = 480;
+static const int MIN_WIDTH        = 480;
+static const int MIN_HEIGHT       = 640;
 static const int RESIZE_BORDER    = 6;   // pixels from edge for resize hit-test
 static const wchar_t* WND_CLASS = L"FontPickerOverlay";
 

@@ -26,6 +26,7 @@ namespace Config {
     extern bool PickerShowOnStartup;
     extern int TextSubstitutionMode;
     extern UINT TextSubstitutionCodepage;
+    extern UINT YurisAtlasCodepage;
     extern bool EnableDebugLog;
     extern bool CompatSkipDrawTextA;
     extern bool CompatSkipFontDataQueries;

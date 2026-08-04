@@ -212,6 +212,7 @@
     <None Include="hooks\internal\engines\artemis\README.md" />
     <None Include="hooks\internal\engines\artemis_legacy\README.md" />
     <None Include="hooks\internal\engines\bgi\README.md" />
+    <None Include="hooks\internal\engines\catsystem2\README.md" />
     <None Include="hooks\internal\engines\dxlib\README.md" />
     <None Include="hooks\internal\engines\entis\README.md" />
     <None Include="hooks\internal\engines\escude\README.md" />
@@ -223,6 +224,7 @@
     <None Include="hooks\internal\engines\tinkerbell\README.md" />
     <None Include="hooks\internal\engines\tyrano\README.md" />
     <None Include="hooks\internal\engines\unity\README.md" />
+    <None Include="hooks\internal\engines\yuris\README.md" />
     <None Include="hooks\internal\engines\common\engine_font_export.cppinc" />
     <None Include="hooks\internal\engines\unity\unity_mono.cppinc" />
     <None Include="hooks\internal\engines\unity\unity_mono_state.cppinc" />
@@ -255,6 +257,7 @@
     <None Include="hooks\internal\engines\bgi\bgi_cache_detection.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_cache_hooks.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_runtime.cppinc" />
+    <None Include="hooks\internal\engines\catsystem2\catsystem2_font.cppinc" />
     <None Include="hooks\internal\font_hooks_platform.cppinc" />
     <None Include="hooks\internal\font_hooks_install.cppinc" />
     <None Include="hooks\internal\engines\engine_file_dispatch.cppinc" />
@@ -288,6 +291,12 @@
     <None Include="hooks\internal\engines\renpy\renpy_font_source.cppinc" />
     <None Include="hooks\internal\engines\renpy\renpy_python_bridge.cppinc" />
     <None Include="hooks\internal\engines\renpy\renpy_runtime.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_font.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_state.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_profiles.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_catalog.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_renderer.cppinc" />
+    <None Include="hooks\internal\engines\yuris\yuris_runtime.cppinc" />
     <None Include="hooks\internal\model\font_hooks_codepage_epoch.cppinc" />
     <None Include="hooks\internal\model\font_hooks_metric_adjust.cppinc" />
     <None Include="hooks\internal\model\font_hooks_replacement_cache.cppinc" />
@@ -304,18 +313,22 @@
     <None Include="ui\internal\state\font_picker_state.cppinc" />
     <None Include="ui\internal\state\font_picker_layout_geometry.cppinc" />
     <None Include="ui\internal\state\font_picker_metric_layout.cppinc" />
+    <None Include="ui\internal\state\font_picker_window_animation.cppinc" />
     <None Include="ui\internal\input\font_picker_selection.cppinc" />
     <None Include="ui\internal\input\font_picker_metric_edit.cppinc" />
+    <None Include="ui\internal\input\font_picker_guide_input.cppinc" />
     <None Include="ui\internal\input\font_picker_wndproc.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_background.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_title.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_search.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_charset.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_spoof.cppinc" />
+    <None Include="ui\internal\paint\font_picker_paint_text_substitution.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_metrics.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_font_list.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_scrollbar.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_preview.cppinc" />
+    <None Include="ui\internal\paint\font_picker_paint_guide.cppinc" />
     <None Include="ui\internal\paint\font_picker_paint_border.cppinc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

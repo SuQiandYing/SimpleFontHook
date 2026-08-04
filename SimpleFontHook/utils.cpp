@@ -29,6 +29,7 @@ namespace Config {
     bool PickerShowOnStartup = true;
     int TextSubstitutionMode = TextSubstitutionModeJapaneseTraditional;
     UINT TextSubstitutionCodepage = 932;
+    UINT YurisAtlasCodepage = 0;
     bool EnableDebugLog = false;
     bool CompatSkipDrawTextA = true;
     bool CompatSkipFontDataQueries = true;
@@ -838,6 +839,7 @@ namespace Utils {
         out += "DxLibClearRuntimeFontCacheOnSwitch=" + std::string(boolStr(Config::DxLibClearRuntimeFontCacheOnSwitch)) + "\r\n";
         out += "DxLibCachedFontNameW=" + WideToUtf8(Config::DxLibCachedFontNameW) + "\r\n";
         out += "EnableTinkerBellHook=" + std::string(boolStr(Config::EnableTinkerBellHook)) + "\r\n";
+        out += "YurisAtlasCodepage=" + dwordStr(Config::YurisAtlasCodepage) + "\r\n";
         out += "EnableCatSystemUnityHook=" + std::string(boolStr(Config::EnableCatSystemUnityHook)) + "\r\n";
         out += "EnableTyranoHook=" + std::string(boolStr(Config::EnableTyranoHook)) + "\r\n";
         out += "TyranoRedirectWebFonts=" + std::string(boolStr(Config::TyranoRedirectWebFonts)) + "\r\n";
@@ -962,6 +964,11 @@ namespace Utils {
         if (Config::TextSubstitutionCodepage == 0) Config::TextSubstitutionCodepage = CP_ACP;
         Config::SpoofFromCharset = (DWORD)getInt("SpoofFromCharset", GB2312_CHARSET);
         Config::SpoofToCharset = (DWORD)getInt("SpoofToCharset", SHIFTJIS_CHARSET);
+        // Runtime replacement follows the active spoof mapping. The saved key is
+        // still parsed above so existing configuration files remain readable.
+        Config::EnableCodepageRuntimeReplace =
+            Config::EnableCodepageSpoof &&
+            Config::SpoofFromCharset != Config::SpoofToCharset;
         Config::EnableDebugLog = getInt("EnableDebugLog", 0) != 0;
         Config::DebugSlowMs = getInt("DebugSlowMs", 50);
         if (Config::DebugSlowMs < 0) Config::DebugSlowMs = 0;
@@ -1004,6 +1011,12 @@ namespace Utils {
         Config::DxLibReplaceFontDataQueries = getInt("DxLibReplaceFontDataQueries", 1) != 0;
         Config::DxLibClearRuntimeFontCacheOnSwitch = getInt("DxLibClearRuntimeFontCacheOnSwitch", 0) != 0;
         Config::EnableTinkerBellHook = getInt("EnableTinkerBellHook", 1) != 0;
+        {
+            int yurisAtlasCodepage = getInt("YurisAtlasCodepage", 0);
+            Config::YurisAtlasCodepage = yurisAtlasCodepage > 0 &&
+                IsValidCodePage(static_cast<UINT>(yurisAtlasCodepage))
+                ? static_cast<UINT>(yurisAtlasCodepage) : 0;
+        }
         Config::EnableCatSystemUnityHook = getInt("EnableCatSystemUnityHook", 1) != 0;
         Config::EnableTyranoHook = getInt("EnableTyranoHook", 1) != 0;
         Config::TyranoRedirectWebFonts = getInt("TyranoRedirectWebFonts", 1) != 0;

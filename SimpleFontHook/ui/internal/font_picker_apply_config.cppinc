@@ -429,13 +429,15 @@ static void ApplySpoofConfig() {
     BYTE sourceCharset = ResolveSpoofRuntimeSourceCharset(targetCharset);
     g_spoofFromIdx = FindCharsetIndexByValue(sourceCharset);
     g_spoofToIdx = FindCharsetIndexByValue(targetCharset);
+    g_spoofRuntimeReplaceEnabled =
+        g_spoofEnabled && sourceCharset != targetCharset;
 
     Config::EnableCodepageSpoof = g_spoofEnabled;
     Config::EnableCodepageRuntimeReplace = g_spoofRuntimeReplaceEnabled;
     Config::SpoofFromCharset = sourceCharset;
     Config::SpoofToCharset = targetCharset;
 
-    Utils::Log("[Config] Codepage spoof: %s, target=%u, bit=%d, runtimeReplace=%d, source=%u (Reloading...)",
+    Utils::Log("[Config] Codepage spoof: %s, target=%u, bit=%d, runtimeReplace=%d (derived), source=%u",
         g_spoofEnabled ? "ON" : "OFF", 
         (DWORD)Config::SpoofToCharset,
         FontPatcher::CodePageRangeBitForCharset(Config::SpoofToCharset),

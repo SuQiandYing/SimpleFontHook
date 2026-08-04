@@ -16,6 +16,32 @@ static RECT MakeUiRect(int left, int top, int right, int bottom) {
 }
 
 static RECT GetTitleAreaRect() { return MakeUiRect(0, 0, WINDOW_WIDTH, TITLE_HEIGHT); }
+
+struct PickerPageTabRects {
+    RECT fonts;
+    RECT guide;
+};
+
+static PickerPageTabRects GetPickerPageTabRects() {
+    PickerPageTabRects rects = {};
+    int top = 7;
+    int bottom = TITLE_HEIGHT - 7;
+    rects.fonts = MakeUiRect(40, top, 100, bottom);
+    rects.guide = MakeUiRect(104, top, 176, bottom);
+    return rects;
+}
+
+static int PickerPageTabHitTest(int x, int y) {
+    PickerPageTabRects rects = GetPickerPageTabRects();
+    if (x >= rects.fonts.left && x < rects.fonts.right &&
+        y >= rects.fonts.top && y < rects.fonts.bottom)
+        return PICKER_PAGE_FONTS;
+    if (x >= rects.guide.left && x < rects.guide.right &&
+        y >= rects.guide.top && y < rects.guide.bottom)
+        return PICKER_PAGE_GUIDE;
+    return -1;
+}
+
 static RECT GetCharsetAreaRect() {
     return MakeUiRect(0, TITLE_HEIGHT + SEARCH_HEIGHT, WINDOW_WIDTH, TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT);
 }
@@ -132,6 +158,83 @@ static bool PointInRect(int x, int y, const RECT& rc) {
     return x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom;
 }
 
+static const int GUIDE_HEADER_HEIGHT = 64;
+static const int GUIDE_SECTION_TABS_HEIGHT = 42;
+static const int GUIDE_FOOTER_HEIGHT = 36;
+
+static RECT GetGuideHeaderRect() {
+    return MakeUiRect(0, TITLE_HEIGHT, WINDOW_WIDTH,
+        TITLE_HEIGHT + GUIDE_HEADER_HEIGHT);
+}
+
+static RECT GetGuideSectionTabsRect() {
+    int top = TITLE_HEIGHT + GUIDE_HEADER_HEIGHT;
+    return MakeUiRect(0, top, WINDOW_WIDTH,
+        top + GUIDE_SECTION_TABS_HEIGHT);
+}
+
+static RECT GetGuideViewportRect() {
+    int top = TITLE_HEIGHT + GUIDE_HEADER_HEIGHT + GUIDE_SECTION_TABS_HEIGHT;
+    return MakeUiRect(0, top, WINDOW_WIDTH,
+        max(top, WINDOW_HEIGHT - GUIDE_FOOTER_HEIGHT));
+}
+
+static RECT GetGuideFooterRect() {
+    return MakeUiRect(0, max(TITLE_HEIGHT, WINDOW_HEIGHT - GUIDE_FOOTER_HEIGHT),
+        WINDOW_WIDTH, WINDOW_HEIGHT);
+}
+
+static RECT GetGuideSectionTabRect(int index) {
+    RECT tabs = GetGuideSectionTabsRect();
+    int margin = 12;
+    int gap = 4;
+    int contentWidth = max(0, WINDOW_WIDTH - margin * 2 -
+        gap * (PICKER_GUIDE_SECTION_COUNT - 1));
+    int tabWidth = contentWidth / PICKER_GUIDE_SECTION_COUNT;
+    int left = margin + index * (tabWidth + gap);
+    int right = index == PICKER_GUIDE_SECTION_COUNT - 1
+        ? WINDOW_WIDTH - margin : left + tabWidth;
+    return MakeUiRect(left, tabs.top + 6, right, tabs.bottom - 6);
+}
+
+static int GuideSectionHitTest(int x, int y) {
+    for (int index = 0; index < PICKER_GUIDE_SECTION_COUNT; ++index) {
+        if (PointInRect(x, y, GetGuideSectionTabRect(index)))
+            return index;
+    }
+    return -1;
+}
+
+static int GetGuideMaxScroll() {
+    RECT viewport = GetGuideViewportRect();
+    int viewportHeight = (int)(viewport.bottom - viewport.top);
+    return max(0, g_guideContentHeight - viewportHeight);
+}
+
+static void GetGuideScrollbarRect(RECT* thumbRc, RECT* trackRc) {
+    RECT viewport = GetGuideViewportRect();
+    RECT track = MakeUiRect(WINDOW_WIDTH - 10, viewport.top + 7,
+        WINDOW_WIDTH - 4, viewport.bottom - 7);
+    if (trackRc) *trackRc = track;
+
+    if (!thumbRc) return;
+    int maxScroll = GetGuideMaxScroll();
+    int trackHeight = max(0, (int)(track.bottom - track.top));
+    if (maxScroll <= 0 || trackHeight <= 0) {
+        *thumbRc = MakeUiRect(0, 0, 0, 0);
+        return;
+    }
+
+    int viewportHeight = max(1, (int)(viewport.bottom - viewport.top));
+    int thumbHeight = max(34,
+        trackHeight * viewportHeight / max(1, g_guideContentHeight));
+    thumbHeight = min(trackHeight, thumbHeight);
+    int scrollRange = max(1, trackHeight - thumbHeight);
+    int thumbTop = track.top + scrollRange * g_guideScrollOffset / maxScroll;
+    *thumbRc = MakeUiRect(track.left, thumbTop, track.right,
+        thumbTop + thumbHeight);
+}
+
 // Mix two colors: ratio 0.0 = a, 1.0 = b
 static COLORREF MixColor(COLORREF a, COLORREF b, float ratio) {
     int r = (int)(GetRValue(a) * (1.f - ratio) + GetRValue(b) * ratio);
@@ -201,7 +304,7 @@ static int CharsetHitTest(int x, int y, int* outTotalWidth = nullptr) {
     return result;
 }
 
-// Spoof bar hit test: returns 0=toggle, 1=target charset, 2=mode, -1=none.
+// Spoof bar hit test: returns 0=toggle, 1=target charset, -1=none.
 static int SpoofBarHitTest(int x, int y) {
     int spTop = TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT;
     int py = spTop + (SPOOF_HEIGHT - 24) / 2;
@@ -231,21 +334,9 @@ static int SpoofBarHitTest(int x, int y) {
         HGDIOBJ old = SelectObject(hdc, spFont);
         const wchar_t* charsetLabel = g_spoofCharsets[g_spoofCharsetIdx].shortLabel;
         SIZE sz; GetTextExtentPoint32W(hdc, charsetLabel, (int)wcslen(charsetLabel), &sz);
-        int bw = sz.cx + 16;
+        int bw = sz.cx + 18;
         RECT r = { px, py, px + bw, py + 24 };
         if (result < 0 && x >= r.left && x < r.right) result = 1;
-        px += bw + 8;
-        SelectObject(hdc, old);
-    }
-
-    // Mode
-    {
-        HGDIOBJ old = SelectObject(hdc, spFont);
-        const wchar_t* modeLabel = g_spoofRuntimeReplaceEnabled ? L"\x66FF\x6362" : L"\x4EC5\x6807\x8BC6";
-        SIZE sz; GetTextExtentPoint32W(hdc, modeLabel, (int)wcslen(modeLabel), &sz);
-        int bw = sz.cx + 16;
-        RECT r = { px, py, px + bw, py + 24 };
-        if (result < 0 && x >= r.left && x < r.right) result = 2;
         SelectObject(hdc, old);
     }
 
@@ -276,8 +367,6 @@ static int TextSubstitutionHitTest(int x, int y) {
     GetTextExtentPoint32W(hdc, modeLabel, (int)wcslen(modeLabel), &sz);
     r = { px, py, px + sz.cx + 16, py + 24 };
     if (result < 0 && x >= r.left && x < r.right) result = 1;
-    px = r.right + 8;
-
     px = r.right + 10;
 
     SelectObject(hdc, fontBold);

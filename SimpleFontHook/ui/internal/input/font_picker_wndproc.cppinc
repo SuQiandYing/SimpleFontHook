@@ -64,6 +64,12 @@ static bool HandleTitleButtonClick(HWND hWnd, int x, int y) {
     if (y >= TITLE_HEIGHT)
         return false;
 
+    int pageHit = PickerPageTabHitTest(x, y);
+    if (pageHit >= 0) {
+        SetPickerPage(hWnd, (PickerPage)pageHit);
+        return true;
+    }
+
     int zoomBtnW = 34;
     int zoomOutL = WINDOW_WIDTH - 88 - zoomBtnW * 2 - 4;
     int zoomInL = zoomOutL + zoomBtnW + 2;
@@ -71,6 +77,10 @@ static bool HandleTitleButtonClick(HWND hWnd, int x, int y) {
         g_uiScale = max(UI_SCALE_MIN, g_uiScale - UI_SCALE_STEP);
         RecalcLayout();
         ClampScroll();
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            g_guideContentHeight = 0;
+            g_guideScrollOffset = 0;
+        }
         InvalidateRect(hWnd, NULL, FALSE);
         return true;
     }
@@ -78,17 +88,19 @@ static bool HandleTitleButtonClick(HWND hWnd, int x, int y) {
         g_uiScale = min(UI_SCALE_MAX, g_uiScale + UI_SCALE_STEP);
         RecalcLayout();
         ClampScroll();
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            g_guideContentHeight = 0;
+            g_guideScrollOffset = 0;
+        }
         InvalidateRect(hWnd, NULL, FALSE);
         return true;
     }
     if (x >= WINDOW_WIDTH - 46) {
-        ShowWindow(hWnd, SW_HIDE);
-        g_visible = false;
+        HidePickerWindowAnimated(hWnd);
         return true;
     }
     if (x >= WINDOW_WIDTH - 88 && x < WINDOW_WIDTH - 46) {
-        ShowWindow(hWnd, SW_MINIMIZE);
-        g_visible = false;
+        MinimizePickerWindowNative(hWnd);
         return true;
     }
     return false;
@@ -120,9 +132,6 @@ static bool HandleSpoofBarClick(HWND hWnd, int x, int y) {
     } else if (hit == 1) {
         g_spoofCharsetIdx++;
         if (g_spoofCharsetIdx >= g_spoofCharsetCount) g_spoofCharsetIdx = 0;
-        ApplySpoofConfig();
-    } else if (hit == 2) {
-        g_spoofRuntimeReplaceEnabled = !g_spoofRuntimeReplaceEnabled;
         ApplySpoofConfig();
     }
     if (hit >= 0)
@@ -209,7 +218,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         PaintWindow(hWnd);
         return 0;
 
+    case WM_TIMER:
+        if (wParam == PICKER_WINDOW_ANIMATION_TIMER_ID &&
+            AdvancePickerWindowAnimation(hWnd))
+            return 0;
+        break;
+
     case WM_NCHITTEST: {
+        if (g_pickerWindowAnimation != PICKER_WINDOW_ANIMATION_NONE)
+            return HTNOWHERE;
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ScreenToClient(hWnd, &pt);
         int x = pt.x, y = pt.y;
@@ -226,20 +243,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (x >= w - b)                 return HTRIGHT;
         if (y < b)                      return HTTOP;
         if (y >= h - b)                 return HTBOTTOM;
-        // Title bar (caption for drag, but not over buttons including zoom A-/A+)
+        // Title bar (caption for drag, but not over page tabs or buttons).
         {
             int zoomBtnW = 34;
             int zoomOutL = w - 88 - zoomBtnW * 2 - 4;
-            if (y < TITLE_HEIGHT && x < zoomOutL) return HTCAPTION;
+            if (y < TITLE_HEIGHT) {
+                if (PickerPageTabHitTest(x, y) >= 0 || x >= zoomOutL)
+                    return HTCLIENT;
+                return HTCAPTION;
+            }
         }
         return HTCLIENT;
     }
 
     case WM_NCLBUTTONDBLCLK: return 0;
 
-    // Keep the whole popup as client area so only our custom border is visible.
-    case WM_NCCALCSIZE:
-        return 0;
+    // Standard style bits are retained only for DWM/taskbar behavior. The
+    // entire window remains client area and native frame painting is ignored.
+    case WM_NCCALCSIZE: return 0;
+    case WM_NCPAINT: return 0;
+    case WM_NCACTIVATE: return TRUE;
 
     case WM_COMMAND:
         if ((HWND)lParam == g_hSearchEdit && HIWORD(wParam) == EN_CHANGE) {
@@ -250,6 +273,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
 
     case WM_KEYDOWN:
+        if (wParam == VK_TAB) {
+            SetPickerPage(hWnd, g_pickerPage == PICKER_PAGE_GUIDE
+                ? PICKER_PAGE_FONTS : PICKER_PAGE_GUIDE);
+            return 0;
+        }
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            if (wParam == VK_ESCAPE)
+                HidePickerWindowAnimated(hWnd);
+            return 0;
+        }
         if (IsSelectionNavigationKey(wParam) && g_filteredIndices.empty()) {
             g_selectedIndex = -1;
             return 0;
@@ -281,12 +314,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             InvalidateUiRect(hWnd, GetPreviewAreaRect(), 1);
             return 0;
         case VK_ESCAPE:
-            ShowWindow(hWnd, SW_HIDE); g_visible = false;
+            HidePickerWindowAnimated(hWnd);
             return 0;
         }
         break;
 
     case WM_MOUSEWHEEL: {
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            HandleGuidePageWheel(hWnd, GET_WHEEL_DELTA_WPARAM(wParam));
+            return 0;
+        }
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         // Check if mouse is over charset bar for horizontal scroll
         POINT wpt;
@@ -342,7 +379,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_trackingMouseLeave = true;
         }
 
-        // Title buttons (zoom A-/A+, minimize, close)
+        // Page tabs and title buttons (zoom A-/A+, minimize, close)
         bool inClose = (x >= WINDOW_WIDTH - 46 && y < TITLE_HEIGHT);
         bool inMin = (x >= WINDOW_WIDTH - 88 && x < WINDOW_WIDTH - 46 && y < TITLE_HEIGHT);
         int zBtnW = 34;
@@ -350,11 +387,23 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         int zInL = zOutL + zBtnW + 2;
         bool inZoomOut = (y < TITLE_HEIGHT && x >= zOutL && x < zOutL + zBtnW);
         bool inZoomIn  = (y < TITLE_HEIGHT && x >= zInL && x < zInL + zBtnW);
+        int pageHit = PickerPageTabHitTest(x, y);
+        bool inFontsPageTab = pageHit == PICKER_PAGE_FONTS;
+        bool inGuidePageTab = pageHit == PICKER_PAGE_GUIDE;
         if (inClose != g_closeHovered || inMin != g_minHovered ||
-            inZoomOut != g_zoomOutHovered || inZoomIn != g_zoomInHovered) {
+            inZoomOut != g_zoomOutHovered || inZoomIn != g_zoomInHovered ||
+            inFontsPageTab != g_fontsPageTabHovered ||
+            inGuidePageTab != g_guidePageTabHovered) {
             g_closeHovered = inClose; g_minHovered = inMin;
             g_zoomOutHovered = inZoomOut; g_zoomInHovered = inZoomIn;
+            g_fontsPageTabHovered = inFontsPageTab;
+            g_guidePageTabHovered = inGuidePageTab;
             InvalidateUiRect(hWnd, GetTitleAreaRect(), 1);
+        }
+
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            HandleGuidePageMouseMove(hWnd, x, y);
+            return 0;
         }
 
         // Scrollbar drag
@@ -404,18 +453,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         // Spoof bar hover
         {
             int spTop = TITLE_HEIGHT + SEARCH_HEIGHT + CHARSET_HEIGHT;
-            bool newToggle = false, newCharset = false, newMode = false;
+            bool newToggle = false, newCharset = false;
             if (y >= spTop && y < spTop + SPOOF_HEIGHT) {
                 int hit = SpoofBarHitTest(x, y);
                 newToggle = (hit == 0);
                 newCharset = (hit == 1);
-                newMode = (hit == 2);
             }
-            if (newToggle != g_spoofToggleHovered || newCharset != g_spoofCharsetHovered ||
-                newMode != g_spoofModeHovered) {
+            if (newToggle != g_spoofToggleHovered || newCharset != g_spoofCharsetHovered) {
                 g_spoofToggleHovered = newToggle;
                 g_spoofCharsetHovered = newCharset;
-                g_spoofModeHovered = newMode;
                 InvalidateUiRect(hWnd, GetSpoofAreaRect(), 1);
             }
         }
@@ -473,21 +519,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_trackingMouseLeave = false;
         if (g_hoveredIndex != -1 || g_closeHovered || g_minHovered || g_scrollbarHovered || g_hoveredCharset != -1
             || g_zoomInHovered || g_zoomOutHovered
-            || g_spoofToggleHovered || g_spoofCharsetHovered || g_spoofModeHovered
+            || g_fontsPageTabHovered || g_guidePageTabHovered
+            || g_guideHoveredSection >= 0 || g_guideScrollbarHovered
+            || g_spoofToggleHovered || g_spoofCharsetHovered
             || g_textSubstitutionHovered || g_textSubstitutionModeHovered
             || g_codepageRedirectHovered || g_codepageRedirectPresetHovered
             || g_metricHovered != METRIC_NONE) {
             int oldHovered = g_hoveredIndex;
-            bool dirtyTitle = g_closeHovered || g_minHovered || g_zoomInHovered || g_zoomOutHovered;
+            bool dirtyTitle = g_closeHovered || g_minHovered || g_zoomInHovered || g_zoomOutHovered ||
+                g_fontsPageTabHovered || g_guidePageTabHovered;
             bool dirtyScrollbar = g_scrollbarHovered;
             bool dirtyCharset = g_hoveredCharset != -1;
-            bool dirtySpoof = g_spoofToggleHovered || g_spoofCharsetHovered || g_spoofModeHovered;
+            bool dirtySpoof = g_spoofToggleHovered || g_spoofCharsetHovered;
             bool dirtyTextSub = g_textSubstitutionHovered || g_textSubstitutionModeHovered ||
                 g_codepageRedirectHovered || g_codepageRedirectPresetHovered;
             bool dirtyMetrics = g_metricHovered != METRIC_NONE;
+            bool dirtyGuide = ClearGuidePageHoverState();
             g_hoveredIndex = -1; g_closeHovered = false; g_minHovered = false; g_scrollbarHovered = false;
             g_hoveredCharset = -1; g_zoomInHovered = false; g_zoomOutHovered = false;
-            g_spoofToggleHovered = false; g_spoofCharsetHovered = false; g_spoofModeHovered = false;
+            g_fontsPageTabHovered = false; g_guidePageTabHovered = false;
+            g_spoofToggleHovered = false; g_spoofCharsetHovered = false;
             g_textSubstitutionHovered = false;
             g_textSubstitutionModeHovered = false;
             g_codepageRedirectHovered = false;
@@ -499,16 +550,28 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (dirtySpoof) InvalidateUiRect(hWnd, GetSpoofAreaRect(), 1);
             if (dirtyTextSub) InvalidateUiRect(hWnd, GetTextSubAreaRect(), 1);
             if (dirtyMetrics) InvalidateUiRect(hWnd, GetMetricsAreaRect(), 1);
+            if (dirtyGuide) {
+                InvalidateUiRect(hWnd, GetGuideSectionTabsRect(), 1);
+                InvalidateUiRect(hWnd, GetGuideViewportRect(), 1);
+            }
             InvalidateListItem(hWnd, oldHovered);
         }
         return 0;
 
     case WM_LBUTTONDOWN: {
+        if (g_pickerWindowAnimation != PICKER_WINDOW_ANIMATION_NONE)
+            return 0;
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
 
-        if (HandleTitleButtonClick(hWnd, x, y) ||
-            HandleCharsetClick(hWnd, x, y) ||
+        if (HandleTitleButtonClick(hWnd, x, y))
+            return 0;
+        if (g_pickerPage == PICKER_PAGE_GUIDE) {
+            HandleGuidePageClick(hWnd, x, y);
+            return 0;
+        }
+
+        if (HandleCharsetClick(hWnd, x, y) ||
             HandleSpoofBarClick(hWnd, x, y) ||
             HandleTextSubstitutionClick(hWnd, x, y) ||
             HandleMetricClick(hWnd, x, y) ||
@@ -524,6 +587,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_LBUTTONUP:
+        if (g_guideScrollbarDragging) {
+            RECT track = {};
+            GetGuideScrollbarRect(NULL, &track);
+            EndGuideScrollbarDrag();
+            InvalidateUiRect(hWnd, track, 2);
+        }
         if (g_scrollbarDragging) {
             g_scrollbarDragging = false;
             ReleaseCapture();
@@ -532,6 +601,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_LBUTTONDBLCLK: {
+        if (g_pickerPage == PICKER_PAGE_GUIDE)
+            return 0;
         int y = GET_Y_LPARAM(lParam);
         int di = ListIndexFromPoint(y);
         if (di >= 0) {
@@ -551,14 +622,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_HOTKEY:
-        if ((int)wParam == HOTKEY_TOGGLE_PICKER ||
-            (int)wParam == HOTKEY_TOGGLE_PICKER_ALT_SHIFT ||
-            (int)wParam == HOTKEY_TOGGLE_PICKER_F8) {
-            g_visible = !g_visible;
-            ShowWindow(hWnd, g_visible ? SW_RESTORE : SW_HIDE);
+        if ((int)wParam == HOTKEY_TOGGLE_PICKER_INSERT ||
+            (int)wParam == HOTKEY_TOGGLE_PICKER_PAUSE ||
+            (int)wParam == HOTKEY_TOGGLE_PICKER_SCROLL_LOCK) {
+            if (g_visible)
+                HidePickerWindowAnimated(hWnd);
+            else
+                ShowPickerWindowAnimated(hWnd);
             if (g_visible) {
                 SetForegroundWindow(hWnd);
-                SetFocus(g_hSearchEdit);
+                SetFocus(g_pickerPage == PICKER_PAGE_FONTS
+                    ? g_hSearchEdit : hWnd);
                 InvalidateRect(hWnd, NULL, FALSE);
             }
             return 0;
@@ -573,7 +647,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE: {
-        if (wParam == SIZE_MINIMIZED) break;
+        if (wParam == SIZE_MINIMIZED) {
+            g_visible = false;
+            break;
+        }
+        if (wParam == SIZE_RESTORED &&
+            g_pickerWindowAnimation == PICKER_WINDOW_ANIMATION_NONE &&
+            IsWindowVisible(hWnd)) {
+            g_visible = true;
+        }
         RECT cr;
         GetClientRect(hWnd, &cr);
         WINDOW_WIDTH = cr.right;
@@ -581,15 +663,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         ReleasePaintBuffer();
         RecalcLayout();
         ClampScroll();
+        g_guideContentHeight = 0;
+        g_guideScrollOffset = 0;
         InvalidateRect(hWnd, NULL, FALSE);
         return 0;
     }
 
     case WM_ERASEBKGND: return 1;
     case WM_DESTROY:
-        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER);
-        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_ALT_SHIFT);
-        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_F8);
+        CancelPickerWindowAnimation(hWnd);
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_INSERT);
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_PAUSE);
+        UnregisterHotKey(hWnd, HOTKEY_TOGGLE_PICKER_SCROLL_LOCK);
         ReleasePaintBuffer();
         ClearPickerFontCache();
         if (g_editFont) {

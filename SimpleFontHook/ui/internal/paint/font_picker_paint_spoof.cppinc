@@ -50,28 +50,19 @@ static void PaintSpoofBar(HDC mem, const RECT& rc)
     }
 
     {
-        const wchar_t* modeLabel = g_spoofRuntimeReplaceEnabled ? L"\x66FF\x6362" : L"\x4EC5\x6807\x8BC6";
-        SIZE sz; GetTextExtentPoint32W(mem, modeLabel, (int)wcslen(modeLabel), &sz);
-        int bw = sz.cx + 18;
-        RECT modeRc = { px, py, px + bw, py + 24 };
-        COLORREF bgCol = g_spoofModeHovered ? COL_HOVER_BG : RGB(38, 30, 56);
-        FillRoundRect(mem, modeRc, 10, bgCol);
-        DrawRoundRectOutline(mem, modeRc, 10,
-            g_spoofRuntimeReplaceEnabled ? RGB(255, 170, 135) : RGB(160, 220, 170));
-        SetTextColor(mem, g_spoofRuntimeReplaceEnabled ? RGB(255, 195, 160) : RGB(180, 255, 190));
-        DrawTextW(mem, modeLabel, -1, &modeRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        px += bw + 8;
-    }
-
-    {
-        SetTextColor(mem, RGB(110, 95, 145));
         wchar_t hint[96] = {};
-        if (g_spoofRuntimeReplaceEnabled) {
+        if (g_spoofEnabled && g_spoofRuntimeReplaceEnabled) {
+            SetTextColor(mem, RGB(255, 195, 160));
             wsprintfW(hint, L"\x8C03\x7528: %s \x2192 %s",
                 GetCharsetDisplayName(g_charsets[g_spoofFromIdx].value),
                 GetCharsetDisplayName(g_spoofCharsets[g_spoofCharsetIdx].value));
-        } else {
+        } else if (g_spoofEnabled) {
+            SetTextColor(mem, RGB(180, 255, 190));
             wsprintfW(hint, L"\x5B57\x4F53\x6807\x8BC6: %s",
+                GetCharsetDisplayName(g_spoofCharsets[g_spoofCharsetIdx].value));
+        } else {
+            SetTextColor(mem, RGB(110, 95, 145));
+            wsprintfW(hint, L"\x76EE\x6807: %s",
                 GetCharsetDisplayName(g_spoofCharsets[g_spoofCharsetIdx].value));
         }
         RECT hintRc = { px, py, rc.right - 8, py + 24 };
