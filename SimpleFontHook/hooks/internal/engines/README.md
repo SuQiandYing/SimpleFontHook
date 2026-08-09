@@ -84,7 +84,7 @@
 | 公共基础 | 身份策略、路径边界、模块查询、字体来源和虚拟文件 | [common/README.md](common/README.md) |
 | Artemis | 表文件、PFS、字体资源和运行时缓存 | [artemis/README.md](artemis/README.md) |
 | Artemis Legacy | IET/文本脚本、RFT 和版本化字体资源 | [artemis_legacy/README.md](artemis_legacy/README.md) |
-| BGI | Win32 GDI 栅格度量、IAT 与字形缓存 | [bgi/README.md](bgi/README.md) |
+| BGI | x86/x64 DSC 解码后 LINE 字体脚本、Win32 GDI 栅格度量、IAT 与字形缓存 | [bgi/README.md](bgi/README.md) |
 | classic CatSystem2 | FreeType 文件字体、`font` 目录与字体资源注册 | [catsystem2/README.md](catsystem2/README.md) |
 | DxLib | `_FONTSET.MED` 缓存一致性 | [dxlib/README.md](dxlib/README.md) |
 | EntisGLS | 位图字体注册、内部字体对象和字形栅格 | [entis/README.md](entis/README.md) |
@@ -105,7 +105,7 @@
 | --- | --- | --- | --- |
 | Artemis | PFS `pf2/pf6/pf8` + `list_windows*.tbl` 资源族 | 表字段、PFS 字体和缓存 | PFS 无表资源 |
 | Artemis Legacy | PFS + `system/_base` 中的 `.iet` | IET、RFT、虚拟 SFNT | 只有 Artemis 表资源 |
-| BGI | Buriko 模块标记或 BURIKO 魔数 | Win32 GDI 导入、缓存布局、度量 | 只有 GDI 导入 |
+| BGI | Buriko 模块标记或 BURIKO 魔数 | x86/x64 DSC 解码器、BP LINE 语义布局；Win32 GDI 导入与缓存 | 只有 DSC 字符串或 GDI 导入 |
 | classic CatSystem2 | `CatScene/cs2confx` + `kcFontImage_Win/FT` | `font/*.ttf/.otf/.ttc/.otc` | 只有一组标记 |
 | DxLib | DxLib 模块标记 + 字体契约 | `_FONTSET.MED`、`GetFontData` | 只有 MED 后缀 |
 | EntisGLS | `SGLFont::m_pFontStock` + 位图加载器类证据 | BMF、RTTI/vtable、引用字体 | 缺少任一类证据 |

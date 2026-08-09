@@ -1,0 +1,24 @@
+static bool HasBgiIdentity() {
+    static volatile LONG cached = -1;
+    LONG value = InterlockedCompareExchange(&cached, -1, -1);
+    if (value != -1) return value != 0;
+
+    static const char* const moduleMarkers[] = {
+        "Buriko General Interpreter",
+        "BURIKO ARC",
+    };
+    static const char* const archiveMagics[] = {
+        "BURIKO ARC",
+    };
+    const bool moduleMarker = EngineCommon::MainModuleContainsAnyAscii(
+        moduleMarkers, _countof(moduleMarkers));
+    const bool archiveFormat = EngineCommon::AnyRootFileStartsWithAnyAscii(
+        L"*.arc", archiveMagics, _countof(archiveMagics));
+    const bool detected = EngineIdentityPolicy::Confirm({
+        moduleMarker || archiveFormat, false, false, false });
+    InterlockedExchange(&cached, detected ? 1 : 0);
+    Utils::Trace("[DEBUG][BGI] identity result=%d module-marker=%d buriko-archive=%d",
+        detected ? 1 : 0, moduleMarker ? 1 : 0, archiveFormat ? 1 : 0);
+    return detected;
+}
+

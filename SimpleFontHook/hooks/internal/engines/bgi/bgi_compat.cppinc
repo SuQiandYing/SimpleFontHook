@@ -1,5 +1,12 @@
 namespace BgiCompat {
 
+namespace {
+
+#include "bgi_identity.cppinc"
+#include "bgi_line_font.cppinc"
+
+} // namespace
+
 #ifndef _WIN64
 
 namespace {

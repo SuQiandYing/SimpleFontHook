@@ -114,6 +114,10 @@
 | [Ren'Py](../SimpleFontHook/hooks/internal/engines/renpy/README.md) | `EnableRenPyHook=1`、`RenPyRedirectFonts=1`、`RenPyRefreshFontOnSwitch=1` |
 | [YU-RIS](../SimpleFontHook/hooks/internal/engines/yuris/README.md) | `YurisAtlasCodepage=0`（INI 诊断覆盖项）；使用 `EnableFontHook`、`FontNameW` 和通用度量配置 |
 
+BGI 的 `EnableBgiHook` 同时控制 x86/x64 DSC 解码后的 LINE 字体脚本层和 Win32 GDI
+栅格层；`BgiPatchGdiImports`、`BgiClearGlyphCacheOnSwitch` 只作用于 Win32 GDI 路径。
+LINE 脚本能力默认自动检测，不要求单独配置或外置 `scrdrv._bp`。
+
 Artemis 还保存 `ArtemisFontPath`、`ArtemisFontSize=0` 和 `ArtemisRubySize=-1`。
 DxLib 的 `DxLibCachedFontNameW` 是兼容缓存状态；读取该键会填充进程内缓存，缺少该键时
 清空缓存。

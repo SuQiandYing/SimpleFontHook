@@ -1,0 +1,525 @@
+enum class BgiLineDecoderAbi {
+    None,
+    Fastcall,
+    LegacyX86Registers,
+};
+
+enum class BgiLinePatchResult {
+    NotScript,
+    NoMatch,
+    Ambiguous,
+    Patched,
+};
+
+struct BgiLineWildcard {
+    size_t offset;
+    size_t length;
+};
+
+struct BgiLineScriptLayout {
+    const char* name;
+    const BYTE* pattern;
+    size_t patternSize;
+    const BgiLineWildcard* wildcards;
+    size_t wildcardCount;
+    const BYTE* replacement;
+    size_t replacementSize;
+    bool hasCodeReference;
+};
+
+struct BgiLineImageView {
+    BYTE* base;
+    size_t size;
+    IMAGE_SECTION_HEADER* sections;
+    WORD sectionCount;
+};
+
+using BgiLineFastcallDecoder = int (__fastcall*)(BYTE* output, const void* source);
+
+static BgiLineFastcallDecoder g_bgiLineOriginalFastcallDecoder = nullptr;
+static volatile LONG g_bgiLineFontActive = 0;
+static volatile LONG g_bgiLineApplyTraceCount = 0;
+static volatile LONG g_bgiLineAmbiguousTraceCount = 0;
+
+#ifndef _WIN64
+using BgiLineLegacyRegisterDecoder = int (__cdecl*)();
+static BgiLineLegacyRegisterDecoder g_bgiLineOriginalLegacyRegisterDecoder = nullptr;
+#endif
+
+static const BYTE kBgiLineModernScriptPattern[] = {
+    0x04, 0x04, 0x00, 0x05, 0x00, 0x00, 0xEE, 0x00, 0x00, 0x0F, 0x14, 0x80,
+    0x01, 0x20, 0x05, 0x18, 0x00, 0x0C, 0x00, 0x80, 0xD8, 0x04, 0x00, 0x8C,
+    0x04, 0xEC, 0x8C, 0x04, 0x01, 0x2C, 0x07, 0x18, 0x20, 0x07, 0x00, 0x80,
+    0x09, 0x00, 0x01, 0x2D, 0x07, 0x0D, 0x39, 0x01, 0x2F, 0x07, 0x0D, 0x91,
+    0x03,
+};
+static const BgiLineWildcard kBgiLineModernScriptWildcards[] = {
+    { 4, 2 },
+    { 7, 2 },
+};
+static const BYTE kBgiLineModernScriptReplacement[] = {
+    0x04, 0x04, 0x00,
+    0x18, 0x0C, 0x0C, 0x00, 0x80,
+    0x09, 0x02,
+    0x12, 0x00,
+};
+
+static const BYTE kBgiLineLegacyScriptPattern[] = {
+    0x04, 0x04, 0x00, 0x05, 0x00, 0x00, 0x06, 0x00, 0x00, 0x16, 0x0F, 0x10,
+    0x80, 0x01, 0x1C, 0x05, 0x18, 0xD4, 0x0B, 0x00, 0x80, 0x1B, 0x04, 0x80,
+    0x8C, 0x04, 0x01, 0x0C, 0x02, 0x60, 0x01, 0x28, 0x07, 0x18, 0x1C, 0x07,
+    0x00, 0x80, 0x09, 0x00,
+};
+static const BgiLineWildcard kBgiLineLegacyScriptWildcards[] = {
+    { 4, 2 },
+    { 7, 2 },
+};
+static const BYTE kBgiLineLegacyScriptReplacement[] = {
+    0x04, 0x04, 0x00,
+    0x18, 0xDC, 0x0B, 0x00, 0x80,
+    0x09, 0x02,
+    0x13, 0x00, 0x00,
+};
+
+static const BgiLineScriptLayout kBgiLineScriptLayouts[] = {
+    {
+        "bp-modern-font-record-0c00",
+        kBgiLineModernScriptPattern,
+        _countof(kBgiLineModernScriptPattern),
+        kBgiLineModernScriptWildcards,
+        _countof(kBgiLineModernScriptWildcards),
+        kBgiLineModernScriptReplacement,
+        _countof(kBgiLineModernScriptReplacement),
+        false,
+    },
+    {
+        "bp-legacy-font-record-0bd4",
+        kBgiLineLegacyScriptPattern,
+        _countof(kBgiLineLegacyScriptPattern),
+        kBgiLineLegacyScriptWildcards,
+        _countof(kBgiLineLegacyScriptWildcards),
+        kBgiLineLegacyScriptReplacement,
+        _countof(kBgiLineLegacyScriptReplacement),
+        true,
+    },
+};
+
+#ifdef _WIN64
+static const BYTE kBgiLineFastcallDecoderPattern[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0xB8, 0x10, 0x40, 0x00, 0x00,
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x2B, 0xE0, 0x48, 0x8B, 0xF9,
+    0x48, 0x8B, 0xDA, 0x48, 0x8D, 0x4C, 0x24, 0x20,
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x44, 0x24, 0x20,
+    0x48, 0x8B, 0xD3, 0x48, 0x8B, 0xCF,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x8B, 0x9C, 0x24, 0x20, 0x40, 0x00, 0x00,
+    0x48, 0x81, 0xC4, 0x10, 0x40, 0x00, 0x00, 0x5F, 0xC3,
+};
+static const BgiLineWildcard kBgiLineFastcallDecoderWildcards[] = {
+    { 12, 4 },
+    { 31, 4 },
+    { 47, 4 },
+};
+static const size_t kBgiLineFastcallDecoderCalls[] = { 11, 30, 46 };
+#else
+static const BYTE kBgiLineFastcallDecoderPattern[] = {
+    0x55, 0x8B, 0xEC, 0xB8, 0xF4, 0x3F, 0x00, 0x00,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0xA1, 0x00, 0x00, 0x00, 0x00,
+    0x33, 0xC5, 0x89, 0x45, 0xFC, 0x56, 0x8B, 0xF1,
+    0x8D, 0x8D, 0x0C, 0xC0, 0xFF, 0xFF, 0x57, 0x8B, 0xFA,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x8D, 0x85, 0x0C, 0xC0, 0xFF, 0xFF, 0x8B, 0xD7, 0x50, 0x8B, 0xCE,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0x4D, 0xFC, 0x83, 0xC4, 0x04, 0x33, 0xCD, 0x5F, 0x5E,
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x8B, 0xE5, 0x5D, 0xC3,
+};
+static const BgiLineWildcard kBgiLineFastcallDecoderWildcards[] = {
+    { 9, 4 },
+    { 14, 4 },
+    { 36, 4 },
+    { 52, 4 },
+    { 67, 4 },
+};
+static const size_t kBgiLineFastcallDecoderCalls[] = { 8, 35, 51, 66 };
+
+static const BYTE kBgiLineLegacyDecoderPattern[] = {
+    0x55, 0x8B, 0xEC, 0xB8, 0xF4, 0x3F, 0x00, 0x00,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0xA1, 0x00, 0x00, 0x00, 0x00,
+    0x33, 0xC5, 0x89, 0x45, 0xFC,
+    0x8D, 0x85, 0x0C, 0xC0, 0xFF, 0xFF, 0x56, 0x50,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x8D, 0x8D, 0x0C, 0xC0, 0xFF, 0xFF, 0x51, 0x56, 0x57,
+    0xE8, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0x4D, 0xFC, 0x33, 0xCD, 0x83, 0xC4, 0x14,
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x8B, 0xE5, 0x5D, 0xC3,
+};
+static const BgiLineWildcard kBgiLineLegacyDecoderWildcards[] = {
+    { 9, 4 },
+    { 14, 4 },
+    { 32, 4 },
+    { 46, 4 },
+    { 59, 4 },
+};
+static const size_t kBgiLineLegacyDecoderCalls[] = { 8, 31, 45, 58 };
+#endif
+
+static bool BgiLineIsImageRange(const BgiLineImageView& image, const void* address, size_t length) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(image.base);
+    const uintptr_t value = reinterpret_cast<uintptr_t>(address);
+    return value >= base && length <= image.size && value - base <= image.size - length;
+}
+
+static bool BgiLineReadMainModuleImage(BgiLineImageView* image) {
+    if (!image) return false;
+    HMODULE module = GetModuleHandleW(nullptr);
+    MODULEINFO moduleInfo = {};
+    if (!module || !GetModuleInformation(GetCurrentProcess(), module, &moduleInfo, sizeof(moduleInfo)) ||
+        !moduleInfo.lpBaseOfDll || moduleInfo.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+
+    BgiLineImageView candidate = {};
+    candidate.base = static_cast<BYTE*>(moduleInfo.lpBaseOfDll);
+    candidate.size = moduleInfo.SizeOfImage;
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(candidate.base);
+    if (!BgiLineIsImageRange(candidate, dos, sizeof(*dos)) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 || static_cast<size_t>(dos->e_lfanew) > candidate.size - sizeof(IMAGE_NT_HEADERS)) {
+        return false;
+    }
+
+    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(candidate.base + dos->e_lfanew);
+    if (!BgiLineIsImageRange(candidate, nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER) ||
+#ifdef _WIN64
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+#else
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+#endif
+        nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER) ||
+        nt->OptionalHeader.SizeOfImage > candidate.size ||
+        nt->FileHeader.NumberOfSections == 0 || nt->FileHeader.NumberOfSections > 96) {
+        return false;
+    }
+
+    BYTE* sectionTable = reinterpret_cast<BYTE*>(&nt->OptionalHeader) +
+        nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(nt->FileHeader.NumberOfSections) *
+        sizeof(IMAGE_SECTION_HEADER);
+    if (!BgiLineIsImageRange(candidate, sectionTable, sectionBytes)) return false;
+
+    candidate.sections = reinterpret_cast<IMAGE_SECTION_HEADER*>(sectionTable);
+    candidate.sectionCount = nt->FileHeader.NumberOfSections;
+    *image = candidate;
+    return true;
+}
+
+static bool BgiLineGetSectionSpan(const BgiLineImageView& image,
+    const IMAGE_SECTION_HEADER& section, BYTE** start, size_t* length) {
+    if (!start || !length || section.VirtualAddress >= image.size) return false;
+    size_t span = std::max<size_t>(section.Misc.VirtualSize, section.SizeOfRawData);
+    span = std::min<size_t>(span, image.size - static_cast<size_t>(section.VirtualAddress));
+    if (span == 0) return false;
+    *start = image.base + section.VirtualAddress;
+    *length = span;
+    return true;
+}
+
+static bool BgiLineIsExecutableAddress(const BgiLineImageView& image, const BYTE* address) {
+    for (WORD index = 0; index < image.sectionCount; ++index) {
+        const IMAGE_SECTION_HEADER& section = image.sections[index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        BYTE* start = nullptr;
+        size_t length = 0;
+        if (BgiLineGetSectionSpan(image, section, &start, &length) &&
+            address >= start && static_cast<size_t>(address - start) < length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool BgiLineImageContainsDscMagic(const BgiLineImageView& image) {
+    static const BYTE magic[] = "DSC FORMAT 1.00";
+    for (WORD index = 0; index < image.sectionCount; ++index) {
+        const IMAGE_SECTION_HEADER& section = image.sections[index];
+        if ((section.Characteristics & (IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA)) == 0) continue;
+        BYTE* start = nullptr;
+        size_t length = 0;
+        if (!BgiLineGetSectionSpan(image, section, &start, &length) || length < sizeof(magic)) continue;
+        for (size_t offset = 0; offset <= length - sizeof(magic); ++offset) {
+            if (memcmp(start + offset, magic, sizeof(magic)) == 0) return true;
+        }
+    }
+    return false;
+}
+
+static bool BgiLineIsWildcard(size_t offset,
+    const BgiLineWildcard* wildcards, size_t wildcardCount) {
+    for (size_t index = 0; index < wildcardCount; ++index) {
+        if (offset >= wildcards[index].offset &&
+            offset - wildcards[index].offset < wildcards[index].length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool BgiLineMatchesPattern(const BYTE* bytes, const BYTE* pattern, size_t patternSize,
+    const BgiLineWildcard* wildcards, size_t wildcardCount) {
+    for (size_t offset = 0; offset < patternSize; ++offset) {
+        if (!BgiLineIsWildcard(offset, wildcards, wildcardCount) && bytes[offset] != pattern[offset]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static BYTE* BgiLineFindUniqueExecutablePattern(const BgiLineImageView& image,
+    const BYTE* pattern, size_t patternSize,
+    const BgiLineWildcard* wildcards, size_t wildcardCount, size_t* matchCount) {
+    if (matchCount) *matchCount = 0;
+    BYTE* match = nullptr;
+    size_t count = 0;
+    for (WORD index = 0; index < image.sectionCount; ++index) {
+        const IMAGE_SECTION_HEADER& section = image.sections[index];
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+        BYTE* start = nullptr;
+        size_t length = 0;
+        if (!BgiLineGetSectionSpan(image, section, &start, &length) || length < patternSize) continue;
+        for (size_t offset = 0; offset <= length - patternSize; ++offset) {
+            if (start[offset] != pattern[0] ||
+                !BgiLineMatchesPattern(start + offset, pattern, patternSize, wildcards, wildcardCount)) {
+                continue;
+            }
+            match = start + offset;
+            ++count;
+        }
+    }
+    if (matchCount) *matchCount = count;
+    return count == 1 ? match : nullptr;
+}
+
+static bool BgiLineValidateRelativeCalls(const BgiLineImageView& image, const BYTE* function,
+    const size_t* callOffsets, size_t callCount) {
+    for (size_t index = 0; index < callCount; ++index) {
+        const BYTE* call = function + callOffsets[index];
+        if (!BgiLineIsImageRange(image, call, 5) || call[0] != 0xE8) return false;
+        int32_t relative = 0;
+        memcpy(&relative, call + 1, sizeof(relative));
+        const BYTE* target = call + 5 + relative;
+        if (!BgiLineIsExecutableAddress(image, target)) return false;
+    }
+    return true;
+}
+
+static bool BgiLineIsPlausibleCp932FontName(const BYTE* text, size_t available) {
+    const size_t limit = std::min<size_t>(available, 63);
+    size_t length = 0;
+    while (length < limit && text[length] != 0) ++length;
+    if (length == 0 || length == limit) return false;
+
+    for (size_t offset = 0; offset < length; ++offset) {
+        const BYTE value = text[offset];
+        if (value >= 0x20 && value <= 0x7E) continue;
+        if (value >= 0xA1 && value <= 0xDF) continue;
+        const bool lead = (value >= 0x81 && value <= 0x9F) || (value >= 0xE0 && value <= 0xFC);
+        if (!lead || offset + 1 >= length) return false;
+        const BYTE trail = text[++offset];
+        if (!((trail >= 0x40 && trail <= 0x7E) || (trail >= 0x80 && trail <= 0xFC))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static DWORD BgiLineReadDword(const BYTE* address) {
+    DWORD value = 0;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static SHORT BgiLineReadShort(const BYTE* address) {
+    SHORT value = 0;
+    memcpy(&value, address, sizeof(value));
+    return value;
+}
+
+static bool BgiLineValidateScriptReference(const BYTE* script, size_t scriptSize,
+    size_t matchOffset, const BgiLineScriptLayout& layout) {
+    const intptr_t stringOpcode = static_cast<intptr_t>(matchOffset) + 3;
+    const intptr_t stringTarget = stringOpcode + BgiLineReadShort(script + matchOffset + 4);
+    if (stringTarget < 16 || static_cast<size_t>(stringTarget) >= scriptSize ||
+        !BgiLineIsPlausibleCp932FontName(script + stringTarget, scriptSize - stringTarget)) {
+        return false;
+    }
+
+    if (layout.hasCodeReference) {
+        const intptr_t codeOpcode = static_cast<intptr_t>(matchOffset) + 6;
+        const intptr_t codeTarget = codeOpcode + BgiLineReadShort(script + matchOffset + 7);
+        if (codeTarget < 16 || static_cast<size_t>(codeTarget) >= scriptSize ||
+            codeTarget == stringTarget) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static BgiLinePatchResult BgiLineTryPatchDecodedScript(BYTE* script, size_t scriptSize,
+    const char** layoutName, size_t* patchedOffset) {
+    constexpr size_t kMaximumScriptSize = 4 * 1024 * 1024;
+    if (layoutName) *layoutName = nullptr;
+    if (patchedOffset) *patchedOffset = 0;
+    if (!script || scriptSize < 16 || scriptSize > kMaximumScriptSize ||
+        BgiLineReadDword(script) != 16 || BgiLineReadDword(script + 4) != scriptSize - 16 ||
+        BgiLineReadDword(script + 8) != 0 || BgiLineReadDword(script + 12) != 0) {
+        return BgiLinePatchResult::NotScript;
+    }
+
+    const BgiLineScriptLayout* selectedLayout = nullptr;
+    size_t selectedOffset = 0;
+    size_t matchCount = 0;
+    for (const BgiLineScriptLayout& layout : kBgiLineScriptLayouts) {
+        if (scriptSize < layout.patternSize) continue;
+        for (size_t offset = 16; offset <= scriptSize - layout.patternSize; ++offset) {
+            if (script[offset] != 0x04 || script[offset + 1] != 0x04 || script[offset + 2] != 0x00 ||
+                !BgiLineMatchesPattern(script + offset, layout.pattern, layout.patternSize,
+                    layout.wildcards, layout.wildcardCount) ||
+                !BgiLineValidateScriptReference(script, scriptSize, offset, layout)) {
+                continue;
+            }
+            selectedLayout = &layout;
+            selectedOffset = offset;
+            ++matchCount;
+        }
+    }
+
+    if (matchCount == 0) return BgiLinePatchResult::NoMatch;
+    if (matchCount != 1 || !selectedLayout ||
+        selectedLayout->replacementSize > selectedLayout->patternSize) {
+        return BgiLinePatchResult::Ambiguous;
+    }
+
+    memcpy(script + selectedOffset, selectedLayout->replacement, selectedLayout->replacementSize);
+    if (layoutName) *layoutName = selectedLayout->name;
+    if (patchedOffset) *patchedOffset = selectedOffset;
+    return BgiLinePatchResult::Patched;
+}
+
+static void __cdecl BgiLinePatchDecodedOutput(BYTE* output, int decodedSize) {
+    if (decodedSize <= 0) return;
+    const char* layoutName = nullptr;
+    size_t patchedOffset = 0;
+    const BgiLinePatchResult result = BgiLineTryPatchDecodedScript(
+        output, static_cast<size_t>(decodedSize), &layoutName, &patchedOffset);
+    if (result == BgiLinePatchResult::Patched &&
+        InterlockedIncrement(&g_bgiLineApplyTraceCount) <= 16) {
+        Utils::Trace("[DEBUG][BGI] phase=line-font-apply decision=patched evidence=%s configVersion=%ld fallback=none size=%d offset=0x%zx",
+            layoutName, Config::ConfigVersion, decodedSize, patchedOffset);
+    } else if (result == BgiLinePatchResult::Ambiguous &&
+        InterlockedIncrement(&g_bgiLineAmbiguousTraceCount) <= 4) {
+        Utils::Trace("[DEBUG][BGI] phase=line-font-apply decision=skip evidence=multiple-layout-matches configVersion=%ld fallback=original-script size=%d",
+            Config::ConfigVersion, decodedSize);
+    }
+}
+
+static int __fastcall BgiLineFastcallDecoderHook(BYTE* output, const void* source) {
+    const int decodedSize = g_bgiLineOriginalFastcallDecoder(output, source);
+    BgiLinePatchDecodedOutput(output, decodedSize);
+    return decodedSize;
+}
+
+#ifndef _WIN64
+__declspec(naked) static int __cdecl BgiLineLegacyRegisterDecoderHook() {
+    __asm {
+        call dword ptr [g_bgiLineOriginalLegacyRegisterDecoder]
+        push eax
+        push eax
+        push edi
+        call BgiLinePatchDecodedOutput
+        add esp, 8
+        pop eax
+        ret
+    }
+}
+#endif
+
+static bool InstallBgiLineFontInOpenDetourTransaction() {
+    BgiLineImageView image = {};
+    if (!BgiLineReadMainModuleImage(&image) || !BgiLineImageContainsDscMagic(image)) {
+        Utils::Trace("[DEBUG][BGI] phase=line-font-capability decision=skip evidence=dsc-format-missing configVersion=%ld fallback=original-script",
+            Config::ConfigVersion);
+        return false;
+    }
+
+    size_t fastcallMatches = 0;
+    BYTE* fastcallTarget = BgiLineFindUniqueExecutablePattern(image,
+        kBgiLineFastcallDecoderPattern, _countof(kBgiLineFastcallDecoderPattern),
+        kBgiLineFastcallDecoderWildcards, _countof(kBgiLineFastcallDecoderWildcards),
+        &fastcallMatches);
+    if (fastcallTarget && !BgiLineValidateRelativeCalls(image, fastcallTarget,
+        kBgiLineFastcallDecoderCalls, _countof(kBgiLineFastcallDecoderCalls))) {
+        fastcallTarget = nullptr;
+        fastcallMatches = 0;
+    }
+
+    BgiLineDecoderAbi abi = BgiLineDecoderAbi::None;
+    BYTE* target = nullptr;
+    const char* profile = nullptr;
+    size_t totalMatches = fastcallMatches;
+    if (fastcallTarget) {
+        abi = BgiLineDecoderAbi::Fastcall;
+        target = fastcallTarget;
+#ifdef _WIN64
+        profile = "x64-fastcall-dsc";
+#else
+        profile = "x86-fastcall-dsc";
+#endif
+    }
+
+#ifndef _WIN64
+    size_t legacyMatches = 0;
+    BYTE* legacyTarget = BgiLineFindUniqueExecutablePattern(image,
+        kBgiLineLegacyDecoderPattern, _countof(kBgiLineLegacyDecoderPattern),
+        kBgiLineLegacyDecoderWildcards, _countof(kBgiLineLegacyDecoderWildcards),
+        &legacyMatches);
+    if (legacyTarget && !BgiLineValidateRelativeCalls(image, legacyTarget,
+        kBgiLineLegacyDecoderCalls, _countof(kBgiLineLegacyDecoderCalls))) {
+        legacyTarget = nullptr;
+        legacyMatches = 0;
+    }
+    totalMatches += legacyMatches;
+    if (legacyTarget && totalMatches == 1) {
+        abi = BgiLineDecoderAbi::LegacyX86Registers;
+        target = legacyTarget;
+        profile = "x86-legacy-register-dsc";
+    }
+#endif
+
+    if (!target || totalMatches != 1) {
+        Utils::Trace("[DEBUG][BGI] phase=line-font-capability decision=skip evidence=decoder-profile-count-%zu configVersion=%ld fallback=original-script",
+            totalMatches, Config::ConfigVersion);
+        return false;
+    }
+
+    LONG attachResult = ERROR_NOT_SUPPORTED;
+    if (abi == BgiLineDecoderAbi::Fastcall) {
+        g_bgiLineOriginalFastcallDecoder = reinterpret_cast<BgiLineFastcallDecoder>(target);
+        attachResult = DetourAttach(reinterpret_cast<PVOID*>(&g_bgiLineOriginalFastcallDecoder),
+            reinterpret_cast<PVOID>(BgiLineFastcallDecoderHook));
+    }
+#ifndef _WIN64
+    else if (abi == BgiLineDecoderAbi::LegacyX86Registers) {
+        g_bgiLineOriginalLegacyRegisterDecoder = reinterpret_cast<BgiLineLegacyRegisterDecoder>(target);
+        attachResult = DetourAttach(reinterpret_cast<PVOID*>(&g_bgiLineOriginalLegacyRegisterDecoder),
+            reinterpret_cast<PVOID>(BgiLineLegacyRegisterDecoderHook));
+    }
+#endif
+
+    if (attachResult == NO_ERROR) InterlockedExchange(&g_bgiLineFontActive, 1);
+    Utils::Trace("[DEBUG][BGI] phase=line-font-capability decision=%s evidence=%s configVersion=%ld fallback=%s target=%p result=%ld",
+        attachResult == NO_ERROR ? "attached" : "skip", profile, Config::ConfigVersion,
+        attachResult == NO_ERROR ? "none" : "detour-attach-failed", target, attachResult);
+    return attachResult == NO_ERROR;
+}

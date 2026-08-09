@@ -52,7 +52,7 @@ DebugPickerThreadLogLimit=0
 | --- | --- |
 | `[TRACE]` | 安装、配置版本和 API 采样 |
 | `[DEBUG][TextSub]` | 文字映射输入和输出 |
-| `[DEBUG][BGI]` | BGI 检测、缓存和度量适配 |
+| `[DEBUG][BGI]` | BGI 身份、DSC/LINE 字体脚本、GDI 缓存和度量适配 |
 | `[DEBUG][CatSystem2]` | classic CatSystem2 字体源、文件重定向和缺失目录枚举回退 |
 | `[DEBUG][UnityMono]` | Unity Mono 运行时绑定和对象应用 |
 | `[DEBUG][CatSystemUnity]` | Unity IL2CPP/TMP 运行时适配 |
@@ -100,6 +100,20 @@ DebugPickerThreadLogLimit=0
 
 先确认引擎检测证据，再临时关闭该引擎总开关进行对照。通用 GDI 导入不能作为具体
 引擎身份的充分证据。
+
+### BGI LINE 界面仍使用固定字体
+
+先查启动日志中的 `phase=line-font-capability`。`decision=attached` 表示当前 x86/x64
+DSC 解码器 profile 唯一并已挂接；`decision=skip` 时根据 `evidence` 判断是缺少 DSC、
+解码器布局未知还是匹配不唯一，适配器会保留原脚本。
+
+进入 LINE 界面后还必须出现 `phase=line-font-apply decision=patched`。其中 `evidence`
+应为已验证的 `bp-modern-font-record-0c00` 或 `bp-legacy-font-record-0bd4`，`size` 和
+`offset` 用于对应本次内存输出。只有 capability 而没有 apply，表示解码器钩子可用但当前
+BP 没有唯一命中已知 LINE 语义布局，不要改用固定 RVA 或只搜索字体名。
+
+该路径直接处理 `sysprg.arc` 解码后的内存缓冲区。目标目录没有解包后的 `scrdrv._bp` 是
+正常状态；放置同名松散文件不会启用功能，也不能用于判断路由是否成功。
 
 ### YU-RIS 页表布局不兼容
 

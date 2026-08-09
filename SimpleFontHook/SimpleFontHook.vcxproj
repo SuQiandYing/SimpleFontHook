@@ -251,6 +251,8 @@
     <None Include="hooks\internal\font_hooks_font_queries.cppinc" />
     <None Include="hooks\internal\font_hooks_font_creation.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_compat.cppinc" />
+    <None Include="hooks\internal\engines\bgi\bgi_identity.cppinc" />
+    <None Include="hooks\internal\engines\bgi\bgi_line_font.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_compat_state.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_font_metrics.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_import_detection.cppinc" />
