@@ -1,4 +1,0 @@
-#include "state/font_picker_state.cppinc"
-#include "state/font_picker_layout_geometry.cppinc"
-#include "state/font_picker_metric_layout.cppinc"
-#include "state/font_picker_window_animation.cppinc"
