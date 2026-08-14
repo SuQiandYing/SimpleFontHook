@@ -51,5 +51,5 @@ echo ============================================
 echo Build target: !BUILD_TARGET!
 echo Build finished with errorlevel: !BUILD_RESULT!
 echo ============================================
-pause
+if not defined SIMPLEFONTHOOK_NO_PAUSE pause
 exit /b !BUILD_RESULT!

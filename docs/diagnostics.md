@@ -91,6 +91,14 @@ DebugPickerThreadLogLimit=0
 检查 `ConfigVersion` 是否更新、目标引擎是否使用内部缓存，以及对应适配器是否记录了
 缓存清理或资源重建。不要直接把问题归因于字体名称替换失败。
 
+### TyranoScript 换字体后场景或插件提示 file not found
+
+先确认 `resources/app.asar` 与 `resources/app` 的实际布局。已经从 `app.asar` 启动的
+Electron 进程必须在字体热切换后继续看到同一归档；否则后续 `./data/scenario/...` 和
+`./data/scenario/../others/plugin/...` 请求会落到不存在或不完整的 loose 根。开启
+`EnableDebugLog` 后检查 `[DEBUG][Tyrano]` 的 `asar-visible`、`asar-index-ready` 和
+`asar-overlay-open`，并确认规范化后的条目仍位于应用根内。
+
 ### 启动卡顿
 
 检查日志中的慢调用和 watchdog 阶段。重点排查高频钩子中的重复文件扫描、PE/ASAR
