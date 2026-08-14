@@ -1,9 +1,9 @@
 // JavaScript bridges keep the selected font synchronized in Electron's main
 // and renderer processes without restarting the game.
 
-static const char kTyranoFontBridgeMarker[] = "SimpleFontHookTyranoFontBridgeV1";
+static const char kTyranoFontBridgeMarker[] = "SimpleFontHookTyranoFontBridgeV2";
 static const char kTyranoFontBridge[] = R"SFH(
-// SimpleFontHookTyranoFontBridgeV1
+// SimpleFontHookTyranoFontBridgeV2
 (() => {
   try {
     const electron = require("electron");
@@ -11,30 +11,41 @@ static const char kTyranoFontBridge[] = R"SFH(
     const path = require("path");
     const iniPath = path.join(path.dirname(process.execPath), "FontHook.ini");
     const cssKeys = new Map();
-    let lastFace = "";
+    let lastFamilies = "";
     let timer = 0;
 
-    const readFace = () => {
+    const readFamilies = () => {
       try {
         const text = fs.readFileSync(iniPath, "utf8").replace(/^\uFEFF/, "");
-        const match = /^FontNameW=(.*)$/m.exec(text);
-        return match ? match[1].trim() : "";
+        const readValue = (key) => {
+          const match = new RegExp(`^${key}=(.*)$`, "m").exec(text);
+          return match ? match[1].trim() : "";
+        };
+        const families = [];
+        const add = (family) => {
+          if (family && !families.includes(family)) families.push(family);
+        };
+        [readValue("FontNameW"), readValue("FontNameA")].forEach((family) => {
+          add(family);
+          add(family.replace(/[ -]?\d{2,3}W(?:\s+\w+)?$/i, "").trim());
+        });
+        return families;
       } catch (_) {
-        return "";
+        return [];
       }
     };
 
-    const applyToWindow = (win, face) => {
-      if (!win || win.isDestroyed() || !face) return;
+    const applyToWindow = (win, families) => {
+      if (!win || win.isDestroyed() || !families.length) return;
       const oldKey = cssKeys.get(win.id);
       const remove = oldKey
         ? win.webContents.removeInsertedCSS(oldKey).catch(() => {})
         : Promise.resolve();
       remove.then(() => {
         if (win.isDestroyed()) return;
-        const quoted = JSON.stringify(face);
+        const familyList = families.map(JSON.stringify).join(", ");
         return win.webContents.insertCSS(
-          `html, body, body * { font-family: ${quoted}, sans-serif !important; }`,
+          `html, body, body * { font-family: ${familyList}, sans-serif !important; }`,
           { cssOrigin: "user" }
         );
       }).then((key) => {
@@ -43,16 +54,16 @@ static const char kTyranoFontBridge[] = R"SFH(
     };
 
     const applyToAll = () => {
-      const face = readFace();
-      if (!face) return;
-      lastFace = face;
-      electron.BrowserWindow.getAllWindows().forEach((win) => applyToWindow(win, face));
+      const families = readFamilies();
+      if (!families.length) return;
+      lastFamilies = families.join("\n");
+      electron.BrowserWindow.getAllWindows().forEach((win) => applyToWindow(win, families));
     };
 
     electron.app.on("browser-window-created", (_, win) => {
       win.webContents.on("did-finish-load", () => {
         cssKeys.delete(win.id);
-        applyToWindow(win, readFace());
+        applyToWindow(win, readFamilies());
       });
       win.on("closed", () => cssKeys.delete(win.id));
     });
@@ -61,8 +72,8 @@ static const char kTyranoFontBridge[] = R"SFH(
     fs.watchFile(iniPath, { interval: 200 }, () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        const face = readFace();
-        if (face && face !== lastFace) applyToAll();
+        const families = readFamilies();
+        if (families.length && families.join("\n") !== lastFamilies) applyToAll();
       }, 80);
     });
     electron.app.on("will-quit", () => fs.unwatchFile(iniPath));
@@ -73,13 +84,13 @@ static const char kTyranoFontBridge[] = R"SFH(
 )SFH";
 
 static const char kTyranoRendererFontBridgeMarker[] =
-    "SimpleFontHookTyranoRendererFontBridgeV1";
+    "SimpleFontHookTyranoRendererFontBridgeV2";
 static const char kTyranoRendererFontBridge[] = R"SFH(
-// SimpleFontHookTyranoRendererFontBridgeV1
+// SimpleFontHookTyranoRendererFontBridgeV2
 (() => {
   try {
-    if (window.__simpleFontHookTyranoRendererBridge) return;
-    window.__simpleFontHookTyranoRendererBridge = true;
+    if (window.__simpleFontHookTyranoRendererBridgeV2) return;
+    window.__simpleFontHookTyranoRendererBridgeV2 = true;
 
     const api = window.studio_api || {};
     const nodeRequire = typeof require === "function" ? require : null;
@@ -96,26 +107,38 @@ static const char kTyranoRendererFontBridge[] = R"SFH(
     const style = document.createElement("style");
     style.id = "simple-font-hook-tyrano-font";
     (document.head || document.documentElement).appendChild(style);
-    let lastFace = "";
+    let lastFamilies = "";
 
-    const readFace = () => {
+    const readFamilies = () => {
       try {
         const text = fs.readFileSync(iniPath, "utf8").replace(/^\uFEFF/, "");
-        const match = /^FontNameW=(.*)$/m.exec(text);
-        return match ? match[1].trim() : "";
+        const readValue = (key) => {
+          const match = new RegExp(`^${key}=(.*)$`, "m").exec(text);
+          return match ? match[1].trim() : "";
+        };
+        const families = [];
+        const add = (family) => {
+          if (family && !families.includes(family)) families.push(family);
+        };
+        [readValue("FontNameW"), readValue("FontNameA")].forEach((family) => {
+          add(family);
+          add(family.replace(/[ -]?\d{2,3}W(?:\s+\w+)?$/i, "").trim());
+        });
+        return families;
       } catch (_) {
-        return "";
+        return [];
       }
     };
 
     const apply = () => {
-      const face = readFace();
-      if (!face || face === lastFace) return;
-      lastFace = face;
-      const quoted = JSON.stringify(face);
+      const families = readFamilies();
+      const familyKey = families.join("\n");
+      if (!families.length || familyKey === lastFamilies) return;
+      lastFamilies = familyKey;
+      const familyList = families.map(JSON.stringify).join(", ");
       style.textContent =
-        `html, body, body * { font-family: ${quoted}, sans-serif !important; }`;
-      document.documentElement.dataset.simpleFontHookFace = face;
+        `html, body, body * { font-family: ${familyList}, sans-serif !important; }`;
+      document.documentElement.dataset.simpleFontHookFace = families[0];
     };
 
     apply();
@@ -126,6 +149,15 @@ static const char kTyranoRendererFontBridge[] = R"SFH(
     // The native web-font redirect remains the fallback when preload APIs differ.
   }
 })();
+)SFH";
+
+// Pure-ASAR games never open the loose main.js/tyrano.js paths handled above.
+// Keep this payload below the reserved comment slot used by the ASAR read hook;
+// replacing that slot preserves every archive entry offset and size.
+static const char kTyranoAsarRendererBridgeSlotPrefix[] =
+    "/*\r\n    $.setStorage = function(key,val){";
+static const char kTyranoAsarRendererBridge[] = R"SFH(
+(()=>{try{if(window.__sfh2)return;window.__sfh2=1;let r=typeof require=="function"&&require("fs"),p=typeof require=="function"&&require("path"),e=window.process&&window.process.execPath,s=document.createElement("style"),v="";if(!r||!p||!e)return;(document.head||document.documentElement).appendChild(s);let a=()=>{try{let m=/^FontNameW=(.*)$/m.exec(r.readFileSync(p.join(p.dirname(e),"FontHook.ini"),"utf8")),n=m&&m[1].trim();if(n&&n!=v)v=n,s.textContent="html,body,body *{font-family:"+JSON.stringify(n)+","+JSON.stringify(n.replace(/[ -]?\d{2,3}W.*$/i,""))+",sans-serif!important}"}catch(_){}};a();setInterval(a,200)}catch(_){}})();
 )SFH";
 
 static const char* TyranoBridgePayloadForPath(const std::wstring& relativePath) {

@@ -1,7 +1,17 @@
 // Shared TyranoScript state and path/text helpers.
 
 static volatile LONG g_tyranoEngineProbe = -1;
+// -1 = undecided, 0 = keep app.asar visible, 1 = use the loose app root.
+static volatile LONG g_tyranoAsarVisibilityDecision = -1;
 static volatile LONG g_tyranoTraceCount = 0;
+static volatile LONG g_tyranoScriptPatchCount = 0;
+static std::mutex g_tyranoScriptPatchMutex;
+static bool g_tyranoScriptPatchPrepared = false;
+static ULONGLONG g_tyranoScriptPatchOffset = 0;
+static std::vector<BYTE> g_tyranoScriptPatchBytes;
+static std::mutex g_tyranoPatchedAsarMutex;
+static bool g_tyranoPatchedAsarAttempted = false;
+static std::wstring g_tyranoPatchedAsarPath;
 static std::mutex g_tyranoFontBytesMutex;
 static LONG g_tyranoFontBytesVersion = LONG_MIN;
 static std::wstring g_tyranoFontBytesFace;
@@ -44,12 +54,37 @@ static std::wstring TyranoBuildRootPath(const wchar_t* relativePath) {
 }
 
 static std::wstring TyranoNormalizeRelativePath(std::wstring path) {
-    while (!path.empty() && (path.front() == L'\\' || path.front() == L'/')) path.erase(path.begin());
     for (wchar_t& ch : path) {
         if (ch == L'/') ch = L'\\';
-        ch = (wchar_t)towlower(ch);
     }
-    return path;
+
+    std::vector<std::wstring> parts;
+    size_t cursor = 0;
+    while (cursor <= path.size()) {
+        size_t separator = path.find(L'\\', cursor);
+        size_t length = separator == std::wstring::npos ?
+            path.size() - cursor : separator - cursor;
+        std::wstring part = path.substr(cursor, length);
+        if (!part.empty() && part != L".") {
+            if (part == L"..") {
+                if (parts.empty()) return L"";
+                parts.pop_back();
+            } else {
+                std::transform(part.begin(), part.end(), part.begin(),
+                    [](wchar_t ch) { return (wchar_t)towlower(ch); });
+                parts.push_back(std::move(part));
+            }
+        }
+        if (separator == std::wstring::npos) break;
+        cursor = separator + 1;
+    }
+
+    std::wstring normalized;
+    for (const std::wstring& part : parts) {
+        if (!normalized.empty()) normalized += L"\\";
+        normalized += part;
+    }
+    return normalized;
 }
 
 static std::wstring TyranoUtf8ToWide(const std::string& value) {

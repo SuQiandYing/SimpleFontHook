@@ -106,18 +106,28 @@ static bool TyranoShouldHideAsarW(const wchar_t* fileName) {
     std::wstring fullPath = EngineCommon::FullPath(fileName);
     std::wstring asarPath = TyranoBuildRootPath(L"resources\\app.asar");
     if (!EngineCommon::SamePath(fullPath, asarPath)) return false;
-    if (!TyranoReplacementEnabled()) return false;
 
-    // Electron selects resources/app when resources/app.asar is unavailable.
-    // Only do this when the archive index is readable: text and script opens
-    // are then overlaid from app.asar, so a stale loose extraction cannot hide
-    // localized scenario content.
-    if (!TyranoEnsureAsarIndex()) {
-        TyranoTraceLimited("asar-visible request='%s' reason=overlay-index-unavailable",
-            EngineCommon::WideToUtf8(fullPath).c_str());
-        return false;
-    }
-    TyranoTraceLimited("asar-hidden request='%s' fallback='resources/app' overlay=archive-text",
-        EngineCommon::WideToUtf8(fullPath).c_str());
-    return true;
+    LONG cached = InterlockedCompareExchange(
+        &g_tyranoAsarVisibilityDecision, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    // Electron resolves relative renderer URLs through the storage root chosen
+    // at process startup. Freeze that choice on the first app.asar query so a
+    // live font change cannot move later ./data and ./tyrano requests between
+    // archive and loose roots. Pure-ASAR games stay on the archive; a complete
+    // loose Tyrano tree may use the overlay from the beginning.
+    bool hasLooseRuntime = TyranoPathIsDirectory(L"resources\\app\\tyrano");
+    bool hasLoosePackageMarker = hasLooseRuntime && TyranoPackageHasMarker();
+    bool hide = hasLoosePackageMarker && TyranoReplacementEnabled() &&
+        TyranoEnsureAsarIndex();
+    InterlockedCompareExchange(&g_tyranoAsarVisibilityDecision,
+        hide ? 1 : 0, -1);
+    LONG decision = InterlockedCompareExchange(
+        &g_tyranoAsarVisibilityDecision, -1, -1);
+    TyranoTraceLimited("asar-%s request='%s' storage-root=%s loose-runtime=%d package-marker=%d",
+        decision != 0 ? "hidden" : "visible",
+        EngineCommon::WideToUtf8(fullPath).c_str(),
+        decision != 0 ? "resources/app" : "resources/app.asar",
+        hasLooseRuntime ? 1 : 0, hasLoosePackageMarker ? 1 : 0);
+    return decision != 0;
 }

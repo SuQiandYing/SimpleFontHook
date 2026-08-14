@@ -106,16 +106,19 @@ static bool TyranoLoosePathToRelative(const wchar_t* fileName,
     std::wstring fullPath = EngineCommon::FullPath(fileName);
     std::wstring normalized = EngineCommon::NormalizePath(fullPath);
     std::wstring appRoot = EngineCommon::NormalizePath(TyranoBuildRootPath(L"resources\\app"));
-    if (appRoot.empty() || normalized.size() <= appRoot.size() ||
+    if (appRoot.empty() || normalized.size() < appRoot.size() ||
         normalized.compare(0, appRoot.size(), appRoot) != 0 ||
-        normalized[appRoot.size()] != L'\\') {
+        (normalized.size() > appRoot.size() &&
+         normalized[appRoot.size()] != L'\\')) {
         return false;
     }
 
-    std::wstring relative = TyranoNormalizeRelativePath(
-        normalized.substr(appRoot.size() + 1));
-    if (relative.empty() || relative.find(L"..\\") == 0 ||
-        relative.find(L"\\..\\") != std::wstring::npos) {
+    std::wstring relative;
+    if (normalized.size() > appRoot.size()) {
+        relative = TyranoNormalizeRelativePath(
+            normalized.substr(appRoot.size() + 1));
+    }
+    if (normalized.size() > appRoot.size() && relative.empty()) {
         return false;
     }
 
@@ -217,6 +220,262 @@ static bool TyranoReadAsarEntry(const TyranoAsarEntry& entry,
     CloseHandle(file);
     if (!ok) bytes.clear();
     return ok;
+}
+
+static bool TyranoGetAsarEntry(const wchar_t* relativePath,
+    TyranoAsarEntry* entryOut) {
+    if (!relativePath || !relativePath[0] || !entryOut ||
+        !TyranoEnsureAsarIndex()) {
+        return false;
+    }
+    std::wstring normalized = TyranoNormalizeRelativePath(relativePath);
+    if (normalized.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_tyranoAsarMutex);
+    auto found = g_tyranoAsarEntries.find(normalized);
+    if (found == g_tyranoAsarEntries.end() || found->second.unpacked) return false;
+    *entryOut = found->second;
+    return true;
+}
+
+static bool TyranoPrepareAsarRendererPatch() {
+    std::lock_guard<std::mutex> lock(g_tyranoScriptPatchMutex);
+    if (g_tyranoScriptPatchPrepared) return !g_tyranoScriptPatchBytes.empty();
+    g_tyranoScriptPatchPrepared = true;
+
+    TyranoAsarEntry entry = {};
+    std::vector<BYTE> entryBytes;
+    if (!TyranoGetAsarEntry(L"tyrano\\libs.js", &entry) || entry.size == 0 ||
+        !TyranoReadAsarEntry(entry, entryBytes)) {
+        TyranoTraceLimited("asar-script-plan-failed entry='tyrano/libs.js' reason=read");
+        return false;
+    }
+
+    size_t bridgeLength = strlen(kTyranoAsarRendererBridge);
+    size_t prefixLength = strlen(kTyranoAsarRendererBridgeSlotPrefix);
+    BYTE* entryBegin = entryBytes.data();
+    BYTE* entryEnd = entryBegin + entryBytes.size();
+    BYTE* slotBegin = std::search(entryBegin, entryEnd,
+        kTyranoAsarRendererBridgeSlotPrefix,
+        kTyranoAsarRendererBridgeSlotPrefix + prefixLength);
+    if (slotBegin == entryEnd) {
+        TyranoTraceLimited("asar-script-plan-failed entry='tyrano/libs.js' reason=slot-prefix");
+        return false;
+    }
+
+    static const char kCommentEnd[] = "*/";
+    BYTE* slotEndMarker = std::search(slotBegin + prefixLength, entryEnd,
+        kCommentEnd, kCommentEnd + 2);
+    if (slotEndMarker == entryEnd) {
+        TyranoTraceLimited("asar-script-plan-failed entry='tyrano/libs.js' reason=slot-end");
+        return false;
+    }
+
+    size_t slotLength = static_cast<size_t>(slotEndMarker + 2 - slotBegin);
+    if (bridgeLength == 0 || bridgeLength > slotLength) {
+        TyranoTraceLimited("asar-script-plan-failed entry='tyrano/libs.js' bridge=%lu slot=%lu",
+            (DWORD)bridgeLength, (DWORD)slotLength);
+        return false;
+    }
+
+    size_t slotRelativeOffset = static_cast<size_t>(slotBegin - entryBegin);
+    if (entry.absoluteOffset > ULLONG_MAX - slotRelativeOffset) return false;
+    g_tyranoScriptPatchOffset = entry.absoluteOffset + slotRelativeOffset;
+    g_tyranoScriptPatchBytes.assign(slotLength, static_cast<BYTE>(' '));
+    memcpy(g_tyranoScriptPatchBytes.data(), kTyranoAsarRendererBridge,
+        bridgeLength);
+    TyranoTraceLimited("asar-script-plan-ready entry='tyrano/libs.js' offset=%llu bridge=%lu slot=%lu",
+        (unsigned long long)g_tyranoScriptPatchOffset, (DWORD)bridgeLength,
+        (DWORD)slotLength);
+    return true;
+}
+
+static bool TyranoPatchAsarRendererScript(HANDLE file, void* buffer,
+    DWORD bytesRead, ULONGLONG readStart) {
+    if (!buffer || bytesRead == 0 || !TyranoReplacementEnabled()) return false;
+
+    if (!TyranoPrepareAsarRendererPatch()) return false;
+    ULONGLONG readEnd = readStart + bytesRead;
+    if (readEnd < readStart) return false;
+
+    std::wstring asarPath = TyranoBuildRootPath(L"resources\\app.asar");
+    wchar_t finalPath[MAX_PATH] = {};
+    DWORD finalLength = GetFinalPathNameByHandleW(file, finalPath,
+        _countof(finalPath), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (finalLength == 0 || finalLength >= _countof(finalPath)) return false;
+    const wchar_t* comparablePath = finalPath;
+    if (wcsncmp(comparablePath, L"\\\\?\\", 4) == 0) comparablePath += 4;
+    if (!EngineCommon::SamePath(comparablePath, asarPath)) return false;
+
+    std::lock_guard<std::mutex> patchLock(g_tyranoScriptPatchMutex);
+    ULONGLONG patchEnd = g_tyranoScriptPatchOffset +
+        static_cast<ULONGLONG>(g_tyranoScriptPatchBytes.size());
+    if (patchEnd < g_tyranoScriptPatchOffset ||
+        readEnd <= g_tyranoScriptPatchOffset || readStart >= patchEnd) {
+        return false;
+    }
+
+    ULONGLONG copyStart = (std::max)(readStart, g_tyranoScriptPatchOffset);
+    ULONGLONG copyEnd = (std::min)(readEnd, patchEnd);
+    size_t sourceOffset = static_cast<size_t>(copyStart - g_tyranoScriptPatchOffset);
+    size_t destinationOffset = static_cast<size_t>(copyStart - readStart);
+    size_t copyLength = static_cast<size_t>(copyEnd - copyStart);
+    memcpy(static_cast<BYTE*>(buffer) + destinationOffset,
+        g_tyranoScriptPatchBytes.data() + sourceOffset, copyLength);
+    LONG hit = InterlockedIncrement(&g_tyranoScriptPatchCount);
+    TyranoTraceLimited("asar-script-patched entry='tyrano/libs.js' offset=%llu fragment=%lu hit=%ld",
+        (unsigned long long)copyStart, (DWORD)copyLength, hit);
+    return true;
+}
+
+static bool TyranoReadFileStamp(const std::wstring& path, FILETIME* creation,
+    FILETIME* access, FILETIME* write, ULONGLONG* sizeOut) {
+    HANDLE file = orgCreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size = {};
+    FILETIME localCreation = {}, localAccess = {}, localWrite = {};
+    bool ok = GetFileSizeEx(file, &size) &&
+        GetFileTime(file, &localCreation, &localAccess, &localWrite);
+    CloseHandle(file);
+    if (!ok || size.QuadPart < 0) return false;
+    if (creation) *creation = localCreation;
+    if (access) *access = localAccess;
+    if (write) *write = localWrite;
+    if (sizeOut) *sizeOut = static_cast<ULONGLONG>(size.QuadPart);
+    return true;
+}
+
+static bool TyranoPatchedAsarIsCurrent(const std::wstring& source,
+    const std::wstring& cache) {
+    FILETIME sourceCreation = {}, sourceAccess = {}, sourceWrite = {};
+    FILETIME cacheCreation = {}, cacheAccess = {}, cacheWrite = {};
+    ULONGLONG sourceSize = 0, cacheSize = 0;
+    if (!TyranoReadFileStamp(source, &sourceCreation, &sourceAccess,
+        &sourceWrite, &sourceSize) ||
+        !TyranoReadFileStamp(cache, &cacheCreation, &cacheAccess,
+            &cacheWrite, &cacheSize)) {
+        return false;
+    }
+    if (sourceSize != cacheSize || CompareFileTime(&sourceWrite, &cacheWrite) != 0)
+        return false;
+
+    // Source timestamps stay unchanged when a newer DLL changes the injected
+    // bridge. Include the reserved slot bytes in the persistent cache identity.
+    if (!TyranoPrepareAsarRendererPatch()) return false;
+    ULONGLONG patchOffset = 0;
+    std::vector<BYTE> expected;
+    {
+        std::lock_guard<std::mutex> patchLock(g_tyranoScriptPatchMutex);
+        patchOffset = g_tyranoScriptPatchOffset;
+        expected = g_tyranoScriptPatchBytes;
+    }
+    if (expected.empty() || expected.size() > MAXDWORD) return false;
+
+    HANDLE cacheFile = orgCreateFileW(cache.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (cacheFile == INVALID_HANDLE_VALUE) return false;
+    std::vector<BYTE> actual(expected.size());
+    bool matches = TyranoReadAt(cacheFile, patchOffset, actual.data(),
+        (DWORD)actual.size()) && actual == expected;
+    CloseHandle(cacheFile);
+    return matches;
+}
+
+static bool TyranoEnsurePatchedAsar(std::wstring* cachePathOut) {
+    std::wstring source = TyranoBuildRootPath(L"resources\\app.asar");
+    std::wstring cache = TyranoBuildRootPath(L"resources\\app.asar.sfh");
+    std::lock_guard<std::mutex> lock(g_tyranoPatchedAsarMutex);
+    if (g_tyranoPatchedAsarAttempted && g_tyranoPatchedAsarPath == source) {
+        if (cachePathOut && PathFileExistsW(cache.c_str())) *cachePathOut = cache;
+        return PathFileExistsW(cache.c_str());
+    }
+    g_tyranoPatchedAsarAttempted = true;
+    g_tyranoPatchedAsarPath = source;
+    if (!TyranoReplacementEnabled() || !PathFileExistsW(source.c_str())) return false;
+
+    if (!TyranoPatchedAsarIsCurrent(source, cache)) {
+        if (!CopyFileW(source.c_str(), cache.c_str(), FALSE)) {
+            TyranoTraceLimited("asar-cache-copy-failed source='%s' cache='%s' err=%lu",
+                EngineCommon::WideToUtf8(source).c_str(),
+                EngineCommon::WideToUtf8(cache).c_str(), GetLastError());
+            return false;
+        }
+        if (!TyranoPrepareAsarRendererPatch()) {
+            DeleteFileW(cache.c_str());
+            return false;
+        }
+
+        std::lock_guard<std::mutex> patchLock(g_tyranoScriptPatchMutex);
+        HANDLE cacheFile = orgCreateFileW(cache.c_str(), GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (cacheFile == INVALID_HANDLE_VALUE) {
+            DeleteFileW(cache.c_str());
+            return false;
+        }
+        LARGE_INTEGER position = {};
+        position.QuadPart = static_cast<LONGLONG>(g_tyranoScriptPatchOffset);
+        bool ok = SetFilePointerEx(cacheFile, position, NULL, FILE_BEGIN);
+        DWORD written = 0;
+        if (ok && !g_tyranoScriptPatchBytes.empty()) {
+            ok = WriteFile(cacheFile, g_tyranoScriptPatchBytes.data(),
+                (DWORD)g_tyranoScriptPatchBytes.size(), &written, NULL) != FALSE &&
+                written == g_tyranoScriptPatchBytes.size();
+        }
+        FlushFileBuffers(cacheFile);
+        CloseHandle(cacheFile);
+        if (!ok) {
+            DeleteFileW(cache.c_str());
+            TyranoTraceLimited("asar-cache-patch-failed cache='%s' err=%lu",
+                EngineCommon::WideToUtf8(cache).c_str(), GetLastError());
+            return false;
+        }
+
+        HANDLE sourceFile = orgCreateFileW(source.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE patchedFile = orgCreateFileW(cache.c_str(), FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (sourceFile != INVALID_HANDLE_VALUE && patchedFile != INVALID_HANDLE_VALUE) {
+            FILETIME creation = {}, access = {}, write = {};
+            if (GetFileTime(sourceFile, &creation, &access, &write)) {
+                SetFileTime(patchedFile, &creation, &access, &write);
+            }
+        }
+        if (sourceFile != INVALID_HANDLE_VALUE) CloseHandle(sourceFile);
+        if (patchedFile != INVALID_HANDLE_VALUE) CloseHandle(patchedFile);
+        TyranoTraceLimited("asar-cache-ready source='%s' cache='%s' offset=%llu bytes=%lu",
+            EngineCommon::WideToUtf8(source).c_str(),
+            EngineCommon::WideToUtf8(cache).c_str(),
+            (unsigned long long)g_tyranoScriptPatchOffset,
+            (DWORD)g_tyranoScriptPatchBytes.size());
+    }
+
+    if (cachePathOut) *cachePathOut = cache;
+    return PathFileExistsW(cache.c_str()) != FALSE;
+}
+
+static HANDLE TyranoTryOpenPatchedAsarW(const wchar_t* fileName,
+    DWORD desiredAccess, DWORD creationDisposition) {
+    if (!EngineCommon::IsReadOnlyOpen(desiredAccess, creationDisposition) ||
+        !fileName || !fileName[0]) return INVALID_HANDLE_VALUE;
+    std::wstring requested = EngineCommon::FullPath(fileName);
+    std::wstring source = TyranoBuildRootPath(L"resources\\app.asar");
+    if (!EngineCommon::SamePath(requested, source)) return INVALID_HANDLE_VALUE;
+    std::wstring cache;
+    if (!TyranoEnsurePatchedAsar(&cache)) return INVALID_HANDLE_VALUE;
+    HANDLE file = orgCreateFileW(cache.c_str(), desiredAccess,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        TyranoTraceLimited("asar-cache-open request='%s' cache='%s'",
+            EngineCommon::WideToUtf8(requested).c_str(),
+            EngineCommon::WideToUtf8(cache).c_str());
+    }
+    return file;
 }
 
 static bool TyranoBytesContain(const std::vector<BYTE>& bytes, const char* needle) {

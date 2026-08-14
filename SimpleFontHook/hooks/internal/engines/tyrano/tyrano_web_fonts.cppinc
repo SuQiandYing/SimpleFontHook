@@ -13,8 +13,11 @@ static bool TyranoIsBundledFontPath(const wchar_t* fileName, std::wstring* fullP
 
     std::wstring fullPath = EngineCommon::FullPath(fileName);
     std::wstring normalized = EngineCommon::NormalizePath(fullPath);
+    // Tyrano's generated font.css references data/others/<face>.ttf directly,
+    // while some projects organize the same assets below data/others/font/.
+    // Extension checks at the call sites keep this broader root font-only.
     std::wstring fontRoot = EngineCommon::NormalizePath(
-        TyranoBuildRootPath(L"resources\\app\\data\\others\\font"));
+        TyranoBuildRootPath(L"resources\\app\\data\\others"));
     if (fontRoot.empty() || normalized.size() <= fontRoot.size() ||
         normalized.compare(0, fontRoot.size(), fontRoot) != 0 ||
         normalized[fontRoot.size()] != L'\\') {

@@ -71,6 +71,13 @@ static bool EngineTryOpenFileW(const wchar_t* fileName, DWORD desiredAccess,
         return true;
     }
 
+    handle = TyranoTryOpenPatchedAsarW(fileName, desiredAccess,
+        creationDisposition);
+    if (handle != INVALID_HANDLE_VALUE) {
+        *result = handle;
+        return true;
+    }
+
     handle = TyranoTryOpenAsarOverlayFileW(fileName, desiredAccess,
         creationDisposition);
     if (handle != INVALID_HANDLE_VALUE) {
