@@ -6,9 +6,9 @@
 #include <limits>
 #include <vector>
 #include <string>
-#include <map>
 #include <mutex>
 #include <cstring>
+#include <utility>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -742,9 +742,30 @@ namespace Utils {
         return path;
     }
 
-    // --- Parse a simple INI from UTF-8 string into key=value map ---
-    static std::map<std::string, std::string> ParseIni(const std::string& content) {
-        std::map<std::string, std::string> kv;
+    struct IniEntry {
+        std::string key;
+        std::string value;
+    };
+
+    using IniEntries = std::vector<IniEntry>;
+
+    static const std::string* FindIniValue(const IniEntries& entries, const char* key) {
+        for (const IniEntry& entry : entries) {
+            if (entry.key == key) return &entry.value;
+        }
+        return nullptr;
+    }
+
+    static int ReadIniInt(const IniEntries& entries, const char* key, int defaultValue) {
+        const std::string* value = FindIniValue(entries, key);
+        return value ? atoi(value->c_str()) : defaultValue;
+    }
+
+    // Configuration files are small and read once. A compact linear table avoids
+    // pulling the std::map tree implementation into every release binary.
+    static IniEntries ParseIni(const std::string& content) {
+        IniEntries entries;
+        entries.reserve(80);
         size_t pos = 0;
         while (pos < content.size()) {
             size_t eol = content.find('\n', pos);
@@ -758,109 +779,147 @@ namespace Utils {
             size_t eq = line.find('=');
             if (eq == std::string::npos) continue;
             std::string key = line.substr(0, eq);
-            std::string val = line.substr(eq + 1);
-            kv[key] = val;
+            std::string value = line.substr(eq + 1);
+            bool replaced = false;
+            for (IniEntry& entry : entries) {
+                if (entry.key != key) continue;
+                entry.value = std::move(value);
+                replaced = true;
+                break;
+            }
+            if (!replaced) entries.push_back({ std::move(key), std::move(value) });
         }
-        return kv;
+        return entries;
+    }
+
+    static __declspec(noinline) void AppendIniText(std::string& output,
+        const char* key, const char* value) {
+        output.append(key);
+        output.push_back('=');
+        output.append(value ? value : "");
+        output.append("\r\n");
+    }
+
+    static __declspec(noinline) void AppendIniText(std::string& output,
+        const char* key, const std::string& value) {
+        output.append(key);
+        output.push_back('=');
+        output.append(value);
+        output.append("\r\n");
+    }
+
+    static __declspec(noinline) void AppendIniBool(std::string& output,
+        const char* key, bool value) {
+        AppendIniText(output, key, value ? "1" : "0");
+    }
+
+    static __declspec(noinline) void AppendIniInt(std::string& output,
+        const char* key, int value) {
+        char buffer[32];
+        sprintf_s(buffer, "%d", value);
+        AppendIniText(output, key, buffer);
+    }
+
+    static __declspec(noinline) void AppendIniUnsigned(std::string& output,
+        const char* key, DWORD value) {
+        char buffer[32];
+        sprintf_s(buffer, "%lu", value);
+        AppendIniText(output, key, buffer);
     }
 
     void SaveConfig(HMODULE hModule) {
         std::wstring iniPath = GetIniPath(hModule);
 
-        // Build UTF-8 content
         std::string out;
-        out += "[FontHook]\r\n";
-        out += "FontNameW=" + WideToUtf8(Config::ForcedFontNameW) + "\r\n";
-        // Save FontNameA as wide->utf8 for lossless round-trip
+        out.reserve(4096);
+        out.append("[FontHook]\r\n");
+        AppendIniText(out, "FontNameW", WideToUtf8(Config::ForcedFontNameW));
+
         wchar_t fontNameAW[LF_FACESIZE];
         MultiByteToWideChar(CP_ACP, 0, Config::ForcedFontNameA, -1, fontNameAW, LF_FACESIZE);
-        out += "FontNameA=" + WideToUtf8(fontNameAW) + "\r\n";
+        AppendIniText(out, "FontNameA", WideToUtf8(fontNameAW));
 
-        auto boolStr = [](bool v) -> const char* { return v ? "1" : "0"; };
-        auto dwordStr = [](DWORD v) { char b[32]; sprintf_s(b, "%lu", v); return std::string(b); };
-        auto intStr = [](int v) { char b[32]; sprintf_s(b, "%d", v); return std::string(b); };
+        AppendIniBool(out, "EnableFontHook", Config::EnableFontHook);
+        AppendIniBool(out, "EnableFaceNameReplace", Config::EnableFaceNameReplace);
+        AppendIniBool(out, "EnableCharsetReplace", Config::EnableCharsetReplace);
+        AppendIniUnsigned(out, "ForcedCharset", Config::ForcedCharset);
 
-        out += "EnableFontHook=" + std::string(boolStr(Config::EnableFontHook)) + "\r\n";
-        out += "EnableFaceNameReplace=" + std::string(boolStr(Config::EnableFaceNameReplace)) + "\r\n";
-        out += "EnableCharsetReplace=" + std::string(boolStr(Config::EnableCharsetReplace)) + "\r\n";
-        out += "ForcedCharset=" + dwordStr(Config::ForcedCharset) + "\r\n";
+        AppendIniBool(out, "EnableCodepageSpoof", Config::EnableCodepageSpoof);
+        AppendIniBool(out, "EnableCodepageRuntimeReplace", Config::EnableCodepageRuntimeReplace);
+        AppendIniBool(out, "EnableCodepageRedirect", Config::EnableCodepageRedirect);
+        AppendIniUnsigned(out, "CodepageRedirectFrom", Config::CodepageRedirectFrom);
+        AppendIniUnsigned(out, "CodepageRedirectTo", Config::CodepageRedirectTo);
+        AppendIniBool(out, "EnableTextSubstitution", Config::EnableTextSubstitution);
+        AppendIniBool(out, "PickerShowOnStartup", Config::PickerShowOnStartup);
+        AppendIniInt(out, "TextSubstitutionMode", Config::TextSubstitutionMode);
+        AppendIniUnsigned(out, "TextSubstitutionCodepage", Config::TextSubstitutionCodepage);
+        AppendIniUnsigned(out, "SpoofFromCharset", Config::SpoofFromCharset);
+        AppendIniUnsigned(out, "SpoofToCharset", Config::SpoofToCharset);
+        AppendIniBool(out, "EnableDebugLog", Config::EnableDebugLog);
+        AppendIniInt(out, "DebugSlowMs", Config::DebugSlowMs);
+        AppendIniInt(out, "DebugTraceSampleLimit", Config::DebugTraceSampleLimit);
+        AppendIniInt(out, "DebugPickerThreadLogLimit", Config::DebugPickerThreadLogLimit);
 
-        out += "EnableCodepageSpoof=" + std::string(boolStr(Config::EnableCodepageSpoof)) + "\r\n";
-        out += "EnableCodepageRuntimeReplace=" + std::string(boolStr(Config::EnableCodepageRuntimeReplace)) + "\r\n";
-        out += "EnableCodepageRedirect=" + std::string(boolStr(Config::EnableCodepageRedirect)) + "\r\n";
-        out += "CodepageRedirectFrom=" + dwordStr((DWORD)Config::CodepageRedirectFrom) + "\r\n";
-        out += "CodepageRedirectTo=" + dwordStr((DWORD)Config::CodepageRedirectTo) + "\r\n";
-        out += "EnableTextSubstitution=" + std::string(boolStr(Config::EnableTextSubstitution)) + "\r\n";
-        out += "PickerShowOnStartup=" + std::string(boolStr(Config::PickerShowOnStartup)) + "\r\n";
-        out += "TextSubstitutionMode=" + intStr(Config::TextSubstitutionMode) + "\r\n";
-        out += "TextSubstitutionCodepage=" + dwordStr((DWORD)Config::TextSubstitutionCodepage) + "\r\n";
-        out += "SpoofFromCharset=" + dwordStr(Config::SpoofFromCharset) + "\r\n";
-        out += "SpoofToCharset=" + dwordStr(Config::SpoofToCharset) + "\r\n";
-        out += "EnableDebugLog=" + std::string(boolStr(Config::EnableDebugLog)) + "\r\n";
-        out += "DebugSlowMs=" + intStr(Config::DebugSlowMs) + "\r\n";
-        out += "DebugTraceSampleLimit=" + intStr(Config::DebugTraceSampleLimit) + "\r\n";
-        out += "DebugPickerThreadLogLimit=" + intStr(Config::DebugPickerThreadLogLimit) + "\r\n";
+        AppendIniBool(out, "CompatSkipDrawTextA", Config::CompatSkipDrawTextA);
+        AppendIniBool(out, "CompatSkipFontDataQueries", Config::CompatSkipFontDataQueries);
+        AppendIniBool(out, "CompatSelectObjectTrackedOnly", Config::CompatSelectObjectTrackedOnly);
+        AppendIniBool(out, "CompatHookCreateFontW", Config::CompatHookCreateFontW);
+        AppendIniBool(out, "CompatHookCreateFontIndirectW", Config::CompatHookCreateFontIndirectW);
+        AppendIniBool(out, "CompatHookGetTextFace", Config::CompatHookGetTextFace);
+        AppendIniBool(out, "EnableBgiHook", Config::EnableBgiHook);
+        AppendIniBool(out, "BgiPatchGdiImports", Config::BgiPatchGdiImports);
+        AppendIniBool(out, "BgiClearGlyphCacheOnSwitch", Config::BgiClearGlyphCacheOnSwitch);
+        AppendIniBool(out, "EnableArtemisHook", Config::EnableArtemisHook);
+        AppendIniBool(out, "ArtemisPatchTables", Config::ArtemisPatchTables);
+        AppendIniBool(out, "ArtemisRedirectFontFiles", Config::ArtemisRedirectFontFiles);
+        AppendIniBool(out, "ArtemisClearFontCacheOnSwitch", Config::ArtemisClearFontCacheOnSwitch);
+        AppendIniText(out, "ArtemisFontPath", WideToUtf8(Config::ArtemisFontPath));
+        AppendIniInt(out, "ArtemisFontSize", Config::ArtemisFontSize);
+        AppendIniInt(out, "ArtemisRubySize", Config::ArtemisRubySize);
+        AppendIniBool(out, "EnableKrkrHook", Config::EnableKrkrHook);
+        AppendIniBool(out, "KrkrDisablePrerenderedFonts", Config::KrkrDisablePrerenderedFonts);
+        AppendIniBool(out, "EnableEntisHook", Config::EnableEntisHook);
+        AppendIniBool(out, "EntisDisableBitmapFonts", Config::EntisDisableBitmapFonts);
+        AppendIniBool(out, "EntisRefreshFontOnSwitch", Config::EntisRefreshFontOnSwitch);
+        AppendIniBool(out, "EnableSoftpalHook", Config::EnableSoftpalHook);
+        AppendIniBool(out, "SoftpalDisableDefaultFontDat", Config::SoftpalDisableDefaultFontDat);
+        AppendIniBool(out, "SoftpalForceDefaultOptionToSystemFont", Config::SoftpalForceDefaultOptionToSystemFont);
+        AppendIniBool(out, "EnableEscudeHook", Config::EnableEscudeHook);
+        AppendIniBool(out, "EscudeVirtualFontConfig", Config::EscudeVirtualFontConfig);
+        AppendIniBool(out, "EnableMiraiHook", Config::EnableMiraiHook);
+        AppendIniBool(out, "MiraiReplaceFontDataQueries", Config::MiraiReplaceFontDataQueries);
+        AppendIniBool(out, "MiraiRedirectFontFiles", Config::MiraiRedirectFontFiles);
+        AppendIniBool(out, "MiraiPinFontDataSource", Config::MiraiPinFontDataSource);
+        AppendIniBool(out, "EnableMajiroHook", Config::EnableMajiroHook);
+        AppendIniBool(out, "MajiroDisableFontCache", Config::MajiroDisableFontCache);
+        AppendIniBool(out, "EnableDxLibHook", Config::EnableDxLibHook);
+        AppendIniBool(out, "DxLibDisableFontCache", Config::DxLibDisableFontCache);
+        AppendIniBool(out, "DxLibReplaceFontDataQueries", Config::DxLibReplaceFontDataQueries);
+        AppendIniBool(out, "DxLibClearRuntimeFontCacheOnSwitch", Config::DxLibClearRuntimeFontCacheOnSwitch);
+        AppendIniText(out, "DxLibCachedFontNameW", WideToUtf8(Config::DxLibCachedFontNameW));
+        AppendIniBool(out, "EnableTinkerBellHook", Config::EnableTinkerBellHook);
+        AppendIniUnsigned(out, "YurisAtlasCodepage", Config::YurisAtlasCodepage);
+        AppendIniBool(out, "EnableCatSystemUnityHook", Config::EnableCatSystemUnityHook);
+        AppendIniBool(out, "EnableTyranoHook", Config::EnableTyranoHook);
+        AppendIniBool(out, "TyranoRedirectWebFonts", Config::TyranoRedirectWebFonts);
+        AppendIniBool(out, "EnableRenPyHook", Config::EnableRenPyHook);
+        AppendIniBool(out, "RenPyRedirectFonts", Config::RenPyRedirectFonts);
+        AppendIniBool(out, "RenPyRefreshFontOnSwitch", Config::RenPyRefreshFontOnSwitch);
 
-        out += "CompatSkipDrawTextA=" + std::string(boolStr(Config::CompatSkipDrawTextA)) + "\r\n";
-        out += "CompatSkipFontDataQueries=" + std::string(boolStr(Config::CompatSkipFontDataQueries)) + "\r\n";
-        out += "CompatSelectObjectTrackedOnly=" + std::string(boolStr(Config::CompatSelectObjectTrackedOnly)) + "\r\n";
-        out += "CompatHookCreateFontW=" + std::string(boolStr(Config::CompatHookCreateFontW)) + "\r\n";
-        out += "CompatHookCreateFontIndirectW=" + std::string(boolStr(Config::CompatHookCreateFontIndirectW)) + "\r\n";
-        out += "CompatHookGetTextFace=" + std::string(boolStr(Config::CompatHookGetTextFace)) + "\r\n";
-        out += "EnableBgiHook=" + std::string(boolStr(Config::EnableBgiHook)) + "\r\n";
-        out += "BgiPatchGdiImports=" + std::string(boolStr(Config::BgiPatchGdiImports)) + "\r\n";
-        out += "BgiClearGlyphCacheOnSwitch=" + std::string(boolStr(Config::BgiClearGlyphCacheOnSwitch)) + "\r\n";
-        out += "EnableArtemisHook=" + std::string(boolStr(Config::EnableArtemisHook)) + "\r\n";
-        out += "ArtemisPatchTables=" + std::string(boolStr(Config::ArtemisPatchTables)) + "\r\n";
-        out += "ArtemisRedirectFontFiles=" + std::string(boolStr(Config::ArtemisRedirectFontFiles)) + "\r\n";
-        out += "ArtemisClearFontCacheOnSwitch=" + std::string(boolStr(Config::ArtemisClearFontCacheOnSwitch)) + "\r\n";
-        out += "ArtemisFontPath=" + WideToUtf8(Config::ArtemisFontPath) + "\r\n";
-        out += "ArtemisFontSize=" + intStr(Config::ArtemisFontSize) + "\r\n";
-        out += "ArtemisRubySize=" + intStr(Config::ArtemisRubySize) + "\r\n";
-        out += "EnableKrkrHook=" + std::string(boolStr(Config::EnableKrkrHook)) + "\r\n";
-        out += "KrkrDisablePrerenderedFonts=" + std::string(boolStr(Config::KrkrDisablePrerenderedFonts)) + "\r\n";
-        out += "EnableEntisHook=" + std::string(boolStr(Config::EnableEntisHook)) + "\r\n";
-        out += "EntisDisableBitmapFonts=" + std::string(boolStr(Config::EntisDisableBitmapFonts)) + "\r\n";
-        out += "EntisRefreshFontOnSwitch=" + std::string(boolStr(Config::EntisRefreshFontOnSwitch)) + "\r\n";
-        out += "EnableSoftpalHook=" + std::string(boolStr(Config::EnableSoftpalHook)) + "\r\n";
-        out += "SoftpalDisableDefaultFontDat=" + std::string(boolStr(Config::SoftpalDisableDefaultFontDat)) + "\r\n";
-        out += "SoftpalForceDefaultOptionToSystemFont=" + std::string(boolStr(Config::SoftpalForceDefaultOptionToSystemFont)) + "\r\n";
-        out += "EnableEscudeHook=" + std::string(boolStr(Config::EnableEscudeHook)) + "\r\n";
-        out += "EscudeVirtualFontConfig=" + std::string(boolStr(Config::EscudeVirtualFontConfig)) + "\r\n";
-        out += "EnableMiraiHook=" + std::string(boolStr(Config::EnableMiraiHook)) + "\r\n";
-        out += "MiraiReplaceFontDataQueries=" + std::string(boolStr(Config::MiraiReplaceFontDataQueries)) + "\r\n";
-        out += "MiraiRedirectFontFiles=" + std::string(boolStr(Config::MiraiRedirectFontFiles)) + "\r\n";
-        out += "MiraiPinFontDataSource=" + std::string(boolStr(Config::MiraiPinFontDataSource)) + "\r\n";
-        out += "EnableMajiroHook=" + std::string(boolStr(Config::EnableMajiroHook)) + "\r\n";
-        out += "MajiroDisableFontCache=" + std::string(boolStr(Config::MajiroDisableFontCache)) + "\r\n";
-        out += "EnableDxLibHook=" + std::string(boolStr(Config::EnableDxLibHook)) + "\r\n";
-        out += "DxLibDisableFontCache=" + std::string(boolStr(Config::DxLibDisableFontCache)) + "\r\n";
-        out += "DxLibReplaceFontDataQueries=" + std::string(boolStr(Config::DxLibReplaceFontDataQueries)) + "\r\n";
-        out += "DxLibClearRuntimeFontCacheOnSwitch=" + std::string(boolStr(Config::DxLibClearRuntimeFontCacheOnSwitch)) + "\r\n";
-        out += "DxLibCachedFontNameW=" + WideToUtf8(Config::DxLibCachedFontNameW) + "\r\n";
-        out += "EnableTinkerBellHook=" + std::string(boolStr(Config::EnableTinkerBellHook)) + "\r\n";
-        out += "YurisAtlasCodepage=" + dwordStr(Config::YurisAtlasCodepage) + "\r\n";
-        out += "EnableCatSystemUnityHook=" + std::string(boolStr(Config::EnableCatSystemUnityHook)) + "\r\n";
-        out += "EnableTyranoHook=" + std::string(boolStr(Config::EnableTyranoHook)) + "\r\n";
-        out += "TyranoRedirectWebFonts=" + std::string(boolStr(Config::TyranoRedirectWebFonts)) + "\r\n";
-        out += "EnableRenPyHook=" + std::string(boolStr(Config::EnableRenPyHook)) + "\r\n";
-        out += "RenPyRedirectFonts=" + std::string(boolStr(Config::RenPyRedirectFonts)) + "\r\n";
-        out += "RenPyRefreshFontOnSwitch=" + std::string(boolStr(Config::RenPyRefreshFontOnSwitch)) + "\r\n";
+        AppendIniBool(out, "EnableFontHeightScale", Config::EnableFontHeightScale);
+        AppendIniBool(out, "EnableFontWidthScale", Config::EnableFontWidthScale);
+        AppendIniBool(out, "EnableFontCharSpacing", Config::EnableFontCharSpacing);
+        AppendIniBool(out, "EnableFontVerticalMetrics", Config::EnableFontVerticalMetrics);
+        AppendIniBool(out, "EnableFontLineSpacing", Config::EnableFontLineSpacing);
+        AppendIniBool(out, "EnableFontWeight", Config::EnableFontWeight);
 
-        out += "EnableFontHeightScale=" + std::string(boolStr(Config::EnableFontHeightScale)) + "\r\n";
-        out += "EnableFontWidthScale=" + std::string(boolStr(Config::EnableFontWidthScale)) + "\r\n";
-        out += "EnableFontCharSpacing=" + std::string(boolStr(Config::EnableFontCharSpacing)) + "\r\n";
-        out += "EnableFontVerticalMetrics=" + std::string(boolStr(Config::EnableFontVerticalMetrics)) + "\r\n";
-        out += "EnableFontLineSpacing=" + std::string(boolStr(Config::EnableFontLineSpacing)) + "\r\n";
-        out += "EnableFontWeight=" + std::string(boolStr(Config::EnableFontWeight)) + "\r\n";
-
-        out += "FontHeightScale1000=" + dwordStr((DWORD)(Config::FontHeightScale * 1000.0f)) + "\r\n";
-        out += "FontWidthScale1000=" + dwordStr((DWORD)(Config::FontWidthScale * 1000.0f)) + "\r\n";
-        out += "FontCharSpacing=" + intStr(Config::FontCharSpacing) + "\r\n";
-        out += "FontAscentPermille=" + intStr(Config::FontAscentPermille) + "\r\n";
-        out += "FontDescentPermille=" + intStr(Config::FontDescentPermille) + "\r\n";
-        out += "FontLineSpacing=" + intStr(Config::FontLineSpacing) + "\r\n";
-        out += "FontWeight=" + intStr(Config::FontWeight) + "\r\n";
+        AppendIniUnsigned(out, "FontHeightScale1000", (DWORD)(Config::FontHeightScale * 1000.0f));
+        AppendIniUnsigned(out, "FontWidthScale1000", (DWORD)(Config::FontWidthScale * 1000.0f));
+        AppendIniInt(out, "FontCharSpacing", Config::FontCharSpacing);
+        AppendIniInt(out, "FontAscentPermille", Config::FontAscentPermille);
+        AppendIniInt(out, "FontDescentPermille", Config::FontDescentPermille);
+        AppendIniInt(out, "FontLineSpacing", Config::FontLineSpacing);
+        AppendIniInt(out, "FontWeight", Config::FontWeight);
 
         // Write with UTF-8 BOM
         HANDLE hFile = CreateFileW(iniPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -901,11 +960,12 @@ namespace Utils {
             content = content.substr(3);
         }
 
-        auto kv = ParseIni(content);
-        if (kv.find("FontNameW") == kv.end()) return false;
+        IniEntries kv = ParseIni(content);
+        const std::string* fontNameWValue = FindIniValue(kv, "FontNameW");
+        if (!fontNameWValue) return false;
 
         // Restore font names
-        std::wstring fontW = Utf8ToWide(kv["FontNameW"]);
+        std::wstring fontW = Utf8ToWide(*fontNameWValue);
         if (LooksLikeInternalMetricCloneName(fontW)) {
             Trace("[Config] Ignored saved internal metric clone font name.");
             fontW.clear();
@@ -913,8 +973,8 @@ namespace Utils {
         wcsncpy_s(Config::ForcedFontNameW, fontW.c_str(), LF_FACESIZE - 1);
         wcsncpy_s(Config::SourceFontNameW, fontW.c_str(), LF_FACESIZE - 1);
 
-        if (kv.find("FontNameA") != kv.end()) {
-            std::wstring fontAW = Utf8ToWide(kv["FontNameA"]);
+        if (const std::string* fontNameAValue = FindIniValue(kv, "FontNameA")) {
+            std::wstring fontAW = Utf8ToWide(*fontNameAValue);
             if (LooksLikeInternalMetricCloneName(fontAW)) fontAW.clear();
             WideCharToMultiByte(CP_ACP, 0, fontAW.c_str(), -1, Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
         } else {
@@ -922,115 +982,109 @@ namespace Utils {
         }
         Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
 
-        auto getInt = [&](const char* key, int def) -> int {
-            auto it = kv.find(key);
-            if (it != kv.end()) return atoi(it->second.c_str());
-            return def;
-        };
-
-        Config::EnableFontHook = getInt("EnableFontHook", 0) != 0;
-        Config::EnableFaceNameReplace = getInt("EnableFaceNameReplace", 0) != 0;
+        Config::EnableFontHook = ReadIniInt(kv, "EnableFontHook", 0) != 0;
+        Config::EnableFaceNameReplace = ReadIniInt(kv, "EnableFaceNameReplace", 0) != 0;
         if (Config::ForcedFontNameW[0] == L'\0') {
             Config::EnableFontHook = false;
             Config::EnableFaceNameReplace = false;
         }
-        Config::EnableCharsetReplace = getInt("EnableCharsetReplace", 0) != 0;
-        Config::ForcedCharset = (DWORD)getInt("ForcedCharset", DEFAULT_CHARSET);
+        Config::EnableCharsetReplace = ReadIniInt(kv, "EnableCharsetReplace", 0) != 0;
+        Config::ForcedCharset = (DWORD)ReadIniInt(kv, "ForcedCharset", DEFAULT_CHARSET);
 
-        Config::EnableCodepageSpoof = getInt("EnableCodepageSpoof", 0) != 0;
-        Config::EnableCodepageRuntimeReplace = getInt("EnableCodepageRuntimeReplace",
+        Config::EnableCodepageSpoof = ReadIniInt(kv, "EnableCodepageSpoof", 0) != 0;
+        Config::EnableCodepageRuntimeReplace = ReadIniInt(kv, "EnableCodepageRuntimeReplace",
             0) != 0;
         int legacyCodepageRedirectEnable =
-            (kv.find("FromCodePage") != kv.end() || kv.find("ToCodePage") != kv.end())
-                ? getInt("Enable", 0)
+            (FindIniValue(kv, "FromCodePage") || FindIniValue(kv, "ToCodePage"))
+                ? ReadIniInt(kv, "Enable", 0)
                 : 0;
-        Config::EnableCodepageRedirect = getInt("EnableCodepageRedirect",
-            getInt("CodePageConvertEnable", legacyCodepageRedirectEnable)) != 0;
-        Config::CodepageRedirectFrom = (UINT)getInt("CodepageRedirectFrom",
-            getInt("FromCodePage", 932));
-        Config::CodepageRedirectTo = (UINT)getInt("CodepageRedirectTo",
-            getInt("ToCodePage", CP_UTF8));
-        Config::EnableTextSubstitution = getInt("EnableTextSubstitution", 0) != 0;
-        Config::PickerShowOnStartup = getInt("PickerShowOnStartup", 1) != 0;
-        Config::TextSubstitutionMode = getInt("TextSubstitutionMode", Config::TextSubstitutionModeJapaneseTraditional);
+        Config::EnableCodepageRedirect = ReadIniInt(kv, "EnableCodepageRedirect",
+            ReadIniInt(kv, "CodePageConvertEnable", legacyCodepageRedirectEnable)) != 0;
+        Config::CodepageRedirectFrom = (UINT)ReadIniInt(kv, "CodepageRedirectFrom",
+            ReadIniInt(kv, "FromCodePage", 932));
+        Config::CodepageRedirectTo = (UINT)ReadIniInt(kv, "CodepageRedirectTo",
+            ReadIniInt(kv, "ToCodePage", CP_UTF8));
+        Config::EnableTextSubstitution = ReadIniInt(kv, "EnableTextSubstitution", 0) != 0;
+        Config::PickerShowOnStartup = ReadIniInt(kv, "PickerShowOnStartup", 1) != 0;
+        Config::TextSubstitutionMode = ReadIniInt(kv, "TextSubstitutionMode", Config::TextSubstitutionModeJapaneseTraditional);
         if (Config::TextSubstitutionMode < Config::TextSubstitutionModeJapaneseTraditional ||
             Config::TextSubstitutionMode > Config::TextSubstitutionModeSimplifiedToTraditional) {
             Config::TextSubstitutionMode = Config::TextSubstitutionModeJapaneseTraditional;
         }
         {
-            int textSubstitutionCodepage = getInt("TextSubstitutionCodepage", 932);
+            int textSubstitutionCodepage = ReadIniInt(kv, "TextSubstitutionCodepage", 932);
             Config::TextSubstitutionCodepage = textSubstitutionCodepage < 0 ? 932 : (UINT)textSubstitutionCodepage;
         }
         if (Config::TextSubstitutionCodepage == 0) Config::TextSubstitutionCodepage = CP_ACP;
-        Config::SpoofFromCharset = (DWORD)getInt("SpoofFromCharset", GB2312_CHARSET);
-        Config::SpoofToCharset = (DWORD)getInt("SpoofToCharset", SHIFTJIS_CHARSET);
+        Config::SpoofFromCharset = (DWORD)ReadIniInt(kv, "SpoofFromCharset", GB2312_CHARSET);
+        Config::SpoofToCharset = (DWORD)ReadIniInt(kv, "SpoofToCharset", SHIFTJIS_CHARSET);
         // Runtime replacement follows the active spoof mapping. The saved key is
         // still parsed above so existing configuration files remain readable.
         Config::EnableCodepageRuntimeReplace =
             Config::EnableCodepageSpoof &&
             Config::SpoofFromCharset != Config::SpoofToCharset;
-        Config::EnableDebugLog = getInt("EnableDebugLog", 0) != 0;
-        Config::DebugSlowMs = getInt("DebugSlowMs", 50);
+        Config::EnableDebugLog = ReadIniInt(kv, "EnableDebugLog", 0) != 0;
+        Config::DebugSlowMs = ReadIniInt(kv, "DebugSlowMs", 50);
         if (Config::DebugSlowMs < 0) Config::DebugSlowMs = 0;
-        Config::DebugTraceSampleLimit = getInt("DebugTraceSampleLimit", 0);
+        Config::DebugTraceSampleLimit = ReadIniInt(kv, "DebugTraceSampleLimit", 0);
         if (Config::DebugTraceSampleLimit < 0) Config::DebugTraceSampleLimit = 0;
-        Config::DebugPickerThreadLogLimit = getInt("DebugPickerThreadLogLimit", 0);
+        Config::DebugPickerThreadLogLimit = ReadIniInt(kv, "DebugPickerThreadLogLimit", 0);
         if (Config::DebugPickerThreadLogLimit < 0) Config::DebugPickerThreadLogLimit = 0;
 
-        Config::CompatSkipDrawTextA = getInt("CompatSkipDrawTextA", 1) != 0;
-        Config::CompatSkipFontDataQueries = getInt("CompatSkipFontDataQueries", 1) != 0;
-        Config::CompatSelectObjectTrackedOnly = getInt("CompatSelectObjectTrackedOnly", 0) != 0;
-        Config::CompatHookCreateFontW = getInt("CompatHookCreateFontW", 1) != 0;
-        Config::CompatHookCreateFontIndirectW = getInt("CompatHookCreateFontIndirectW", 1) != 0;
-        Config::CompatHookGetTextFace = getInt("CompatHookGetTextFace", 0) != 0;
-        Config::EnableBgiHook = getInt("EnableBgiHook", 1) != 0;
-        Config::BgiPatchGdiImports = getInt("BgiPatchGdiImports", 1) != 0;
-        Config::BgiClearGlyphCacheOnSwitch = getInt("BgiClearGlyphCacheOnSwitch", 1) != 0;
-        Config::EnableArtemisHook = getInt("EnableArtemisHook", 1) != 0;
-        Config::ArtemisPatchTables = getInt("ArtemisPatchTables", 1) != 0;
-        Config::ArtemisRedirectFontFiles = getInt("ArtemisRedirectFontFiles", 1) != 0;
-        Config::ArtemisClearFontCacheOnSwitch = getInt("ArtemisClearFontCacheOnSwitch", 1) != 0;
-        Config::EnableKrkrHook = getInt("EnableKrkrHook", 1) != 0;
-        Config::KrkrDisablePrerenderedFonts = getInt("KrkrDisablePrerenderedFonts", 1) != 0;
-        Config::EnableEntisHook = getInt("EnableEntisHook", 1) != 0;
-        Config::EntisDisableBitmapFonts = getInt("EntisDisableBitmapFonts", 1) != 0;
-        Config::EntisRefreshFontOnSwitch = getInt("EntisRefreshFontOnSwitch", 1) != 0;
-        Config::EnableSoftpalHook = getInt("EnableSoftpalHook", 1) != 0;
-        Config::SoftpalDisableDefaultFontDat = getInt("SoftpalDisableDefaultFontDat", 1) != 0;
-        Config::SoftpalForceDefaultOptionToSystemFont = getInt("SoftpalForceDefaultOptionToSystemFont", 1) != 0;
-        Config::EnableEscudeHook = getInt("EnableEscudeHook", 1) != 0;
-        Config::EscudeVirtualFontConfig = getInt("EscudeVirtualFontConfig", 1) != 0;
-        Config::EnableMiraiHook = getInt("EnableMiraiHook", 1) != 0;
-        Config::MiraiReplaceFontDataQueries = getInt("MiraiReplaceFontDataQueries", 1) != 0;
-        Config::MiraiRedirectFontFiles = getInt("MiraiRedirectFontFiles", 1) != 0;
-        Config::MiraiPinFontDataSource = getInt("MiraiPinFontDataSource", 1) != 0;
-        Config::EnableMajiroHook = getInt("EnableMajiroHook", 1) != 0;
-        Config::MajiroDisableFontCache = getInt("MajiroDisableFontCache", 1) != 0;
-        Config::EnableDxLibHook = getInt("EnableDxLibHook", 1) != 0;
-        Config::DxLibDisableFontCache = getInt("DxLibDisableFontCache", 0) != 0;
-        Config::DxLibReplaceFontDataQueries = getInt("DxLibReplaceFontDataQueries", 1) != 0;
-        Config::DxLibClearRuntimeFontCacheOnSwitch = getInt("DxLibClearRuntimeFontCacheOnSwitch", 0) != 0;
-        Config::EnableTinkerBellHook = getInt("EnableTinkerBellHook", 1) != 0;
+        Config::CompatSkipDrawTextA = ReadIniInt(kv, "CompatSkipDrawTextA", 1) != 0;
+        Config::CompatSkipFontDataQueries = ReadIniInt(kv, "CompatSkipFontDataQueries", 1) != 0;
+        Config::CompatSelectObjectTrackedOnly = ReadIniInt(kv, "CompatSelectObjectTrackedOnly", 0) != 0;
+        Config::CompatHookCreateFontW = ReadIniInt(kv, "CompatHookCreateFontW", 1) != 0;
+        Config::CompatHookCreateFontIndirectW = ReadIniInt(kv, "CompatHookCreateFontIndirectW", 1) != 0;
+        Config::CompatHookGetTextFace = ReadIniInt(kv, "CompatHookGetTextFace", 0) != 0;
+        Config::EnableBgiHook = ReadIniInt(kv, "EnableBgiHook", 1) != 0;
+        Config::BgiPatchGdiImports = ReadIniInt(kv, "BgiPatchGdiImports", 1) != 0;
+        Config::BgiClearGlyphCacheOnSwitch = ReadIniInt(kv, "BgiClearGlyphCacheOnSwitch", 1) != 0;
+        Config::EnableArtemisHook = ReadIniInt(kv, "EnableArtemisHook", 1) != 0;
+        Config::ArtemisPatchTables = ReadIniInt(kv, "ArtemisPatchTables", 1) != 0;
+        Config::ArtemisRedirectFontFiles = ReadIniInt(kv, "ArtemisRedirectFontFiles", 1) != 0;
+        Config::ArtemisClearFontCacheOnSwitch = ReadIniInt(kv, "ArtemisClearFontCacheOnSwitch", 1) != 0;
+        Config::EnableKrkrHook = ReadIniInt(kv, "EnableKrkrHook", 1) != 0;
+        Config::KrkrDisablePrerenderedFonts = ReadIniInt(kv, "KrkrDisablePrerenderedFonts", 1) != 0;
+        Config::EnableEntisHook = ReadIniInt(kv, "EnableEntisHook", 1) != 0;
+        Config::EntisDisableBitmapFonts = ReadIniInt(kv, "EntisDisableBitmapFonts", 1) != 0;
+        Config::EntisRefreshFontOnSwitch = ReadIniInt(kv, "EntisRefreshFontOnSwitch", 1) != 0;
+        Config::EnableSoftpalHook = ReadIniInt(kv, "EnableSoftpalHook", 1) != 0;
+        Config::SoftpalDisableDefaultFontDat = ReadIniInt(kv, "SoftpalDisableDefaultFontDat", 1) != 0;
+        Config::SoftpalForceDefaultOptionToSystemFont = ReadIniInt(kv, "SoftpalForceDefaultOptionToSystemFont", 1) != 0;
+        Config::EnableEscudeHook = ReadIniInt(kv, "EnableEscudeHook", 1) != 0;
+        Config::EscudeVirtualFontConfig = ReadIniInt(kv, "EscudeVirtualFontConfig", 1) != 0;
+        Config::EnableMiraiHook = ReadIniInt(kv, "EnableMiraiHook", 1) != 0;
+        Config::MiraiReplaceFontDataQueries = ReadIniInt(kv, "MiraiReplaceFontDataQueries", 1) != 0;
+        Config::MiraiRedirectFontFiles = ReadIniInt(kv, "MiraiRedirectFontFiles", 1) != 0;
+        Config::MiraiPinFontDataSource = ReadIniInt(kv, "MiraiPinFontDataSource", 1) != 0;
+        Config::EnableMajiroHook = ReadIniInt(kv, "EnableMajiroHook", 1) != 0;
+        Config::MajiroDisableFontCache = ReadIniInt(kv, "MajiroDisableFontCache", 1) != 0;
+        Config::EnableDxLibHook = ReadIniInt(kv, "EnableDxLibHook", 1) != 0;
+        Config::DxLibDisableFontCache = ReadIniInt(kv, "DxLibDisableFontCache", 0) != 0;
+        Config::DxLibReplaceFontDataQueries = ReadIniInt(kv, "DxLibReplaceFontDataQueries", 1) != 0;
+        Config::DxLibClearRuntimeFontCacheOnSwitch = ReadIniInt(kv, "DxLibClearRuntimeFontCacheOnSwitch", 0) != 0;
+        Config::EnableTinkerBellHook = ReadIniInt(kv, "EnableTinkerBellHook", 1) != 0;
         {
-            int yurisAtlasCodepage = getInt("YurisAtlasCodepage", 0);
+            int yurisAtlasCodepage = ReadIniInt(kv, "YurisAtlasCodepage", 0);
             Config::YurisAtlasCodepage = yurisAtlasCodepage > 0 &&
                 IsValidCodePage(static_cast<UINT>(yurisAtlasCodepage))
                 ? static_cast<UINT>(yurisAtlasCodepage) : 0;
         }
-        Config::EnableCatSystemUnityHook = getInt("EnableCatSystemUnityHook", 1) != 0;
-        Config::EnableTyranoHook = getInt("EnableTyranoHook", 1) != 0;
-        Config::TyranoRedirectWebFonts = getInt("TyranoRedirectWebFonts", 1) != 0;
-        Config::EnableRenPyHook = getInt("EnableRenPyHook", 1) != 0;
-        Config::RenPyRedirectFonts = getInt("RenPyRedirectFonts", 1) != 0;
-        Config::RenPyRefreshFontOnSwitch = getInt("RenPyRefreshFontOnSwitch", 1) != 0;
-        if (kv.find("DxLibCachedFontNameW") != kv.end()) {
-            std::wstring cachedDxLibFont = Utf8ToWide(kv["DxLibCachedFontNameW"]);
+        Config::EnableCatSystemUnityHook = ReadIniInt(kv, "EnableCatSystemUnityHook", 1) != 0;
+        Config::EnableTyranoHook = ReadIniInt(kv, "EnableTyranoHook", 1) != 0;
+        Config::TyranoRedirectWebFonts = ReadIniInt(kv, "TyranoRedirectWebFonts", 1) != 0;
+        Config::EnableRenPyHook = ReadIniInt(kv, "EnableRenPyHook", 1) != 0;
+        Config::RenPyRedirectFonts = ReadIniInt(kv, "RenPyRedirectFonts", 1) != 0;
+        Config::RenPyRefreshFontOnSwitch = ReadIniInt(kv, "RenPyRefreshFontOnSwitch", 1) != 0;
+        if (const std::string* cachedDxLibValue = FindIniValue(kv, "DxLibCachedFontNameW")) {
+            std::wstring cachedDxLibFont = Utf8ToWide(*cachedDxLibValue);
             wcsncpy_s(Config::DxLibCachedFontNameW, cachedDxLibFont.c_str(), LF_FACESIZE - 1);
         } else {
             Config::DxLibCachedFontNameW[0] = L'\0';
         }
-        if (kv.find("ArtemisFontPath") != kv.end()) {
-            std::wstring artemisFontPath = Utf8ToWide(kv["ArtemisFontPath"]);
+        if (const std::string* artemisFontValue = FindIniValue(kv, "ArtemisFontPath")) {
+            std::wstring artemisFontPath = Utf8ToWide(*artemisFontValue);
             std::wstring normalized = artemisFontPath;
             for (wchar_t& ch : normalized) {
                 if (ch == L'/') ch = L'\\';
@@ -1043,25 +1097,25 @@ namespace Utils {
                 wcsncpy_s(Config::ArtemisFontPath, artemisFontPath.c_str(), MAX_PATH - 1);
             }
         }
-        Config::ArtemisFontSize = getInt("ArtemisFontSize", 0);
+        Config::ArtemisFontSize = ReadIniInt(kv, "ArtemisFontSize", 0);
         if (Config::ArtemisFontSize < 0) Config::ArtemisFontSize = 0;
-        Config::ArtemisRubySize = getInt("ArtemisRubySize", -1);
+        Config::ArtemisRubySize = ReadIniInt(kv, "ArtemisRubySize", -1);
         if (Config::ArtemisRubySize < -1) Config::ArtemisRubySize = -1;
 
-        Config::EnableFontHeightScale = getInt("EnableFontHeightScale", 0) != 0;
-        Config::EnableFontWidthScale = getInt("EnableFontWidthScale", 0) != 0;
-        Config::EnableFontCharSpacing = getInt("EnableFontCharSpacing", 0) != 0;
-        Config::EnableFontVerticalMetrics = getInt("EnableFontVerticalMetrics", 0) != 0;
-        Config::EnableFontLineSpacing = getInt("EnableFontLineSpacing", 0) != 0;
-        Config::EnableFontWeight = getInt("EnableFontWeight", 0) != 0;
+        Config::EnableFontHeightScale = ReadIniInt(kv, "EnableFontHeightScale", 0) != 0;
+        Config::EnableFontWidthScale = ReadIniInt(kv, "EnableFontWidthScale", 0) != 0;
+        Config::EnableFontCharSpacing = ReadIniInt(kv, "EnableFontCharSpacing", 0) != 0;
+        Config::EnableFontVerticalMetrics = ReadIniInt(kv, "EnableFontVerticalMetrics", 0) != 0;
+        Config::EnableFontLineSpacing = ReadIniInt(kv, "EnableFontLineSpacing", 0) != 0;
+        Config::EnableFontWeight = ReadIniInt(kv, "EnableFontWeight", 0) != 0;
 
-        Config::FontHeightScale = getInt("FontHeightScale1000", 1000) / 1000.0f;
-        Config::FontWidthScale = getInt("FontWidthScale1000", 1000) / 1000.0f;
-        Config::FontCharSpacing = getInt("FontCharSpacing", 0);
-        Config::FontAscentPermille = getInt("FontAscentPermille", 880);
-        Config::FontDescentPermille = getInt("FontDescentPermille", -120);
-        Config::FontLineSpacing = getInt("FontLineSpacing", 0);
-        Config::FontWeight = getInt("FontWeight", 400);
+        Config::FontHeightScale = ReadIniInt(kv, "FontHeightScale1000", 1000) / 1000.0f;
+        Config::FontWidthScale = ReadIniInt(kv, "FontWidthScale1000", 1000) / 1000.0f;
+        Config::FontCharSpacing = ReadIniInt(kv, "FontCharSpacing", 0);
+        Config::FontAscentPermille = ReadIniInt(kv, "FontAscentPermille", 880);
+        Config::FontDescentPermille = ReadIniInt(kv, "FontDescentPermille", -120);
+        Config::FontLineSpacing = ReadIniInt(kv, "FontLineSpacing", 0);
+        Config::FontWeight = ReadIniInt(kv, "FontWeight", 400);
 
         LogW(L"[Config] Loaded config from %s (Font: %s, Hook: %d)", iniPath.c_str(), Config::ForcedFontNameW, Config::EnableFontHook);
         return true;
@@ -1127,5 +1181,3 @@ namespace Utils {
         return result;
     }
 }
-#include <fstream>
-#include <limits>
