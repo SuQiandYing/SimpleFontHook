@@ -1,0 +1,80 @@
+static void PaintFontList(HDC mem, const RECT& rc)
+{
+    // Font list.
+    int yStart = GetListTop();
+    int itemCount = (int)g_filteredIndices.size();
+    int maxVisible = min(VISIBLE_ITEMS, itemCount - g_scrollOffset);
+    if (maxVisible < 0) maxVisible = 0;
+
+    HFONT uiBadge = GetCachedPickerFont(L"Segoe UI", SF(10), 0, FW_BOLD, DEFAULT_CHARSET);
+
+    BYTE gameCs = GetGameCharset();
+
+    for (int i = 0; i < maxVisible; i++) {
+        int idx = g_scrollOffset + i;
+        int itemTop = yStart + i * ITEM_HEIGHT;
+        RECT itemRc = { 8, itemTop + 2, rc.right - SCROLLBAR_WIDTH - SCROLLBAR_MARGIN * 2 - 4, itemTop + ITEM_HEIGHT - 2 };
+
+        bool selected = (idx == g_selectedIndex);
+        bool hovered = (idx == g_hoveredIndex);
+        bool isRecent = IsRecentFont(idx);
+        bool isApplied = IsAppliedFont(idx);
+        const std::wstring& fontName = g_allFonts[g_filteredIndices[idx]].name;
+
+        // Item background
+        if (selected) {
+            // Selected: filled rounded rect + left accent bar + glow effect
+            RECT glowRc = { itemRc.left - 2, itemRc.top - 2, itemRc.right + 2, itemRc.bottom + 2 };
+            DrawRoundRectOutline(mem, glowRc, 12, COL_SELECTED_GLO);
+            FillRoundRect(mem, itemRc, 10, COL_SELECTED_BG);
+            RECT bar = { itemRc.left + 1, itemRc.top + 8, itemRc.left + 4, itemRc.bottom - 8 };
+            FillRoundRect(mem, bar, 2, COL_ACCENT);
+        } else if (hovered) {
+            FillRoundRect(mem, itemRc, 10, COL_HOVER_BG);
+            DrawRoundRectOutline(mem, itemRc, 10, MixColor(COL_HOVER_BG, COL_ACCENT, 0.3f));
+        }
+
+        int textLeft = itemRc.left + 14;
+        int badgeRight = itemRc.right - 8;
+
+        // Badges (from right to left)
+        if (isApplied) {
+            SelectObject(mem, uiBadge);
+            SIZE sz; GetTextExtentPoint32W(mem, L"✓ 已应用", 5, &sz);  // 已应用
+            int bw = sz.cx + 12;
+            RECT bdgRc = { badgeRight - bw, itemRc.top + (ITEM_HEIGHT - 20) / 2, badgeRight, itemRc.top + (ITEM_HEIGHT + 16) / 2 };
+            FillRoundRect(mem, bdgRc, 9, COL_APPLIED_BG);
+            SetTextColor(mem, COL_APPLIED_TEXT);
+            DrawTextW(mem, L"✓ 已应用", -1, &bdgRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);  // 已应用
+            badgeRight -= bw + 6;
+        }
+        if (isRecent && !isApplied) {
+            SelectObject(mem, uiBadge);
+            SIZE sz; GetTextExtentPoint32W(mem, L"☆ 最近", 4, &sz);  // 最近
+            int bw = sz.cx + 12;
+            RECT bdgRc = { badgeRight - bw, itemRc.top + (ITEM_HEIGHT - 20) / 2, badgeRight, itemRc.top + (ITEM_HEIGHT + 16) / 2 };
+            FillRoundRect(mem, bdgRc, 9, COL_BADGE_BG);
+            SetTextColor(mem, COL_BADGE_TEXT);
+            DrawTextW(mem, L"☆ 最近", -1, &bdgRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);  // 最近
+            badgeRight -= bw + 6;
+        }
+
+        // Font name in its own typeface (primary line)
+        HFONT itemFont = GetCachedPickerFont(fontName, SF(17), 0, FW_NORMAL, gameCs);
+        SelectObject(mem, itemFont);
+        SetTextColor(mem, selected ? COL_ACCENT : COL_TEXT);
+        RECT nameRc = { textLeft, itemRc.top, badgeRight - 4, itemRc.bottom };
+        DrawTextW(mem, fontName.c_str(), -1, &nameRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        // Separator
+        if (i < maxVisible - 1 && !selected) {
+            HPEN sepPen = CreatePen(PS_SOLID, 1, COL_SEPARATOR);
+            HGDIOBJ oldSep = SelectObject(mem, sepPen);
+            MoveToEx(mem, textLeft, itemRc.bottom + 1, NULL);
+            LineTo(mem, itemRc.right - 14, itemRc.bottom + 1);
+            SelectObject(mem, oldSep);
+            DeleteObject(sepPen);
+        }
+    }
+
+}

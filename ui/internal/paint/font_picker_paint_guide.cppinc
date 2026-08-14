@@ -1,0 +1,695 @@
+enum PickerGuideBlockKind {
+    PICKER_GUIDE_BLOCK_HEADING = 0,
+    PICKER_GUIDE_BLOCK_PARAGRAPH,
+    PICKER_GUIDE_BLOCK_STEP,
+    PICKER_GUIDE_BLOCK_ITEM,
+    PICKER_GUIDE_BLOCK_NOTE,
+    PICKER_GUIDE_BLOCK_KEY,
+    PICKER_GUIDE_BLOCK_REGISTERED_HOTKEY,
+};
+
+struct PickerGuideBlock {
+    PickerGuideBlockKind kind;
+    const wchar_t* label;
+    const wchar_t* text;
+};
+
+struct PickerGuideSectionData {
+    const wchar_t* tabLabel;
+    const wchar_t* title;
+    const wchar_t* summary;
+    const PickerGuideBlock* blocks;
+    int blockCount;
+};
+
+static const PickerGuideBlock g_quickStartGuideBlocks[] = {
+    { PICKER_GUIDE_BLOCK_HEADING, L"准备文件", NULL },
+    { PICKER_GUIDE_BLOCK_STEP, L"1",
+      L"确认游戏实际运行主程序的架构。32 位游戏使用 Win32 版 winmm.dll，64 位游戏使用 x64 版 winmm.dll。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"2",
+      L"备份游戏目录里已有的 winmm.dll 和 FontHook.ini，保留可以直接恢复的原文件。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"3",
+      L"把对应架构的 winmm.dll 放到游戏实际运行的 .exe 同级目录，然后启动游戏。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"加载判断",
+      L"游戏启动后出现字体选择器，表示工具已经进入当前进程。页脚会显示当前实际注册成功的窗口热键。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"第一次应用字体", NULL },
+    { PICKER_GUIDE_BLOCK_STEP, L"1",
+      L"先按游戏文本的实际编码选择语言，再在搜索框输入字体名，或用鼠标滚轮浏览字体列表。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"编码与语言选项",
+      L"Shift-JIS / CP932 选择“日文”，GBK / GB2312 / CP936 选择“中文”，Big5 / CP950 选择“繁体”，CP949 选择“韩文”。优先查看游戏版本或文本补丁说明，不按界面显示语言猜测编码。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"2",
+      L"单击字体查看列表样式和底部预览。预览只用于比较外观，真正应用需要双击字体或按 Enter。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"3",
+      L"应用后回到游戏，依次检查菜单、正文、标点、数字、换行和长文本。确认字体名称变化并且文字完整。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"4",
+      L"显示正常时，让伪装、映射和转码保持关闭。只有出现明确问题时，才进入“功能说明”按对应现象调整。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"自动保存",
+      L"字体应用、开关切换和排版数值会自动写入 DLL 同级的 FontHook.ini，界面没有额外的保存按钮。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"推荐操作顺序",
+      L"每次只改变一类设置，回到游戏确认结果后再继续。这样可以判断是哪一项解决了问题，也便于恢复。" },
+};
+
+static const PickerGuideBlock g_featureGuideBlocks[] = {
+    { PICKER_GUIDE_BLOCK_HEADING, L"字体选择与语言选项", NULL },
+    { PICKER_GUIDE_BLOCK_ITEM, L"搜索框",
+      L"按字体名称筛选列表。清空搜索内容即可恢复当前语言范围内的全部字体。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"默认",
+      L"列出全部可用字体，并在应用时保留游戏原有字符集。游戏使用 Unicode，或已经确认原字符集请求正确且只需替换字体名称时使用。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"中文 / 日文 / 繁体 / 韩文",
+      L"筛选声明支持对应字符集的字体，并在应用字体时指定该字符集。第一次应用时应按游戏实际编码选择，不按字体名称或画面语言猜测。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"单击、双击与 Enter",
+      L"单击只选择并刷新预览；双击或 Enter 才会应用。列表中的已应用标记用于确认当前生效字体。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"方框缺字",
+      L"字符集选项和伪装都不能给字体增加字形。出现方框或空白字时，应选择真正包含目标文字的字体。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"伪装", NULL },
+    { PICKER_GUIDE_BLOCK_PARAGRAPH, NULL,
+      L"伪装用于让游戏把字体视为指定语言字符集。它处理的是字体请求和字符集识别，不负责翻译文字，也不负责繁简转换。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"伪装: 关",
+      L"保持游戏原有字符集行为。字体已经正确显示时使用此状态。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"伪装: 开",
+      L"游戏只接受某种语言字体、正确字体仍被拒绝或字符集识别明显错误时开启。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"目标语言",
+      L"点击伪装右侧语言按钮循环选择。选择游戏期望看到的语言字符集，而不是根据字体名称盲目选择。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"判断结果",
+      L"开启后如果字体可用且原文字仍完整，说明方向正确；出现新的乱码、缺字或文本变化时立即关闭并恢复基线。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"映射", NULL },
+    { PICKER_GUIDE_BLOCK_PARAGRAPH, NULL,
+      L"映射会改变最终显示的 Unicode 字符。它适合处理明确的字形或繁简方向需求，不适合处理字节编码乱码。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"日繁",
+      L"把日文汉字代理字符映射为对应的简体中文字符。它用于中文文本借用日文 / CP932 字符槽位的情况，采用专用代理字表；“繁>简”则处理正常繁体 Unicode 文本，两者不是同一套映射。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"繁>简",
+      L"把繁体字符映射为简体字符。人名、专有名词和异体字可能发生变化，应用后需要检查全文。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"简>繁",
+      L"把简体字符映射为繁体字符。映射结果不等同于人工翻译，同样需要检查语境。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"转码", NULL },
+    { PICKER_GUIDE_BLOCK_PARAGRAPH, NULL,
+      L"转码用于修正程序调用的代码页与文本实际编码不一致的情况。文字本身已经正常时保持关闭；缺少字形时更换字体，不使用转码。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"日文→UTF-8 / 中文→UTF-8",
+      L"程序按日文 CP932 或中文 CP936 读取，但文本实际保存为 UTF-8 时使用。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"系统→UTF-8",
+      L"程序使用当前系统代码页读取，但文本实际保存为 UTF-8 时使用。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"UTF-8→日文 / UTF-8→中文",
+      L"程序请求 UTF-8 转换，但文本实际采用 CP932 或 CP936 时使用。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"选择原则",
+      L"转码方向必须与文本实际编码一致。方向不确定时先保持关闭；错误方向通常会让原有文字变成乱码。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"排版与预览", NULL },
+    { PICKER_GUIDE_BLOCK_ITEM, L"字宽 / 字高",
+      L"倍率 1.00 表示原始比例，减号和加号每次调整 0.01。用于文字过宽、过窄、过高或过矮。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"字距 / 行距",
+      L"数值 0 表示没有额外调整。字距处理字符横向拥挤，行距处理多行文字上下拥挤。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"上行 / 下行",
+      L"控制字体相对基线的垂直度量。文字整体偏上、偏下或被上下裁切时使用，优先采用参照计算。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"粗细",
+      L"400 为常规字重，数值每次变化 100。文字笔画过细或过粗时调整。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"设为参照 / 按参照计算",
+      L"先在列表选中一个垂直位置正常的字体并设为参照，再选择目标字体应用，最后按参照计算上行、下行和行距。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"清空调整",
+      L"恢复全部排版数值的基线状态。排版越调越乱、文字位置难以判断时先使用此按钮。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"底部预览",
+      L"显示测试文字、当前语言、选择位置和应用状态。最终结果仍以游戏实际菜单和正文为准。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"A- / A+",
+      L"只缩放字体选择器界面文字，不改变游戏字体大小。" },
+};
+
+static const PickerGuideBlock g_shortcutGuideBlocks[] = {
+    { PICKER_GUIDE_BLOCK_HEADING, L"窗口与页面", NULL },
+    { PICKER_GUIDE_BLOCK_REGISTERED_HOTKEY, NULL,
+      L"单独按下这个键即可显示或隐藏字体选择器。工具依次尝试 Insert、Pause 和 Scroll Lock，当前实际结果以这里和页脚显示为准。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"Tab",
+      L"在“字体”和“指南”页面之间切换。搜索框获得焦点时同样有效。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"Esc",
+      L"隐藏字体选择器，游戏继续运行。搜索框获得焦点时同样有效。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"A- / A+",
+      L"缩小或放大选择器界面文字。指南正文会重新排版并回到当前章节顶部。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"最小化按钮",
+      L"把选择器收回任务栏分组图标；从任务栏恢复后继续当前页面。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"关闭按钮",
+      L"隐藏选择器窗口。工具随游戏进程工作，关闭按钮不会关闭游戏。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"字体列表键盘操作", NULL },
+    { PICKER_GUIDE_BLOCK_KEY, L"↑ / ↓",
+      L"选择上一项或下一项字体。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"Page Up / Page Down",
+      L"按当前可见行数向上或向下翻页。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"Home / End",
+      L"跳到字体列表第一项或最后一项。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"Enter",
+      L"应用当前选中的字体。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"鼠标双击",
+      L"选择并应用双击位置的字体。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"鼠标滚轮",
+      L"在字体列表上滚动列表；在语言选项栏上横向浏览被窗口宽度遮住的语言按钮。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"指南阅读操作", NULL },
+    { PICKER_GUIDE_BLOCK_KEY, L"点击章节",
+      L"切换快速开始、功能说明、快捷键或问题处理，并回到该章节顶部。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"滚轮",
+      L"滚动当前章节正文。" },
+    { PICKER_GUIDE_BLOCK_KEY, L"拖动滚动条",
+      L"快速移动到当前章节的其他位置；点击轨道可以整页移动。" },
+};
+
+static const PickerGuideBlock g_troubleshootingGuideBlocks[] = {
+    { PICKER_GUIDE_BLOCK_HEADING, L"先识别现象", NULL },
+    { PICKER_GUIDE_BLOCK_PARAGRAPH, NULL,
+      L"字体问题、缺字、文字映射和编码乱码属于不同问题。先找到最接近的现象，再按顺序处理，不要同时开启全部功能。" },
+
+    { PICKER_GUIDE_BLOCK_ITEM, L"字体外观没有变化",
+      L"确认使用了双击或 Enter，而不是只单击预览；检查列表中的已应用标记。重新应用另一种差异明显的字体，再回到游戏切换一次界面或文本。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"出现方框、空白字或缺少符号",
+      L"目标字体缺少对应字形。切到与游戏实际编码一致的语言筛选；需要检查全部字体时再用“默认”。伪装、映射和转码都不能补充缺失字形。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"文字变成乱码",
+      L"先关闭映射与转码，确认原始状态。字体正确但字节被错误读取时，按实际编码选择一个转码方向；每次只测试一个预设，错误时立即关闭。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"简繁方向或旧字形不符合需求",
+      L"日文 / CP932 代理字符需要还原为简中时选择“日繁”；正常繁体 Unicode 文本需要简化时选择“繁>简”；反向需求选择“简>繁”。检查人名、标点和专有名词，确认结果适合全文。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"正确字体仍被游戏拒绝",
+      L"先确认字体包含目标文字，再开启伪装并选择游戏期望的语言字符集。若文字内容发生异常，恢复伪装关闭。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"文字过宽、重叠或超出按钮",
+      L"先降低字宽，再减少字距；如果整体字号也偏大，再降低字高。每次小幅调整并检查长文本。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"文字偏上、偏下或被裁切",
+      L"优先使用“设为参照”和“按参照计算”。仍有偏差时再小幅调整上行、下行和行距。" },
+    { PICKER_GUIDE_BLOCK_ITEM, L"选择器窗口找不到",
+      L"先查看任务栏是否处于最小化状态，再使用本页显示的窗口热键。热键冲突时工具会登记备用组合，实际组合以页脚为准。" },
+
+    { PICKER_GUIDE_BLOCK_HEADING, L"恢复可判断的基线", NULL },
+    { PICKER_GUIDE_BLOCK_STEP, L"1",
+      L"关闭伪装、映射和转码。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"2",
+      L"点击“清空调整”，让字宽、字高、字距、行距、垂直度量和粗细回到基线。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"3",
+      L"语言选项切回与游戏实际编码一致的选项；确认无须指定字符集时才使用“默认”。应用一个覆盖范围完整、容易辨认的字体。" },
+    { PICKER_GUIDE_BLOCK_STEP, L"4",
+      L"回到游戏确认基础字体替换，再按照现象逐项启用需要的功能。" },
+    { PICKER_GUIDE_BLOCK_NOTE, L"仍未刷新",
+      L"部分游戏对象会保留已经创建的字体。确认配置已经保存后，可重新进入当前游戏界面；仍无变化时重新启动游戏再检查。" },
+};
+
+static const PickerGuideSectionData g_pickerGuideSections[] = {
+    { L"快速开始", L"从放置文件到应用字体",
+      L"按顺序完成准备、加载、选择、应用和检查。",
+      g_quickStartGuideBlocks, _countof(g_quickStartGuideBlocks) },
+    { L"功能说明", L"每个可见控件具体做什么",
+      L"先理解作用和适用条件，再决定是否开启。",
+      g_featureGuideBlocks, _countof(g_featureGuideBlocks) },
+    { L"快捷键", L"鼠标与键盘操作",
+      L"窗口、字体列表和指南阅读的完整操作表。",
+      g_shortcutGuideBlocks, _countof(g_shortcutGuideBlocks) },
+    { L"问题处理", L"按画面现象定位设置",
+      L"区分字体、字形、映射、编码和排版问题。",
+      g_troubleshootingGuideBlocks, _countof(g_troubleshootingGuideBlocks) },
+};
+
+static const PickerGuideSectionData& CurrentPickerGuideSection() {
+    int index = max(0, min(PICKER_GUIDE_SECTION_COUNT - 1,
+        (int)g_guideSection));
+    return g_pickerGuideSections[index];
+}
+
+struct PickerGuideTextLine {
+    const wchar_t* text;
+    int length;
+};
+
+static bool IsPickerGuideAsciiWordChar(wchar_t ch) {
+    return (ch >= L'0' && ch <= L'9') ||
+        (ch >= L'A' && ch <= L'Z') ||
+        (ch >= L'a' && ch <= L'z') ||
+        ch == L'_' || ch == L'-' || ch == L'+' || ch == L'/' ||
+        ch == L'\\' || ch == L'.' || ch == L':' || ch == L'=';
+}
+
+static bool IsPickerGuideInlineSpace(wchar_t ch) {
+    return ch == L' ' || ch == L'\t';
+}
+
+static void BuildPickerGuideTextLines(HDC hdc, const wchar_t* text,
+    int width, std::vector<PickerGuideTextLine>& lines) {
+    lines.clear();
+    if (!text || !text[0]) return;
+
+    const int textLength = (int)wcslen(text);
+    int position = 0;
+    while (position < textLength) {
+        if (text[position] == L'\r' || text[position] == L'\n') {
+            lines.push_back({ text + position, 0 });
+            if (text[position] == L'\r' && position + 1 < textLength &&
+                text[position + 1] == L'\n') {
+                ++position;
+            }
+            ++position;
+            continue;
+        }
+
+        int paragraphEnd = position;
+        while (paragraphEnd < textLength && text[paragraphEnd] != L'\r' &&
+            text[paragraphEnd] != L'\n') {
+            ++paragraphEnd;
+        }
+
+        while (position < paragraphEnd) {
+            while (position < paragraphEnd &&
+                IsPickerGuideInlineSpace(text[position])) {
+                ++position;
+            }
+            if (position >= paragraphEnd) break;
+
+            const int remaining = paragraphEnd - position;
+            int fit = 0;
+            SIZE extent = {};
+            GetTextExtentExPointW(hdc, text + position, remaining,
+                max(1, width), &fit, NULL, &extent);
+            fit = max(1, min(fit, remaining));
+
+            int take = fit;
+            if (fit < remaining &&
+                IsPickerGuideAsciiWordChar(text[position + fit - 1]) &&
+                IsPickerGuideAsciiWordChar(text[position + fit])) {
+                int wordStart = fit;
+                while (wordStart > 0 &&
+                    IsPickerGuideAsciiWordChar(text[position + wordStart - 1])) {
+                    --wordStart;
+                }
+                if (wordStart > 0) take = wordStart;
+            }
+
+            int visibleLength = take;
+            while (visibleLength > 0 &&
+                IsPickerGuideInlineSpace(text[position + visibleLength - 1])) {
+                --visibleLength;
+            }
+            if (visibleLength == 0) visibleLength = take;
+            lines.push_back({ text + position, visibleLength });
+            position += take;
+        }
+
+        if (position < textLength && text[position] == L'\r') ++position;
+        if (position < textLength && text[position] == L'\n') ++position;
+    }
+}
+
+static int GetPickerGuideTextLineHeight(HDC hdc) {
+    TEXTMETRICW metrics = {};
+    if (!GetTextMetricsW(hdc, &metrics)) return max(1, SF(11));
+    return max(1, (int)metrics.tmHeight);
+}
+
+static int GetPickerGuideTextLineGap(HDC hdc) {
+    TEXTMETRICW metrics = {};
+    GetTextMetricsW(hdc, &metrics);
+    return max(max(2, SF(3)), (int)metrics.tmExternalLeading);
+}
+
+static int MeasurePickerGuideText(HDC hdc, HFONT font,
+    const wchar_t* text, int width, UINT format) {
+    if (!text || !text[0]) return 0;
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    int height = 0;
+    if ((format & DT_WORDBREAK) != 0 && (format & DT_SINGLELINE) == 0) {
+        std::vector<PickerGuideTextLine> lines;
+        BuildPickerGuideTextLines(hdc, text, width, lines);
+        const int lineHeight = GetPickerGuideTextLineHeight(hdc);
+        const int lineGap = GetPickerGuideTextLineGap(hdc);
+        if (!lines.empty()) {
+            height = (int)lines.size() * lineHeight +
+                ((int)lines.size() - 1) * lineGap;
+        }
+    }
+    else {
+        RECT calc = { 0, 0, max(1, width), 0 };
+        DrawTextW(hdc, text, -1, &calc,
+            format | DT_CALCRECT | DT_NOPREFIX);
+        height = (int)(calc.bottom - calc.top);
+    }
+
+    SelectObject(hdc, oldFont);
+    return max(1, height);
+}
+
+static void DrawPickerGuideText(HDC hdc, HFONT font,
+    COLORREF color, const wchar_t* text, RECT rect, UINT format) {
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+    SetTextColor(hdc, color);
+
+    if (text && text[0] && (format & DT_WORDBREAK) != 0 &&
+        (format & DT_SINGLELINE) == 0) {
+        std::vector<PickerGuideTextLine> lines;
+        BuildPickerGuideTextLines(hdc, text, rect.right - rect.left, lines);
+        const int lineHeight = GetPickerGuideTextLineHeight(hdc);
+        const int lineGap = GetPickerGuideTextLineGap(hdc);
+        int lineTop = rect.top;
+        for (const PickerGuideTextLine& line : lines) {
+            RECT lineRect = { rect.left, lineTop, rect.right,
+                lineTop + lineHeight };
+            if (line.length > 0) {
+                DrawTextW(hdc, line.text, line.length, &lineRect,
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+            }
+            lineTop += lineHeight + lineGap;
+        }
+    }
+    else {
+        DrawTextW(hdc, text, -1, &rect, format | DT_NOPREFIX);
+    }
+
+    SelectObject(hdc, oldFont);
+}
+
+static int LayoutPickerGuideContent(HDC hdc,
+    const PickerGuideSectionData& section, int left, int right,
+    int startY, bool draw) {
+    int width = max(1, right - left);
+    int y = startY;
+
+    HFONT pageTitleFont = GetCachedPickerFont(L"Segoe UI", SF(18), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+    HFONT pageSummaryFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0,
+        FW_NORMAL, DEFAULT_CHARSET);
+    HFONT headingFont = GetCachedPickerFont(L"Segoe UI", SF(13), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+    HFONT labelFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+    HFONT bodyFont = GetCachedPickerFont(L"Segoe UI", SF(11), 0,
+        FW_NORMAL, DEFAULT_CHARSET);
+    HFONT keyFont = GetCachedPickerFont(L"Consolas", SF(10), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+
+    int titleHeight = MeasurePickerGuideText(hdc, pageTitleFont,
+        section.title, width, DT_LEFT | DT_WORDBREAK);
+    if (draw) {
+        RECT titleRect = { left, y, right, y + titleHeight };
+        DrawPickerGuideText(hdc, pageTitleFont, COL_TEXT,
+            section.title, titleRect, DT_LEFT | DT_WORDBREAK);
+    }
+    y += titleHeight + max(4, SF(5));
+
+    int summaryHeight = MeasurePickerGuideText(hdc, pageSummaryFont,
+        section.summary, width, DT_LEFT | DT_WORDBREAK);
+    if (draw) {
+        RECT summaryRect = { left, y, right, y + summaryHeight };
+        DrawPickerGuideText(hdc, pageSummaryFont, COL_TEXT_DIM,
+            section.summary, summaryRect, DT_LEFT | DT_WORDBREAK);
+    }
+    y += summaryHeight + max(12, SF(16));
+
+    if (draw) {
+        HPEN separator = CreatePen(PS_SOLID, 1, COL_BORDER);
+        HGDIOBJ oldPen = SelectObject(hdc, separator);
+        MoveToEx(hdc, left, y - 1, NULL);
+        LineTo(hdc, right, y - 1);
+        SelectObject(hdc, oldPen);
+        DeleteObject(separator);
+    }
+
+    int itemIndex = 0;
+    for (int blockIndex = 0; blockIndex < section.blockCount; ++blockIndex) {
+        const PickerGuideBlock& block = section.blocks[blockIndex];
+        if (block.kind == PICKER_GUIDE_BLOCK_HEADING) {
+            y += blockIndex == 0 ? max(8, SF(10)) : max(18, SF(22));
+            int headingHeight = MeasurePickerGuideText(hdc, headingFont,
+                block.label, width - 14, DT_LEFT | DT_WORDBREAK);
+            if (draw) {
+                RECT accentRect = { left, y + 1, left + 4,
+                    y + max(headingHeight, SF(18)) };
+                HBRUSH accentBrush = CreateSolidBrush(COL_ACCENT);
+                FillRect(hdc, &accentRect, accentBrush);
+                DeleteObject(accentBrush);
+                RECT headingRect = { left + 14, y, right,
+                    y + headingHeight };
+                DrawPickerGuideText(hdc, headingFont, COL_TEXT,
+                    block.label, headingRect, DT_LEFT | DT_WORDBREAK);
+            }
+            y += headingHeight + max(8, SF(10));
+            continue;
+        }
+
+        if (block.kind == PICKER_GUIDE_BLOCK_PARAGRAPH) {
+            int textHeight = MeasurePickerGuideText(hdc, bodyFont,
+                block.text, width, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            if (draw) {
+                RECT textRect = { left, y, right, y + textHeight };
+                DrawPickerGuideText(hdc, bodyFont, COL_TEXT_DIM,
+                    block.text, textRect,
+                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            }
+            y += textHeight + max(10, SF(12));
+            continue;
+        }
+
+        if (block.kind == PICKER_GUIDE_BLOCK_STEP) {
+            int markerSize = max(24, SF(26));
+            int textLeft = left + markerSize + 12;
+            int textHeight = MeasurePickerGuideText(hdc, bodyFont,
+                block.text, right - textLeft,
+                DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            int blockHeight = max(markerSize, textHeight);
+            if (draw) {
+                RECT markerRect = { left, y, left + markerSize,
+                    y + markerSize };
+                COLORREF markerColor = itemIndex % 2 == 0
+                    ? COL_ACCENT2 : RGB(125, 220, 180);
+                HBRUSH markerBrush = CreateSolidBrush(
+                    MixColor(markerColor, RGB(20, 18, 34), 0.58f));
+                HPEN markerPen = CreatePen(PS_SOLID, 1, markerColor);
+                HGDIOBJ oldBrush = SelectObject(hdc, markerBrush);
+                HGDIOBJ oldPen = SelectObject(hdc, markerPen);
+                Ellipse(hdc, markerRect.left, markerRect.top,
+                    markerRect.right, markerRect.bottom);
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBrush);
+                DeleteObject(markerPen);
+                DeleteObject(markerBrush);
+                DrawPickerGuideText(hdc, labelFont, markerColor,
+                    block.label, markerRect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RECT textRect = { textLeft, y, right, y + textHeight };
+                DrawPickerGuideText(hdc, bodyFont, COL_TEXT_DIM,
+                    block.text, textRect,
+                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            }
+            y += blockHeight + max(12, SF(14));
+            ++itemIndex;
+            continue;
+        }
+
+        if (block.kind == PICKER_GUIDE_BLOCK_ITEM) {
+            int textLeft = left + 18;
+            int labelHeight = MeasurePickerGuideText(hdc, labelFont,
+                block.label, right - textLeft, DT_LEFT | DT_WORDBREAK);
+            int bodyHeight = MeasurePickerGuideText(hdc, bodyFont,
+                block.text, right - textLeft,
+                DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            if (draw) {
+                COLORREF bulletColor = itemIndex % 3 == 0 ? COL_ACCENT2
+                    : itemIndex % 3 == 1 ? RGB(125, 220, 180)
+                    : RGB(245, 195, 105);
+                HBRUSH bulletBrush = CreateSolidBrush(bulletColor);
+                HPEN bulletPen = CreatePen(PS_SOLID, 1, bulletColor);
+                HGDIOBJ oldBrush = SelectObject(hdc, bulletBrush);
+                HGDIOBJ oldPen = SelectObject(hdc, bulletPen);
+                Ellipse(hdc, left + 2, y + max(4, SF(5)),
+                    left + 8, y + max(10, SF(11)));
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBrush);
+                DeleteObject(bulletPen);
+                DeleteObject(bulletBrush);
+                RECT labelRect = { textLeft, y, right, y + labelHeight };
+                DrawPickerGuideText(hdc, labelFont, COL_TEXT,
+                    block.label, labelRect, DT_LEFT | DT_WORDBREAK);
+                RECT bodyRect = { textLeft, y + labelHeight + 3, right,
+                    y + labelHeight + 3 + bodyHeight };
+                DrawPickerGuideText(hdc, bodyFont, COL_TEXT_DIM,
+                    block.text, bodyRect,
+                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            }
+            y += labelHeight + 3 + bodyHeight + max(12, SF(14));
+            ++itemIndex;
+            continue;
+        }
+
+        if (block.kind == PICKER_GUIDE_BLOCK_NOTE) {
+            int innerLeft = left + 13;
+            int innerRight = right - 10;
+            int labelHeight = MeasurePickerGuideText(hdc, labelFont,
+                block.label, innerRight - innerLeft,
+                DT_LEFT | DT_WORDBREAK);
+            int bodyHeight = MeasurePickerGuideText(hdc, bodyFont,
+                block.text, innerRight - innerLeft,
+                DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            int padding = max(10, SF(11));
+            int blockHeight = padding + labelHeight + 4 + bodyHeight + padding;
+            if (draw) {
+                RECT noteRect = { left, y, right, y + blockHeight };
+                HBRUSH noteBrush = CreateSolidBrush(RGB(30, 36, 48));
+                FillRect(hdc, &noteRect, noteBrush);
+                DeleteObject(noteBrush);
+                RECT noteAccent = { left, y, left + 4, y + blockHeight };
+                HBRUSH noteAccentBrush = CreateSolidBrush(RGB(125, 220, 180));
+                FillRect(hdc, &noteAccent, noteAccentBrush);
+                DeleteObject(noteAccentBrush);
+                RECT labelRect = { innerLeft, y + padding, innerRight,
+                    y + padding + labelHeight };
+                DrawPickerGuideText(hdc, labelFont, RGB(150, 235, 195),
+                    block.label, labelRect, DT_LEFT | DT_WORDBREAK);
+                RECT bodyRect = { innerLeft, labelRect.bottom + 4,
+                    innerRight, labelRect.bottom + 4 + bodyHeight };
+                DrawPickerGuideText(hdc, bodyFont, COL_TEXT_DIM,
+                    block.text, bodyRect,
+                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            }
+            y += blockHeight + max(12, SF(14));
+            continue;
+        }
+
+        if (block.kind == PICKER_GUIDE_BLOCK_KEY ||
+            block.kind == PICKER_GUIDE_BLOCK_REGISTERED_HOTKEY) {
+            const wchar_t* keyLabel = block.kind == PICKER_GUIDE_BLOCK_REGISTERED_HOTKEY
+                ? g_toggleHotkeyDisplayName : block.label;
+            int keyWidth = min(max(104, SF(116)), max(104, width * 42 / 100));
+            int descLeft = left + keyWidth + 12;
+            int keyHeight = MeasurePickerGuideText(hdc, keyFont,
+                keyLabel, keyWidth, DT_LEFT | DT_WORDBREAK);
+            int descHeight = MeasurePickerGuideText(hdc, bodyFont,
+                block.text, right - descLeft,
+                DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+            int rowHeight = max(keyHeight, descHeight) + max(14, SF(16));
+            if (draw) {
+                RECT keyRect = { left, y + 2, left + keyWidth,
+                    y + 2 + keyHeight };
+                DrawPickerGuideText(hdc, keyFont, COL_ACCENT2,
+                    keyLabel, keyRect, DT_LEFT | DT_WORDBREAK);
+                RECT descRect = { descLeft, y + 2, right,
+                    y + 2 + descHeight };
+                DrawPickerGuideText(hdc, bodyFont, COL_TEXT_DIM,
+                    block.text, descRect,
+                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+                HPEN rowLine = CreatePen(PS_SOLID, 1, COL_SEPARATOR);
+                HGDIOBJ oldPen = SelectObject(hdc, rowLine);
+                MoveToEx(hdc, left, y + rowHeight - 1, NULL);
+                LineTo(hdc, right, y + rowHeight - 1);
+                SelectObject(hdc, oldPen);
+                DeleteObject(rowLine);
+            }
+            y += rowHeight;
+        }
+    }
+
+    return y - startY;
+}
+
+static void PaintGuidePage(HDC mem, const RECT& rc)
+{
+    RECT pageRect = { 0, TITLE_HEIGHT, rc.right, rc.bottom };
+    HBRUSH pageBrush = CreateSolidBrush(RGB(17, 16, 31));
+    FillRect(mem, &pageRect, pageBrush);
+    DeleteObject(pageBrush);
+
+    RECT headerRect = GetGuideHeaderRect();
+    GradientV(mem, headerRect, RGB(40, 31, 58), RGB(24, 22, 42));
+    RECT headerAccent = { 18, headerRect.top + 14, 22,
+        headerRect.bottom - 14 };
+    HBRUSH headerAccentBrush = CreateSolidBrush(COL_ACCENT);
+    FillRect(mem, &headerAccent, headerAccentBrush);
+    DeleteObject(headerAccentBrush);
+
+    HFONT headerFont = GetCachedPickerFont(L"Segoe UI", min(SF(18), 22), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+    HFONT headerSummaryFont = GetCachedPickerFont(L"Segoe UI", min(SF(10), 13), 0,
+        FW_NORMAL, DEFAULT_CHARSET);
+    RECT headerTitleRect = { 34, headerRect.top + 8,
+        rc.right - 70, headerRect.top + 34 };
+    DrawPickerGuideText(mem, headerFont, COL_TEXT, L"使用指南",
+        headerTitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT headerSummaryRect = { 34, headerRect.top + 34,
+        rc.right - 18, headerRect.bottom - 5 };
+    DrawPickerGuideText(mem, headerSummaryFont, COL_TEXT_DIM,
+        L"面向普通用户的完整操作说明",
+        headerSummaryRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE |
+        DT_END_ELLIPSIS);
+    wchar_t sectionCounter[16] = {};
+    swprintf_s(sectionCounter, L"%d / %d", (int)g_guideSection + 1,
+        PICKER_GUIDE_SECTION_COUNT);
+    RECT counterRect = { rc.right - 68, headerRect.top + 8,
+        rc.right - 18, headerRect.top + 34 };
+    DrawPickerGuideText(mem, headerSummaryFont, COL_TEXT_HINT,
+        sectionCounter, counterRect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT tabsRect = GetGuideSectionTabsRect();
+    HBRUSH tabsBrush = CreateSolidBrush(RGB(22, 20, 39));
+    FillRect(mem, &tabsRect, tabsBrush);
+    DeleteObject(tabsBrush);
+    HFONT tabFont = GetCachedPickerFont(L"Segoe UI", min(SF(10), 13), 0,
+        FW_BOLD, DEFAULT_CHARSET);
+    for (int index = 0; index < PICKER_GUIDE_SECTION_COUNT; ++index) {
+        RECT tabRect = GetGuideSectionTabRect(index);
+        bool active = index == (int)g_guideSection;
+        bool hovered = index == g_guideHoveredSection;
+        COLORREF fill = active ? RGB(86, 44, 80) : RGB(35, 29, 52);
+        if (hovered) fill = active ? RGB(108, 54, 96) : COL_BTN_HOV;
+        FillRoundRect(mem, tabRect, 8, fill);
+        DrawRoundRectOutline(mem, tabRect, 8,
+            active ? COL_ACCENT : COL_BORDER);
+        DrawPickerGuideText(mem, tabFont,
+            active ? COL_TEXT : COL_TEXT_DIM,
+            g_pickerGuideSections[index].tabLabel, tabRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    RECT viewport = GetGuideViewportRect();
+    const PickerGuideSectionData& section = CurrentPickerGuideSection();
+    int contentLeft = 20;
+    int contentRight = max(contentLeft + 40, (int)rc.right - 24);
+    int contentPadding = max(14, SF(18));
+    int measuredHeight = LayoutPickerGuideContent(mem, section,
+        contentLeft, contentRight, 0, false) + contentPadding * 2;
+    g_guideContentHeight = measuredHeight;
+    int maxScroll = max(0, measuredHeight -
+        (int)(viewport.bottom - viewport.top));
+    g_guideScrollOffset = max(0, min(maxScroll, g_guideScrollOffset));
+
+    int savedDc = SaveDC(mem);
+    IntersectClipRect(mem, viewport.left, viewport.top,
+        viewport.right, viewport.bottom);
+    int contentTop = viewport.top + contentPadding - g_guideScrollOffset;
+    LayoutPickerGuideContent(mem, section, contentLeft, contentRight,
+        contentTop, true);
+    RestoreDC(mem, savedDc);
+
+    RECT thumb = {}, track = {};
+    GetGuideScrollbarRect(&thumb, &track);
+    if (GetGuideMaxScroll() > 0) {
+        FillRoundRect(mem, track, 6, COL_SB_TRACK);
+        COLORREF thumbColor = g_guideScrollbarDragging ? COL_SB_THUMB_DRG
+            : g_guideScrollbarHovered ? COL_SB_THUMB_HOV : COL_SB_THUMB;
+        FillRoundRect(mem, thumb, 6, thumbColor);
+    }
+
+    RECT footerRect = GetGuideFooterRect();
+    HBRUSH footerBrush = CreateSolidBrush(RGB(23, 21, 40));
+    FillRect(mem, &footerRect, footerBrush);
+    DeleteObject(footerBrush);
+    HPEN footerLine = CreatePen(PS_SOLID, 1, COL_BORDER);
+    HGDIOBJ oldFooterLine = SelectObject(mem, footerLine);
+    MoveToEx(mem, 0, footerRect.top, NULL);
+    LineTo(mem, rc.right, footerRect.top);
+    SelectObject(mem, oldFooterLine);
+    DeleteObject(footerLine);
+
+    wchar_t footerText[160] = {};
+    swprintf_s(footerText,
+        L"滚轮阅读  ·  Tab 返回字体  ·  Esc 隐藏  ·  窗口热键 %s",
+        g_toggleHotkeyDisplayName);
+    HFONT footerFont = GetCachedPickerFont(L"Segoe UI", min(SF(10), 12), 0,
+        FW_NORMAL, DEFAULT_CHARSET);
+    RECT footerTextRect = { 12, footerRect.top,
+        rc.right - 12, footerRect.bottom };
+    DrawPickerGuideText(mem, footerFont, COL_TEXT_HINT, footerText,
+        footerTextRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
