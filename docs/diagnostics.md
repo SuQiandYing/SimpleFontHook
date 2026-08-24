@@ -91,6 +91,14 @@ DebugPickerThreadLogLimit=0
 检查 `ConfigVersion` 是否更新、目标引擎是否使用内部缓存，以及对应适配器是否记录了
 缓存清理或资源重建。不要直接把问题归因于字体名称替换失败。
 
+### 繁简映射开启后回想文本断行异常
+
+仅使用 ANSI GDI 绘制的程序可能用 `GetTextExtentExPointA` 返回值推进原始 DBCS
+字节缓冲区。文字映射路径可以把测量暂时转到宽字符 API，但必须把 `lpnFit` 和
+`lpnDx` 转回源字节边界；否则返回的 UTF-16 字符数会让调用方从半个汉字或过早位置
+继续排版。检查 `[DEBUG][TextSub]` 的解码结果时，同时确认度量钩子保留了 ANSI 字节
+计数，不能只看屏幕上的简体字是否正确。
+
 ### TyranoScript 换字体后场景或插件提示 file not found
 
 先确认 `resources/app.asar` 与 `resources/app` 的实际布局。已经从 `app.asar` 启动的
