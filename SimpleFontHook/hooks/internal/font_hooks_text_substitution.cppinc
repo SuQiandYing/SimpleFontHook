@@ -136,8 +136,71 @@ static UINT TextSubstitutionAnsiCodepage() {
     return Config::TextSubstitutionCodepage;
 }
 
+static bool BuildAnsiWideByteOffsets(UINT codepage, LPCSTR input, int sourceLength,
+    const std::wstring& decoded, std::vector<int>& offsets) {
+    offsets.clear();
+    if (!input || sourceLength < 0 || decoded.empty()) return false;
+
+    offsets.reserve(decoded.size() + 1);
+    int byteOffset = 0;
+    size_t wideOffset = 0;
+    const int kMaxProbeBytes = 8;
+
+    // Decode one source character at a time so callers of an A API can keep
+    // using byte offsets even though the measurement is performed by a W API.
+    while (byteOffset < sourceLength && wideOffset < decoded.size()) {
+        int consumed = 0;
+        int produced = 0;
+        int maxProbe = std::min(kMaxProbeBytes, sourceLength - byteOffset);
+        for (int probeBytes = 1; probeBytes <= maxProbe; ++probeBytes) {
+            wchar_t probe[8] = {};
+            int probeLength = orgMultiByteToWideChar(
+                codepage, 0, input + byteOffset, probeBytes,
+                probe, _countof(probe));
+            if (probeLength <= 0 || wideOffset + (size_t)probeLength > decoded.size())
+                continue;
+            if (std::char_traits<wchar_t>::compare(
+                probe, decoded.data() + wideOffset, probeLength) != 0) {
+                continue;
+            }
+            consumed = probeBytes;
+            produced = probeLength;
+            break;
+        }
+
+        if (consumed == 0) {
+            // Keep the mapping monotonic for malformed or stateful byte
+            // sequences; the normal CP932/936/950 paths never use this.
+            consumed = 1;
+            produced = 1;
+            if (wideOffset + (size_t)produced > decoded.size()) break;
+        }
+
+        for (int i = 0; i < produced; ++i) offsets.push_back(byteOffset);
+        byteOffset += consumed;
+        wideOffset += (size_t)produced;
+    }
+
+    if (wideOffset < decoded.size()) {
+        // A decoder may collapse an invalid tail differently when queried in
+        // small chunks. Associate any remaining UTF-16 units with the tail.
+        while (wideOffset < decoded.size()) {
+            offsets.push_back(std::min(byteOffset, sourceLength));
+            ++wideOffset;
+        }
+    }
+
+    if (offsets.size() != decoded.size()) {
+        offsets.clear();
+        return false;
+    }
+    offsets.push_back(sourceLength);
+    return true;
+}
+
 static bool DecodeTextAToWide(UINT codepage, LPCSTR input, int count, std::wstring& output,
-    int* outputCount) {
+    int* outputCount, std::vector<int>* sourceByteOffsets = NULL) {
+    if (sourceByteOffsets) sourceByteOffsets->clear();
     if (outputCount) *outputCount = count;
     if (!input) return false;
 
@@ -152,6 +215,16 @@ static bool DecodeTextAToWide(UINT codepage, LPCSTR input, int count, std::wstri
     if (MultiByteToWideChar(codepage, 0, input, sourceLen, &output[0], wideLen) != wideLen) {
         output.clear();
         return false;
+    }
+    if (sourceByteOffsets) {
+        UINT boundaryCodepage = codepage;
+        // DecodeTextAToWide goes through the conversion hook, so account for
+        // an active codepage redirect when reconstructing source byte spans.
+        ResolveRedirectCodepage(codepage, &boundaryCodepage);
+        if (!BuildAnsiWideByteOffsets(
+            boundaryCodepage, input, sourceLen, output, *sourceByteOffsets)) {
+            sourceByteOffsets->clear();
+        }
     }
     if (outputCount) *outputCount = count < 0 ? -1 : wideLen;
     return true;
@@ -259,7 +332,9 @@ static bool SubstituteSingleTextCharA(UINT input, wchar_t* output) {
     return SubstituteSingleTextCharW(decoded, output);
 }
 
-static bool SubstituteTextAToWide(LPCSTR input, int count, std::wstring& output, int* outputCount) {
+static bool SubstituteTextAToWide(LPCSTR input, int count, std::wstring& output, int* outputCount,
+    std::vector<int>* sourceByteOffsets = NULL) {
+    if (sourceByteOffsets) sourceByteOffsets->clear();
     if (outputCount) *outputCount = count;
     if (!input) return false;
 
@@ -269,14 +344,14 @@ static bool SubstituteTextAToWide(LPCSTR input, int count, std::wstring& output,
     bool decodeThroughCodepageRedirect = ResolveRedirectCodepage(codepage, &redirectedCodepage);
     if (!IsTextSubstitutionActive()) {
         if (decodeThroughCodepageRedirect)
-            return DecodeTextAToWide(codepage, input, count, output, outputCount);
+            return DecodeTextAToWide(codepage, input, count, output, outputCount, sourceByteOffsets);
         return decodeMajiroCp932 &&
-            DecodeTextAToWide(932, input, count, output, outputCount);
+            DecodeTextAToWide(932, input, count, output, outputCount, sourceByteOffsets);
     }
 
     std::wstring wideInput;
     int wideLen = 0;
-    if (!DecodeTextAToWide(codepage, input, count, wideInput, &wideLen)) return false;
+    if (!DecodeTextAToWide(codepage, input, count, wideInput, &wideLen, sourceByteOffsets)) return false;
 
     int wideOutputCount = 0;
     if (!SubstituteTextW(wideInput.c_str(), wideLen, output, &wideOutputCount)) {
@@ -286,8 +361,37 @@ static bool SubstituteTextAToWide(LPCSTR input, int count, std::wstring& output,
             return true;
         }
         if (!decodeMajiroCp932) return false;
-        return DecodeTextAToWide(932, input, count, output, outputCount);
+        return DecodeTextAToWide(932, input, count, output, outputCount, sourceByteOffsets);
     }
     if (outputCount) *outputCount = count < 0 ? -1 : wideOutputCount;
     return true;
+}
+
+static int MapWideFitToAnsiBytes(int wideFit, const std::vector<int>& sourceByteOffsets,
+    int sourceLength) {
+    if (sourceLength <= 0 || wideFit <= 0) return 0;
+    if (sourceByteOffsets.empty()) return std::min(wideFit, sourceLength);
+
+    size_t index = (size_t)std::min<int>(wideFit, (int)sourceByteOffsets.size() - 1);
+    return std::max(0, std::min(sourceLength, sourceByteOffsets[index]));
+}
+
+static void MapWidePartialExtentsToAnsiBytes(const std::vector<int>& sourceByteOffsets,
+    const int* wideDx, int wideCount, int sourceLength, int* ansiDx) {
+    if (!ansiDx || sourceLength <= 0) return;
+    if (!wideDx || wideCount <= 0 || sourceByteOffsets.empty()) {
+        std::fill(ansiDx, ansiDx + sourceLength, 0);
+        return;
+    }
+
+    int wideIndex = 0;
+    const int offsetCount = (int)sourceByteOffsets.size();
+    for (int byteIndex = 0; byteIndex < sourceLength; ++byteIndex) {
+        while (wideIndex + 1 < offsetCount &&
+            sourceByteOffsets[(size_t)wideIndex + 1] <= byteIndex) {
+            ++wideIndex;
+        }
+        int queryIndex = std::min(wideIndex, wideCount - 1);
+        ansiDx[byteIndex] = wideDx[queryIndex];
+    }
 }

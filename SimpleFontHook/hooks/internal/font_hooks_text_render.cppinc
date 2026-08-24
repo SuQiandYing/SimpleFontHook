@@ -430,18 +430,52 @@ BOOL WINAPI newGetTextExtentExPointA(HDC hdc, LPCSTR lpszString, int cchString, 
     DEBUG_API_CONTEXT("GetTextExtentExPointA");
     TraceApiHit(TRACE_METRICS, "GetTextExtentExPointA hdc=%p count=%d max=%d", hdc, cchString, nMaxExtent);
     std::wstring subTextW;
+    std::vector<int> sourceByteOffsets;
+    const bool needsAnsiResultMapping = lpnFit != NULL || lpnDx != NULL;
+    const int sourceLength = cchString >= 0
+        ? cchString
+        : (lpszString ? lstrlenA(lpszString) : 0);
     int useCount = cchString;
-    bool useWide = SubstituteTextAToWide(lpszString, cchString, subTextW, &useCount);
+    bool useWide = SubstituteTextAToWide(lpszString, cchString, subTextW, &useCount,
+        needsAnsiResultMapping ? &sourceByteOffsets : NULL);
     HFONT hOld, hNew = ReplaceHdcFont(hdc, &hOld);
     DEBUG_GDI_ENTER("GetTextExtentExPointA", hdc, hNew);
-    BOOL ret = useWide
-        ? orgGetTextExtentExPointW(hdc, subTextW.c_str(), useCount, nMaxExtent, lpnFit, lpnDx, lpSize)
-        : orgGetTextExtentExPointA(hdc, lpszString, cchString, nMaxExtent, lpnFit, lpnDx, lpSize);
-    DEBUG_GDI_EXIT("GetTextExtentExPointA", hdc, ret, hNew);
-    if (ret) {
-        AdjustTextExtentSize(hdc, lpSize, useCount);
-        AdjustPartialExtents(lpnDx, useCount);
+    BOOL ret = FALSE;
+    if (useWide && useCount > 0 &&
+        (!needsAnsiResultMapping || !sourceByteOffsets.empty())) {
+        int wideFit = 0;
+        std::vector<int> wideDx;
+        LPINT useWideDx = NULL;
+        if (lpnDx) {
+            wideDx.assign((size_t)useCount, 0);
+            useWideDx = wideDx.data();
+        }
+        ret = orgGetTextExtentExPointW(
+            hdc, subTextW.c_str(), useCount, nMaxExtent,
+            lpnFit ? &wideFit : NULL, useWideDx, lpSize);
+        if (ret) {
+            AdjustTextExtentSize(hdc, lpSize, useCount);
+            if (lpnFit) {
+                *lpnFit = MapWideFitToAnsiBytes(
+                    wideFit, sourceByteOffsets, sourceLength);
+            }
+            if (lpnDx) {
+                AdjustPartialExtents(wideDx.data(), useCount);
+                MapWidePartialExtentsToAnsiBytes(
+                    sourceByteOffsets, wideDx.data(), useCount,
+                    sourceLength, lpnDx);
+            }
+        }
+    } else {
+        ret = orgGetTextExtentExPointA(
+            hdc, lpszString, cchString, nMaxExtent, lpnFit, lpnDx, lpSize);
+        if (ret) {
+            const int sourceCount = cchString >= 0 ? cchString : sourceLength;
+            AdjustTextExtentSize(hdc, lpSize, sourceCount);
+            AdjustPartialExtents(lpnDx, sourceCount);
+        }
     }
+    DEBUG_GDI_EXIT("GetTextExtentExPointA", hdc, ret, hNew);
     RestoreHdcFont(hdc, hOld, hNew);
     return ret;
 }
