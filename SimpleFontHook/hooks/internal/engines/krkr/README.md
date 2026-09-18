@@ -2,90 +2,82 @@
 
 ## 职责
 
-本目录负责 KiriKiri/TVP 的预渲染 `.tft` 字体路径。适配器控制
-`Layer.font.mapPrerenderedFont` 注册和松散 `.tft` 文件可见性，使文本进入可由通用
-字体钩子处理的实时渲染路径。
+保留 `Font.mapPrerenderedFont` 与 `Font.unmapPrerenderedFont` 的原生注册，在确认
+TVP 原生方法能力后，将预渲染映射调用转交给同一字体实例的解除映射方法，让后续
+实时栅格化进入通用字体钩子。不修改游戏脚本、EXE 文件、TJS 成员名或 TFT 文件。
 
-## 通用路径覆盖范围
+## 入口与依赖
 
-KiriKiri 可以把脚本字体映射到预渲染 TFT。命中该映射后，字形直接来自缓存资源，
-`CreateFont*`、字形查询和 GDI 绘制不会构成完整字体来源。脚本注册与文件存在性又是两条
-独立路径：只处理其中一条，仍可能通过另一条继续加载预渲染字体。
+- `krkr_paths.cppinc`：身份缓存、TVP 插件 ABI 绑定与原生方法分派。
+- `KrkrPatchMapPrerenderedFontName`：保留既有安装入口名称，仅做只读身份检查。
+- `KrkrMaybeWrapGetProcAddress`：由 `newGetProcAddress` 包装 `V2Link` 入口。
+- `KrkrShouldHidePrerenderedFontW`：统一文件分派器的兼容入口，始终透传。
+- 复用现有 Detours、`orgGetProcAddress`、配置和通用 GDI 字体模型，不引入 TJS SDK 库。
 
-适配器在安装阶段控制脚本可见的方法名，并在统一文件分派器中控制松散 TFT 的只读视图，
-使引擎采用实时渲染分支后交由通用字体模型处理。
+## 身份、能力与流程
 
-## 身份与资源
+1. 以主模块的 ANSI 或 Unicode `mapPrerenderedFont` 标记做缓存身份检查；路径、
+   `.tft`、XP3 后缀不作为身份依据。
+2. `V2Link` 在引擎脚本线程传入 TVP exporter。最多保存 16 个不同插件入口，各自使用
+   独立 thunk，原参数、HRESULT 和嵌套插件调用保持不变；不在 `GetProcAddress` 中调用 TJS。
+3. 通过官方导出签名查询全局对象与 Variant 操作，获取 `Font` 的 map/unmap 成员。
+   `TJS_IGNOREPROP` 防止属性 getter 副作用；Variant 构造、清理、类型和对象查询均由引擎执行。
+   x86 exporter 查询入口通过栈中立边界识别 `cdecl`（弹出 0 字节）或 `stdcall`
+   （弹出 16 字节），随后引用计数、属性获取和原生分派使用对应虚接口约定。
+   生成的 TVP 导出辅助函数及 `V2Link` 仍使用 `stdcall`，不随虚接口约定一起切换；
+   x64 使用平台统一调用约定。未知栈清理量不继续绑定。
+4. exporter 查询函数、所需函数及原生分派入口必须属于主模块，避免持有可卸载插件代码。
+   使用引擎创建的临时原生方法核对 `FuncCall`，不把脚本函数或自定义分派器当作原生方法。
+5. Detours 仅在能力全部成立后安装；共享 `FuncCall` 内按 map 方法对象指针精确过滤。
+   开关开启且参数有效时调用原生 unmap 方法，传入原始字体实例、空参数和原结果指针。
+   其他方法、非默认成员调用、无实例、参数不足与开关关闭均调用原始分派。
+6. 不隐藏 TFT，松散字体和归档字体无需分别重定向。接口缺失、类尚未就绪、分派不匹配
+   或 Detours 失败均保留引擎原行为；后续插件链接可重试，最多 32 次。
 
-适配器通过主模块中的 ANSI 或 Unicode `mapPrerenderedFont` 运行时方法标记确认
-KiriKiri/TVP 字体能力。XP3、`.tft` 和目录名称只描述资源位置，不参与引擎身份判断。
-检测结果和入口处理状态在进程生命周期内缓存。
+## 不变量与生命周期
 
-## 文件入口
-
-- `krkr_paths.cppinc`：模块方法定位、方法名处理和 TFT 文件分类。
-- `KrkrPatchMapPrerenderedFontName`：安装阶段处理脚本可见方法名。
-- `KrkrShouldHidePrerenderedFontW`：文件分派器使用的 `.tft` 路径判断。
-
-## 实现原理
-
-1. 在主模块映像内查找 ANSI 或 Unicode `mapPrerenderedFont` 标记，以运行时方法确认能力。
-2. 安装阶段把匹配方法名写成等长内部名称，阻止脚本注册预渲染字体映射。
-3. 文件分派器只对游戏根目录内 `.tft` 的只读打开、属性和存在性查询提供缺失结果。
-4. KiriKiri 回到实时字体创建、字形查询和绘制后，通用钩子应用当前字体与度量配置。
-5. 功能关闭或身份不成立时，方法名和所有 TFT 请求保持引擎原行为。
-
-## 功能
-
-- 在主模块映像中识别 `mapPrerenderedFont` ANSI 与 Unicode 字符串。
-- 使用等长内部名称控制该方法的脚本注册。
-- 对游戏根目录内的 `.tft` 只读请求提供缺失结果，使脚本回退到实时字体渲染。
-- 通过通用 GDI 字体创建、字形查询和文本绘制钩子应用当前字体。
-- 使用有限日志记录方法标记、TFT 请求和处理结果。
-
-## 设计约束依据
-
-- 方法标记同时承担身份与字体能力证据，XP3 和 TFT 后缀只用于资源分类。
-- 等长替换保留模块布局，不引入重定位或字符串长度变化。
-- 内存写入限定在主映像命中位置，并通过 `VirtualProtect` 和指令缓存刷新发布结果。
-- 文件隐藏只作用于读取语义，其他文件和根目录外路径继续调用真实 API。
-- 适配器只负责选择实时渲染路径，字体对象、编码和文字映射仍由通用模块处理。
+- 不重命名 `mapPrerenderedFont`，不依赖脚本具有 `try/catch`，不匹配或改写 `unmap` 子串。
+- map/unmap 对象在安装成功后持有引擎引用，随进程保留；失败路径释放临时引用。
+- 不在字体热路径扫描模块、读写磁盘或分配资源；其他原生方法只增加一次指针判断。
+- 插件槽锁只保护槽分配，不在持锁期间调用插件或引擎。
+- 不在 `DLL_PROCESS_DETACH` 调用 TJS、等待线程或卸载运行时钩子。
+- 字体、代码页与文字映射保持独立；不新增样本专用识别或修改游戏文件。
 
 ## 配置
 
-- `EnableKrkrHook`
-- `KrkrDisablePrerenderedFonts`
-- 通用字体名称、字符集、度量和文字映射配置
+- `EnableKrkrHook=1`：启用身份检查和运行时桥接。
+- `KrkrDisablePrerenderedFonts=1`：已安装的分派在每次 map 调用时读取此开关；关闭时
+  调用原 map，开启时调用 unmap。已有配置的声明、默认值、持久化保持不变。
+- 通用字体设置继续控制实时渲染的字体名称和度量。
 
-## 运行约束
-
-- 引擎方法标记成立后处理模块和匹配的字体请求。
-- 模块扫描限定在主映像范围，内存写入使用 `VirtualProtect` 并刷新指令缓存。
-- 文件分类限定为游戏根目录中的 `.tft`。
-- 字体选择器线程使用真实文件视图。
-- 脚本方法名替换保持字节长度一致。
+开关只影响之后的映射调用，不自动重放历史 `mappfont`，也不遍历所有字体实例。
+游戏已映射的字体需由后续映射调用解除；从开启切到关闭不会自动恢复旧 TFT 映射。
+没有插件链接、插件链接晚于字体映射、主模块之外的 TJS runtime、运行时重建 `Font` 类
+以及绕开原生 map 方法的字体路径均不保证预渲染替换，保持透传而非破坏启动。
+不经过通用 GDI 钩子的栅格器也不在本适配器的字体替换保证范围内。
 
 ## 证据与复刻
 
-1. 在主模块可读映像中分别搜索 ANSI 与 Unicode `mapPrerenderedFont`，记录命中偏移、
-   字节长度、所在节和可写保护状态。
-2. 开关开启时记录 `KrkrPatchMapPrerenderedFontName` 的等长方法名结果，并确认指令缓存刷新。
-3. 对根目录 `.tft` 执行只读打开、属性和存在性查询；对归档内 TFT、根目录外路径、写入和
-   创建请求记录 `org*` 结果。
-4. 使用带预渲染映射和不带映射的脚本各运行一次，比较实时 GDI 字体查询与渲染结果。
+官方 ABI 依据：
+[TJS 分派接口](https://github.com/krkrz/krkrz/blob/master/tjs2/tjsInterface.h)、
+[TVP 导出桥](https://github.com/krkrz/krkrz/blob/master/base/win32/FuncStubs.cpp)、
+[原生方法分派](https://github.com/krkrz/krkrz/blob/master/tjs2/tjsNative.cpp)、
+[Font 的 map/unmap](https://github.com/krkrz/krkrz/blob/master/visual/LayerIntf.cpp)。
 
-| 场景 | 预期结果 |
+上述源码证明接口契约，不等于某个游戏版本已运行验证。版本特例与观察记录写入
+[诊断文档](../../../../../docs/diagnostics.md)。
+
+## 扩展与验证
+
+| 场景 | 预期 |
 | --- | --- |
-| ANSI/Unicode 方法标记均命中 | 身份和字体能力成立，方法名按等长规则处理 |
-| 仅一个标记或无标记 | 不写入模块，不隐藏 TFT |
-| 根目录只读 `.tft` | `KrkrShouldHidePrerenderedFontW` 返回隐藏结果 |
-| 归档 TFT、写入或根目录外路径 | 文件请求调用真实 API |
-| 功能关闭 | 脚本方法名和文件可见性保持引擎状态 |
+| 有效 map、开关开启 | 原成员仍存在，原实例执行 unmap，结果由原生分派清理 |
+| 开关关闭或非 map 调用 | 原始分派接收原参数 |
+| 缺少能力、非目标程序、序号导出查询 | 不安装、不改名、不隐藏文件 |
+| 多插件、重复查询、槽满、嵌套链接 | 原 V2Link 不串线，槽满透传 |
+| TFT 松散文件或 XP3 内资源 | 不改变 Win32 文件可见性 |
+| 参数不足、空实例 | 保留引擎校验及错误码 |
+| x86 cdecl / stdcall 虚接口 | 查询后栈平衡，引用计数、PropGet 和 FuncCall 使用同一约定 |
 
-记录包括模块哈希、命中偏移、方法名字节、文件请求、配置快照和诊断日志。通用字段见
-[功能证据与复刻流程](../../../../../docs/reproduction.md)。
-
-## 验证
-
-覆盖松散 TFT、归档 TFT、ANSI/Unicode 方法名、脚本回退、功能开关、模块写保护、
-热切换、共享 TFT/XP3 后缀和缺少运行时方法标记的程序。
+扩展其他运行时前需单独验证导出、调用约定、对象寿命和初始化时机。C++ 变更检查
+Win32/x64 Release；离线接口夹具只验证分派契约，不能替代游戏中的字体渲染验证。

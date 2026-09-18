@@ -1,19 +1,16 @@
-// KiriKiri / TVP pre-rendered font bypass.
+// KiriKiri / TVP pre-rendered font compatibility.
 //
-// Some KRKR games map *.tft files through Layer.font.mapPrerenderedFont.
-// Those files are TVP pre-rendered glyph caches, not TrueType/OpenType fonts, so
-// GDI font replacement cannot affect text once they are mapped. Disabling the
-// script-visible mapPrerenderedFont entry makes the script's try/catch fall back
-// to normal font rendering. The file hiding path remains for loose-file builds.
+// Some KRKR games map *.tft files through Layer.font.mapPrerenderedFont.  The
+// member is part of the TJS contract: never rename it or hide its resources.
+// V2Link supplies the official TVP exporter on the script thread; use that
+// boundary to redirect only the native map method to the native unmap method.
 
 static volatile LONG g_krkrEngineProbe = -1;
 static volatile LONG g_krkrTraceCount = 0;
 static volatile LONG g_krkrMapPatchAttempted = 0;
 
 static const char kKrkrMapPrerenderedFontA[] = "mapPrerenderedFont";
-static const char kKrkrDisabledPrerenderedFontA[] = "sfhPrerenderedFont";
 static const wchar_t kKrkrMapPrerenderedFontW[] = L"mapPrerenderedFont";
-static const wchar_t kKrkrDisabledPrerenderedFontW[] = L"sfhPrerenderedFont";
 
 static void KrkrTraceLimited(const char* format, ...) {
     if (!Config::EnableDebugLog) return;
@@ -46,80 +43,284 @@ static bool KrkrLooksLikeEngineRoot() {
     return detected;
 }
 
-static bool KrkrIsPrerenderedFontPath(const std::wstring& normalizedFullPath) {
-    return EngineCommon::HasExtension(normalizedFullPath, L".tft");
-}
-
-static bool KrkrPatchBytes(BYTE* address, const BYTE* replacement, size_t len) {
-    DWORD oldProtect = 0;
-    if (!VirtualProtect(address, len, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
-
-    for (size_t i = 0; i < len; ++i) {
-        address[i] = replacement[i];
-    }
-
-    FlushInstructionCache(GetCurrentProcess(), address, len);
-    DWORD ignoredProtect = 0;
-    VirtualProtect(address, len, oldProtect, &ignoredProtect);
-    return true;
-}
-
-static DWORD KrkrPatchPatternInMainModule(const BYTE* pattern, const BYTE* replacement, size_t len) {
-    HMODULE hMain = GetModuleHandleW(NULL);
-    MODULEINFO moduleInfo = {};
-    if (!hMain || !GetModuleInformation(GetCurrentProcess(), hMain, &moduleInfo, sizeof(moduleInfo))) {
-        return 0;
-    }
-
-    BYTE* base = (BYTE*)moduleInfo.lpBaseOfDll;
-    size_t size = moduleInfo.SizeOfImage;
-    if (!base || size < len) return 0;
-
-    DWORD patched = 0;
-    for (size_t offset = 0; offset <= size - len; ++offset) {
-        BYTE* current = base + offset;
-        if (memcmp(current, pattern, len) != 0) continue;
-
-        if (KrkrPatchBytes(current, replacement, len)) {
-            ++patched;
-            offset += len - 1;
-        }
-    }
-    return patched;
-}
-
 static void KrkrPatchMapPrerenderedFontName() {
+    // Keep the native member name intact.  KAG scripts call
+    // Layer.font.mapPrerenderedFont directly during startup. Renaming it
+    // removes that member from the TJS class and makes the engine abort with
+    // "Member mapPrerenderedFont does not exist".  The previous byte patch was
+    // therefore not a safe way to select the GDI rendering path.
     if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts) return;
     if (InterlockedExchange(&g_krkrMapPatchAttempted, 1) != 0) return;
-    if (!KrkrLooksLikeEngineRoot()) return;
-
-    DWORD patched = 0;
-    patched += KrkrPatchPatternInMainModule(
-        (const BYTE*)kKrkrMapPrerenderedFontA,
-        (const BYTE*)kKrkrDisabledPrerenderedFontA,
-        sizeof(kKrkrMapPrerenderedFontA) - 1);
-    patched += KrkrPatchPatternInMainModule(
-        (const BYTE*)kKrkrMapPrerenderedFontW,
-        (const BYTE*)kKrkrDisabledPrerenderedFontW,
-        sizeof(kKrkrMapPrerenderedFontW) - sizeof(wchar_t));
-
-    KrkrTraceLimited("mapPrerenderedFont registration disabled patches=%lu", patched);
+    if (KrkrLooksLikeEngineRoot()) {
+        KrkrTraceLimited(
+            "preserve mapPrerenderedFont registration for TJS compatibility");
+    }
 }
 
 static bool KrkrShouldHidePrerenderedFontW(const wchar_t* fileName) {
-    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts ||
-        IsPickerThread() || !fileName || !fileName[0]) {
-        return false;
+    // A missing TFT can throw just like a missing native member.  The runtime
+    // bridge handles both loose and archived fonts without file virtualization.
+    (void)fileName;
+    return false;
+}
+
+// Minimal public TJS plug-in ABI. No engine C++ object layout, allocator, RTTI
+// or private member offsets cross this boundary. Variant operations are always
+// performed by the exporter (SDK storage: pack(4), 12 bytes x86 / 20 bytes x64).
+struct alignas(8) KrkrVariantStorage { BYTE bytes[24]; };
+using KrkrRefProc = ULONG (__stdcall*)(void*);
+using KrkrRefCdeclProc = ULONG (__cdecl*)(void*);
+using KrkrFuncCallProc = LONG (__stdcall*)(void*, ULONG, const wchar_t*, ULONG*,
+    void*, LONG, void**, void*);
+using KrkrFuncCallCdeclProc = LONG (__cdecl*)(void*, ULONG, const wchar_t*, ULONG*,
+    void*, LONG, void**, void*);
+using KrkrPropGetProc = LONG (__stdcall*)(void*, ULONG, const wchar_t*, ULONG*, void*, void*);
+using KrkrPropGetCdeclProc = LONG (__cdecl*)(void*, ULONG, const wchar_t*, ULONG*, void*, void*);
+using KrkrQueryProc = bool (__stdcall*)(void*, const char**, void**, ULONG);
+using KrkrVariantProc = void (__stdcall*)(void*);
+using KrkrVariantTypeProc = LONG (__stdcall*)(const void*);
+using KrkrVariantObjectProc = void* (__stdcall*)(const void*);
+using KrkrGetGlobalProc = void* (__stdcall*)();
+using KrkrNativeCallback = LONG (__stdcall*)(void*, LONG, void**, void*);
+using KrkrCreateMethodProc = void* (__stdcall*)(KrkrNativeCallback);
+using KrkrV2LinkProc = HRESULT (__stdcall*)(void*);
+
+static void* g_krkrMapMethod = nullptr;
+static void* g_krkrUnmapMethod = nullptr;
+static KrkrFuncCallProc orgKrkrFontFuncCall = nullptr;
+static volatile LONG g_krkrBridgeState = 0; // 0 retryable, 1 binding, 2 installed
+static volatile LONG g_krkrBridgeAttempts = 0;
+static bool g_krkrInterfaceCdecl = false;
+
+#if defined(_M_IX86)
+// TJS_INTF_METHOD differs between engine builds even when export names match.
+// Query through a stack-neutral boundary once: cdecl pops 0 bytes, stdcall 16.
+// Keep this separate from generated TVP export stubs, which remain stdcall.
+static __declspec(naked) bool __stdcall KrkrQueryInterface(void* function,
+    void* exporter, const char** names, void** functions, ULONG count, ULONG* popped) {
+    __asm {
+        push ebp
+        mov ebp, esp
+        push ebx
+        mov ebx, esp
+        push dword ptr [ebp + 24]
+        push dword ptr [ebp + 20]
+        push dword ptr [ebp + 16]
+        push dword ptr [ebp + 12]
+        call dword ptr [ebp + 8]
+        mov edx, esp
+        sub edx, ebx
+        add edx, 16
+        mov ecx, dword ptr [ebp + 28]
+        mov dword ptr [ecx], edx
+        mov esp, ebx
+        pop ebx
+        pop ebp
+        ret 24
     }
+}
+#endif
 
-    std::wstring fullPath = EngineCommon::FullPath(fileName);
-    if (fullPath.empty() || !EngineCommon::IsUnderGameRoot(fullPath)) return false;
+static bool KrkrIsMainModuleCode(const void* address) {
+    HMODULE owner = nullptr;
+    return address && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(address), &owner) && owner == GetModuleHandleW(nullptr);
+}
 
-    std::wstring normalized = EngineCommon::NormalizePath(fullPath);
-    if (!KrkrIsPrerenderedFontPath(normalized)) return false;
-    if (!KrkrLooksLikeEngineRoot()) return false;
+static void KrkrReference(void* object, size_t slot) {
+    if (!object) return;
+    void* function = (*static_cast<void***>(object))[slot];
+    if (g_krkrInterfaceCdecl) reinterpret_cast<KrkrRefCdeclProc>(function)(object);
+    else reinterpret_cast<KrkrRefProc>(function)(object);
+}
 
-    KrkrTraceLimited("hide-prerendered-font request='%s'",
-        EngineCommon::WideToUtf8(fullPath).c_str());
-    return true;
+static void KrkrRelease(void* object) {
+    KrkrReference(object, 1);
+}
+
+static LONG KrkrCallOriginal(void* method, ULONG flags, const wchar_t* member,
+    ULONG* hint, void* result, LONG count, void** params, void* instance) {
+    if (g_krkrInterfaceCdecl) {
+        return reinterpret_cast<KrkrFuncCallCdeclProc>(orgKrkrFontFuncCall)(
+            method, flags, member, hint, result, count, params, instance);
+    }
+    return orgKrkrFontFuncCall(method, flags, member, hint, result, count, params, instance);
+}
+
+static LONG __stdcall newKrkrFontFuncCall(void* method, ULONG flags,
+    const wchar_t* member, ULONG* hint, void* result, LONG count,
+    void** params, void* instance) {
+    if (method == g_krkrMapMethod && !member && instance && count >= 1 &&
+        Config::EnableKrkrHook && Config::KrkrDisablePrerenderedFonts) {
+        // Use the original native dispatch to clear the result and invalidate
+        // the engine's font mapping/cache for this exact font instance. A no-op
+        // would leave an earlier mapping alive after a config change.
+        return KrkrCallOriginal(g_krkrUnmapMethod, flags, nullptr, nullptr,
+            result, 0, nullptr, instance);
+    }
+    return KrkrCallOriginal(method, flags, member, hint, result, count, params, instance);
+}
+
+static LONG __cdecl newKrkrFontFuncCallCdecl(void* method, ULONG flags,
+    const wchar_t* member, ULONG* hint, void* result, LONG count,
+    void** params, void* instance) {
+    return newKrkrFontFuncCall(method, flags, member, hint, result, count, params, instance);
+}
+
+static LONG __stdcall KrkrProbeNativeMethod(void*, LONG, void**, void*) { return 0; }
+static LONG __cdecl KrkrProbeNativeMethodCdecl(void*, LONG, void**, void*) { return 0; }
+
+struct KrkrTjsApi {
+    KrkrGetGlobalProc getGlobal;
+    KrkrVariantProc construct;
+    KrkrVariantProc clear;
+    KrkrVariantTypeProc type;
+    KrkrVariantObjectProc object;
+    KrkrCreateMethodProc createMethod;
+};
+
+static void* KrkrGetObjectMember(const KrkrTjsApi& api, void* owner, const wchar_t* name) {
+    KrkrVariantStorage value = {};
+    api.construct(&value);
+    void* get = (*static_cast<void***>(owner))[4];
+    // TJS_IGNOREPROP: retrieve the member object, not its property getter.
+    const LONG status = g_krkrInterfaceCdecl ?
+        reinterpret_cast<KrkrPropGetCdeclProc>(get)(owner, 0x800, name, nullptr, &value, owner) :
+        reinterpret_cast<KrkrPropGetProc>(get)(owner, 0x800, name, nullptr, &value, owner);
+    void* object = nullptr;
+    if (status >= 0 && api.type(&value) == 1) { // tvtObject
+        object = api.object(&value);
+        KrkrReference(object, 0);
+    }
+    api.clear(&value);
+    return object;
+}
+
+static bool KrkrBindFontMethods(void* exporter) {
+    const char* names[] = {
+        "iTJSDispatch2 * ::TVPGetScriptDispatch()",
+        "tTJSVariant::tTJSVariant()",
+        "void tTJSVariant::Clear()",
+        "tTJSVariantType tTJSVariant::Type() const",
+        "iTJSDispatch2 * tTJSVariant::AsObjectNoAddRef() const",
+        "tTJSNativeClassMethod * ::TJSCreateNativeClassMethod(tTJSNativeClassMethodCallback)"
+    };
+    void* functions[_countof(names)] = {};
+    const auto query = reinterpret_cast<KrkrQueryProc>((*static_cast<void***>(exporter))[1]);
+    if (!KrkrIsMainModuleCode(reinterpret_cast<const void*>(query))) return false;
+#if defined(_M_IX86)
+    ULONG popped = 0;
+    const bool found = KrkrQueryInterface(reinterpret_cast<void*>(query),
+        exporter, names, functions, _countof(names), &popped);
+    if (!found || (popped != 0 && popped != 4 * sizeof(void*))) return false;
+    g_krkrInterfaceCdecl = popped == 0;
+#else
+    if (!query(exporter, names, functions, _countof(names))) return false;
+#endif
+    for (void* function : functions) if (!KrkrIsMainModuleCode(function)) return false;
+    const KrkrTjsApi api = {
+        reinterpret_cast<KrkrGetGlobalProc>(functions[0]),
+        reinterpret_cast<KrkrVariantProc>(functions[1]),
+        reinterpret_cast<KrkrVariantProc>(functions[2]),
+        reinterpret_cast<KrkrVariantTypeProc>(functions[3]),
+        reinterpret_cast<KrkrVariantObjectProc>(functions[4]),
+        reinterpret_cast<KrkrCreateMethodProc>(functions[5])
+    };
+    void* global = api.getGlobal(); // TVPGetScriptDispatch returns an owned reference.
+    if (!global) return false;
+    void* font = KrkrGetObjectMember(api, global, L"Font");
+    KrkrRelease(global);
+    if (!font) return false;
+    void* map = KrkrGetObjectMember(api, font, L"mapPrerenderedFont");
+    void* unmap = KrkrGetObjectMember(api, font, L"unmapPrerenderedFont");
+    KrkrRelease(font);
+    void* probe = api.createMethod(g_krkrInterfaceCdecl ?
+        reinterpret_cast<KrkrNativeCallback>(KrkrProbeNativeMethodCdecl) : KrkrProbeNativeMethod);
+    bool installed = false;
+    if (map && unmap && probe && map != unmap) {
+        void* nativeCall = (*static_cast<void***>(probe))[2];
+        // Do not detour a script dispatcher or a custom Font implementation.
+        // Compare with a native method created by this very engine's SDK.
+        if (KrkrIsMainModuleCode(nativeCall) && nativeCall == (*static_cast<void***>(map))[2] &&
+            nativeCall == (*static_cast<void***>(unmap))[2]) {
+            LONG status = DetourTransactionBegin();
+            if (status == NO_ERROR) {
+                orgKrkrFontFuncCall = reinterpret_cast<KrkrFuncCallProc>(nativeCall);
+                g_krkrMapMethod = map;
+                g_krkrUnmapMethod = unmap;
+                status = DetourUpdateThread(GetCurrentThread());
+                if (status == NO_ERROR) {
+                    PVOID hook = g_krkrInterfaceCdecl ?
+                        reinterpret_cast<PVOID>(newKrkrFontFuncCallCdecl) :
+                        reinterpret_cast<PVOID>(newKrkrFontFuncCall);
+                    status = DetourAttach(reinterpret_cast<PVOID*>(&orgKrkrFontFuncCall), hook);
+                }
+                if (status == NO_ERROR) status = DetourTransactionCommit();
+                else DetourTransactionAbort();
+                installed = status == NO_ERROR;
+                if (!installed) {
+                    orgKrkrFontFuncCall = nullptr;
+                    g_krkrMapMethod = g_krkrUnmapMethod = nullptr;
+                }
+            }
+            Utils::Trace("[TRACE][KRKR] native-font-dispatch install=%d status=%ld interface=%s",
+                installed ? 1 : 0, status, g_krkrInterfaceCdecl ? "cdecl" : "platform-default");
+        }
+    }
+    KrkrRelease(probe);
+    if (!installed) {
+        KrkrRelease(map);
+        KrkrRelease(unmap);
+    }
+    // Installed method references live with the process. No engine calls or
+    // waits are made from DLL_PROCESS_DETACH while holding the loader lock.
+    return installed;
+}
+
+static void KrkrTryBindFontMethods(void* exporter) {
+    if (!exporter || !Config::EnableKrkrHook ||
+        InterlockedCompareExchange(&g_krkrBridgeState, 1, 0) != 0) return;
+    bool installed = false;
+    if (InterlockedIncrement(&g_krkrBridgeAttempts) <= 32) {
+        installed = KrkrBindFontMethods(exporter);
+        if (!installed) KrkrTraceLimited("native-font-dispatch unavailable; preserve native mapping and TFT");
+    }
+    InterlockedExchange(&g_krkrBridgeState, installed ? 2 : 0);
+}
+
+// Fixed thunks keep each plugin's original V2Link distinct, including nested
+// Plugins.link calls. Never replace a single global original on each lookup.
+static SRWLOCK g_krkrLinkLock = SRWLOCK_INIT;
+static KrkrV2LinkProc g_krkrV2Links[16] = {};
+template<size_t Slot> static HRESULT __stdcall KrkrV2Link(void* exporter) {
+    KrkrTryBindFontMethods(exporter);
+    const HRESULT result = g_krkrV2Links[Slot](exporter);
+    if (SUCCEEDED(result)) KrkrTryBindFontMethods(exporter);
+    return result;
+}
+
+static FARPROC KrkrMaybeWrapGetProcAddress(HMODULE module, LPCSTR name, FARPROC original) {
+    if (!module || !original || reinterpret_cast<ULONG_PTR>(name) <= 0xffff ||
+        strcmp(name, "V2Link") != 0 || !Config::EnableKrkrHook ||
+        InterlockedCompareExchange(&g_krkrBridgeState, 2, 2) == 2 ||
+        !KrkrLooksLikeEngineRoot()) return original;
+    static const KrkrV2LinkProc wrappers[] = {
+        KrkrV2Link<0>, KrkrV2Link<1>, KrkrV2Link<2>, KrkrV2Link<3>,
+        KrkrV2Link<4>, KrkrV2Link<5>, KrkrV2Link<6>, KrkrV2Link<7>,
+        KrkrV2Link<8>, KrkrV2Link<9>, KrkrV2Link<10>, KrkrV2Link<11>,
+        KrkrV2Link<12>, KrkrV2Link<13>, KrkrV2Link<14>, KrkrV2Link<15>
+    };
+    FARPROC wrapped = original;
+    AcquireSRWLockExclusive(&g_krkrLinkLock);
+    for (size_t i = 0; i < _countof(g_krkrV2Links); ++i) {
+        if (!g_krkrV2Links[i] || g_krkrV2Links[i] == reinterpret_cast<KrkrV2LinkProc>(original)) {
+            g_krkrV2Links[i] = reinterpret_cast<KrkrV2LinkProc>(original);
+            wrapped = reinterpret_cast<FARPROC>(wrappers[i]);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_krkrLinkLock);
+    if (wrapped == original) KrkrTraceLimited("V2Link slot limit; preserve original plugin entry");
+    return wrapped;
 }

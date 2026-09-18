@@ -276,6 +276,7 @@ HMODULE WINAPI newLoadLibraryExW(LPCWSTR name, HANDLE f, DWORD fl) {
 
 FARPROC WINAPI newGetProcAddress(HMODULE module, LPCSTR name) {
     FARPROC original = orgGetProcAddress(module, name);
+    original = KrkrMaybeWrapGetProcAddress(module, name, original);
     return Yuris::MaybeWrapGetProcAddress(module, name, original);
 }
 

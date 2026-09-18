@@ -1,5 +1,40 @@
 # 诊断与问题定位
 
+## KRKR：启动时缺少 mapPrerenderedFont 成员
+
+截图中的 `first.ks:14` / `mappfont` / `Member 'mapPrerenderedFont' does not exist`
+与所提供脚本第 14 行直接执行 `[mappfont storage=MPLUS1C12.tft]` 相符。代码检查发现
+旧适配器在安装时将主映像中的 `mapPrerenderedFont` 改成内部名称，直接调用该成员的
+脚本因而不能假定会进入异常回退；子串扫描还会命中 `unmapPrerenderedFont`。
+隐藏 TFT 也可能把问题变为字体资源加载异常。
+
+当前适配器保留成员名与文件可见性，在插件 `V2Link` 传入官方 exporter 时绑定
+Font 原生方法，对有效 map 调用转交同实例 unmap。所需接口缺失时透传，不使用
+错误弹窗作为切换字体渲染路径的机制。边界与开关语义见
+[KRKR 模块文档](../SimpleFontHook/hooks/internal/engines/krkr/README.md)。
+
+首次修改仅通过离线接口夹具；该夹具原先只模拟 `stdcall` 虚接口，未覆盖目标
+游戏实际使用的 `cdecl`。后续实际运行证据与修复如下。
+
+## KRKR：TVP 虚接口调用约定导致启动快失败
+
+实际运行 `hfeti_risa_crack.exe` 时，旧 DLL 以 `0xC0000409` 退出，Windows
+Application Error 记录 `WINMM.dll+0x5f305`。调试器捕获的第二次机会异常参数 2
+对应安全 cookie 检查失败，PDB 栈定位到 `KrkrBindFontMethods`，不是脚本弹窗。
+
+目标 EXE 的 `QueryFunctionsByNarrowString`（RVA `0x44700`）使用四个显式栈参数、
+以普通 `ret` 返回；引用计数调用点也由调用者清栈。TVP 导出的 Variant 构造辅助函数
+却以 `ret 4` 返回。因此不能将虚接口和导出辅助函数统一声明为同一种约定。
+当前 x86 桥接在首次查询时保存并恢复 ESP，根据实际清栈量选择 `cdecl` / `stdcall`
+虚接口入口；所有 TVP 导出辅助函数仍保持 `stdcall`。安全 cookie 检查保持开启。
+
+运行验证已备份游戏原 `winmm.dll`，再部署独立输出目录内编译的 Win32 修复版。
+新进程日志记录 `native-font-dispatch install=1 status=0 interface=cdecl`，进程保持
+响应，窗口实际显示房间背景和日文对话，未再停在启动崩溃。未改写游戏 EXE 或脚本，
+未由代理更改字体配置。此结论限定为此次启动和已观察到的对话画面，不代表全流程验证。
+原始 DLL、调用约定反汇编、调试转储及执行记录位于 `artifacts/krkr-compat/runtime/`；
+同一事务的四个交付角色及离线回归记录仍位于 `artifacts/krkr-compat/`。
+
 ## 日志文件
 
 运行日志写入目标程序目录中的 `FontHook.trace.log`。每个进程会话第一次写入时重建

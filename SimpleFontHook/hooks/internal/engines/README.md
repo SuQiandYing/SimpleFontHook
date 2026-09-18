@@ -89,7 +89,7 @@
 | DxLib | `_FONTSET.MED` 缓存一致性 | [dxlib/README.md](dxlib/README.md) |
 | EntisGLS | 位图字体注册、内部字体对象和字形栅格 | [entis/README.md](entis/README.md) |
 | Escu:de | `configure.cfg` 字体配置视图 | [escude/README.md](escude/README.md) |
-| KiriKiri / TVP | `.tft` 预渲染字体路径 | [krkr/README.md](krkr/README.md) |
+| KiriKiri / TVP | 保留 TJS 成员的预渲染字体运行时分派 | [krkr/README.md](krkr/README.md) |
 | Majiro | FCD 磁盘缓存和运行时字形缓存 | [majiro/README.md](majiro/README.md) |
 | Mirai | FreeType 字体数据源和字体文件重定向 | [mirai/README.md](mirai/README.md) |
 | Ren'Py | Python 字体映射、虚拟文件回调和缓存刷新 | [renpy/README.md](renpy/README.md) |
