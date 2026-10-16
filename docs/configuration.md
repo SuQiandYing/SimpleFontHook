@@ -100,7 +100,7 @@
 | [BGI](../SimpleFontHook/hooks/internal/engines/bgi/README.md) | `EnableBgiHook=1`、`BgiPatchGdiImports=1`、`BgiClearGlyphCacheOnSwitch=1` |
 | [Artemis](../SimpleFontHook/hooks/internal/engines/artemis/README.md) | `EnableArtemisHook=1`、`ArtemisPatchTables=1`、`ArtemisRedirectFontFiles=1`、`ArtemisClearFontCacheOnSwitch=1` |
 | [Artemis Legacy](../SimpleFontHook/hooks/internal/engines/artemis_legacy/README.md) | 共享 Artemis 开关、字体路径、字号、间距和文字映射配置 |
-| [KiriKiri](../SimpleFontHook/hooks/internal/engines/krkr/README.md) | `EnableKrkrHook=1`、`KrkrDisablePrerenderedFonts=1` |
+| [KiriKiri](../SimpleFontHook/hooks/internal/engines/krkr/README.md) | `EnableKrkrHook=1`、`KrkrDisablePrerenderedFonts=1`、`KrkrNativeDispatchMode=0` |
 | [Entis](../SimpleFontHook/hooks/internal/engines/entis/README.md) | `EnableEntisHook=1`、`EntisDisableBitmapFonts=1`、`EntisRefreshFontOnSwitch=1` |
 | [Softpal](../SimpleFontHook/hooks/internal/engines/softpal/README.md) | `EnableSoftpalHook=1`、`SoftpalDisableDefaultFontDat=1`、`SoftpalForceDefaultOptionToSystemFont=1` |
 | [Escude](../SimpleFontHook/hooks/internal/engines/escude/README.md) | `EnableEscudeHook=1`、`EscudeVirtualFontConfig=1` |
@@ -116,6 +116,11 @@
 
 BGI 的 `EnableBgiHook` 同时控制 x86/x64 DSC 解码后的 LINE 字体脚本层和 Win32 GDI
 栅格层；`BgiPatchGdiImports`、`BgiClearGlyphCacheOnSwitch` 只作用于 Win32 GDI 路径。
+KiriKiri 的 `KrkrDisablePrerenderedFonts=1` 默认使用安全自动判定：已验证的 TVP
+1.4.x 版本才启用 2.6 原生分派桥接，旧版本、版本信息缺失或能力未知时透传 TFT。
+设置 `KrkrDisablePrerenderedFonts=0` 或 `KrkrNativeDispatchMode=2` 可始终关闭桥接；
+`KrkrNativeDispatchMode=1` 仅用于已经确认 ABI 兼容但版本无法自动识别的目标。
+详细行为见 [KiriKiri 适配器说明](../SimpleFontHook/hooks/internal/engines/krkr/README.md)。
 LINE 脚本能力默认自动检测，不要求单独配置或外置 `scrdrv._bp`。
 
 Artemis 还保存 `ArtemisFontPath`、`ArtemisFontSize=0` 和 `ArtemisRubySize=-1`。

@@ -446,10 +446,11 @@ static void TraceLogCurrentConfig(const char* prefix, LONG version) {
         artemisFontPath,
         Config::ArtemisFontSize,
         Config::ArtemisRubySize);
-    Utils::Trace("[TRACE][v%ld] krkr enabled=%d disablePrerenderedFonts=%d",
+    Utils::Trace("[TRACE][v%ld] krkr enabled=%d disablePrerenderedFonts=%d nativeDispatchMode=%d",
         version,
         Config::EnableKrkrHook ? 1 : 0,
-        Config::KrkrDisablePrerenderedFonts ? 1 : 0);
+        Config::KrkrDisablePrerenderedFonts ? 1 : 0,
+        Config::KrkrNativeDispatchMode);
     Utils::Trace("[TRACE][v%ld] entis enabled=%d disableBitmapFonts=%d refreshFontOnSwitch=%d",
         version,
         Config::EnableEntisHook ? 1 : 0,

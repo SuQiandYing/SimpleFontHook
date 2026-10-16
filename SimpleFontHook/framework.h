@@ -10,6 +10,12 @@ namespace Config {
         TextSubstitutionModeSimplifiedToTraditional = 2,
     };
 
+    enum KrkrNativeDispatchModeValue : int {
+        KrkrNativeDispatchAuto = 0,
+        KrkrNativeDispatchForce = 1,
+        KrkrNativeDispatchDisabled = 2,
+    };
+
     extern bool EnableFontHook;
     extern bool EnableFaceNameReplace;
     extern bool EnableCharsetReplace;
@@ -43,6 +49,7 @@ namespace Config {
     extern bool ArtemisClearFontCacheOnSwitch;
     extern bool EnableKrkrHook;
     extern bool KrkrDisablePrerenderedFonts;
+    extern int KrkrNativeDispatchMode;
     extern bool EnableEntisHook;
     extern bool EntisDisableBitmapFonts;
     extern bool EntisRefreshFontOnSwitch;

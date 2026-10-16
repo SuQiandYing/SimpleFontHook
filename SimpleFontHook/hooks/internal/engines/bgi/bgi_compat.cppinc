@@ -7,6 +7,12 @@ namespace {
 
 } // namespace
 
+static bool ShouldPreserveLogicalOutlineFontNames() {
+    // Some BGI builds validate the requested face against OTM names and
+    // recursively recreate the font when a replacement face is exposed.
+    return HasBgiIdentity();
+}
+
 #ifndef _WIN64
 
 namespace {

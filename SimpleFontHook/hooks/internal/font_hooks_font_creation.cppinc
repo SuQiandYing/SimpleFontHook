@@ -31,7 +31,8 @@ HFONT WINAPI newCreateFontA(int nH, int nW, int nE, int nO, int nWt, DWORD fI, D
     if (Config::EnableFontHook && Config::EnableFaceNameReplace) {
         LOGFONTW replacementLogfont = MakeSourceLogFontW(
             fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, Config::ForcedFontNameW);
-        BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, replacementLogfont);
+        BgiCompat::NormalizeReplacementFontMetrics(
+            sourceLogfont, replacementLogfont, _ReturnAddress());
         fH = replacementLogfont.lfHeight;
         fW = replacementLogfont.lfWidth;
         hFont = orgCreateFontW(fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, Config::ForcedFontNameW);
@@ -91,7 +92,8 @@ HFONT WINAPI newCreateFontIndirectA(const LOGFONTA* lplf) {
 
     LOGFONTW replacementLogfont = {};
     LogFontAToW(lf, replacementLogfont);
-    if (BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, replacementLogfont)) {
+    if (BgiCompat::NormalizeReplacementFontMetrics(
+        sourceLogfont, replacementLogfont, _ReturnAddress())) {
         lf.lfHeight = replacementLogfont.lfHeight;
         lf.lfWidth = replacementLogfont.lfWidth;
     }
@@ -126,7 +128,7 @@ HFONT WINAPI newCreateFontW(int nH, int nW, int nE, int nO, int nWt, DWORD fI, D
 
     LOGFONTW replacementLogfont = MakeSourceLogFontW(
         fH, fW, nE, nO, fWt, fI, fU, fS, fCs, fOP, fCP, fQ, fPF, fF);
-    BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, replacementLogfont);
+    BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, replacementLogfont, _ReturnAddress());
     fH = replacementLogfont.lfHeight;
     fW = replacementLogfont.lfWidth;
 
@@ -154,7 +156,7 @@ HFONT WINAPI newCreateFontIndirectW(const LOGFONTW* lplf) {
     if (Config::EnableFontHeightScale) lf.lfHeight = ScaleLogFontValue(lf.lfHeight, Config::FontHeightScale);
     if (Config::EnableFontWidthScale) lf.lfWidth = ScaleLogFontWidth(lf.lfWidth, lf.lfHeight);
     if (Config::EnableFontWeight && Config::FontWeight > 0) lf.lfWeight = Config::FontWeight;
-    BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, lf);
+    BgiCompat::NormalizeReplacementFontMetrics(sourceLogfont, lf, _ReturnAddress());
 
     HFONT hFont = orgCreateFontIndirectW(&lf);
     RegisterCreatedReplacementFont(hFont, sourceLogfont);

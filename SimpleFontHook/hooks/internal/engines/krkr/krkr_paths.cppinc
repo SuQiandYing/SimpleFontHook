@@ -8,6 +8,7 @@
 static volatile LONG g_krkrEngineProbe = -1;
 static volatile LONG g_krkrTraceCount = 0;
 static volatile LONG g_krkrMapPatchAttempted = 0;
+static volatile LONG g_krkrNativeDispatchPolicy = -1;
 
 static const char kKrkrMapPrerenderedFontA[] = "mapPrerenderedFont";
 static const wchar_t kKrkrMapPrerenderedFontW[] = L"mapPrerenderedFont";
@@ -43,13 +44,88 @@ static bool KrkrLooksLikeEngineRoot() {
     return detected;
 }
 
+struct KrkrModuleVersion {
+    WORD major;
+    WORD minor;
+    WORD build;
+    WORD revision;
+};
+
+static bool KrkrReadMainModuleVersion(KrkrModuleVersion* version) {
+    if (!version) return false;
+    *version = {};
+
+    wchar_t modulePath[MAX_PATH] = {};
+    const DWORD pathLength = GetModuleFileNameW(
+        GetModuleHandleW(nullptr), modulePath, _countof(modulePath));
+    if (pathLength == 0 || pathLength >= _countof(modulePath)) return false;
+
+    DWORD ignoredHandle = 0;
+    const DWORD infoSize = GetFileVersionInfoSizeW(modulePath, &ignoredHandle);
+    if (infoSize == 0 || infoSize > 1024 * 1024) return false;
+
+    std::vector<BYTE> info(infoSize);
+    if (!GetFileVersionInfoW(modulePath, 0, infoSize, info.data())) return false;
+
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT fixedSize = 0;
+    if (!VerQueryValueW(info.data(), L"\\", reinterpret_cast<LPVOID*>(&fixed),
+        &fixedSize) || !fixed || fixedSize < sizeof(VS_FIXEDFILEINFO) ||
+        fixed->dwSignature != VS_FFI_SIGNATURE) {
+        return false;
+    }
+
+    version->major = HIWORD(fixed->dwFileVersionMS);
+    version->minor = LOWORD(fixed->dwFileVersionMS);
+    version->build = HIWORD(fixed->dwFileVersionLS);
+    version->revision = LOWORD(fixed->dwFileVersionLS);
+    return true;
+}
+
+static bool KrkrAutoNativeDispatchCompatible() {
+    LONG cached = InterlockedCompareExchange(
+        &g_krkrNativeDispatchPolicy, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    KrkrModuleVersion version = {};
+    const bool hasVersion = KrkrReadMainModuleVersion(&version);
+    // The ABI bridge has been runtime-verified against TVP 1.4.0.8. The
+    // older 1.3.x ABI can crash before QueryFunctionsByNames returns, so an
+    // unrecognised or older module must remain on the native path.
+    const bool compatible = hasVersion && version.major == 1 && version.minor >= 4;
+    InterlockedExchange(&g_krkrNativeDispatchPolicy, compatible ? 1 : 0);
+    if (hasVersion) {
+        KrkrTraceLimited(
+            "native-font-dispatch policy=auto version=%u.%u.%u.%u compatible=%d",
+            version.major, version.minor, version.build, version.revision,
+            compatible ? 1 : 0);
+    } else {
+        KrkrTraceLimited(
+            "native-font-dispatch policy=auto version=unknown compatible=0");
+    }
+    return compatible;
+}
+
+static bool KrkrNativeFontDispatchEnabled() {
+    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts) return false;
+    if (Config::KrkrNativeDispatchMode == Config::KrkrNativeDispatchDisabled) return false;
+    if (Config::KrkrNativeDispatchMode == Config::KrkrNativeDispatchForce) return true;
+    return KrkrLooksLikeEngineRoot() && KrkrAutoNativeDispatchCompatible();
+}
+
 static void KrkrPatchMapPrerenderedFontName() {
     // Keep the native member name intact.  KAG scripts call
     // Layer.font.mapPrerenderedFont directly during startup. Renaming it
     // removes that member from the TJS class and makes the engine abort with
     // "Member mapPrerenderedFont does not exist".  The previous byte patch was
     // therefore not a safe way to select the GDI rendering path.
-    if (!Config::EnableKrkrHook || !Config::KrkrDisablePrerenderedFonts) return;
+    if (!KrkrNativeFontDispatchEnabled()) {
+        if (Config::EnableKrkrHook) {
+            KrkrTraceLimited(
+                "native-font-dispatch disabled or incompatible; preserve native mapping and TFT");
+        }
+        return;
+    }
     if (InterlockedExchange(&g_krkrMapPatchAttempted, 1) != 0) return;
     if (KrkrLooksLikeEngineRoot()) {
         KrkrTraceLimited(
@@ -152,7 +228,7 @@ static LONG __stdcall newKrkrFontFuncCall(void* method, ULONG flags,
     const wchar_t* member, ULONG* hint, void* result, LONG count,
     void** params, void* instance) {
     if (method == g_krkrMapMethod && !member && instance && count >= 1 &&
-        Config::EnableKrkrHook && Config::KrkrDisablePrerenderedFonts) {
+        KrkrNativeFontDispatchEnabled()) {
         // Use the original native dispatch to clear the result and invalidate
         // the engine's font mapping/cache for this exact font instance. A no-op
         // would leave an earlier mapping alive after a config change.
@@ -279,7 +355,7 @@ static bool KrkrBindFontMethods(void* exporter) {
 }
 
 static void KrkrTryBindFontMethods(void* exporter) {
-    if (!exporter || !Config::EnableKrkrHook ||
+    if (!exporter || !KrkrNativeFontDispatchEnabled() ||
         InterlockedCompareExchange(&g_krkrBridgeState, 1, 0) != 0) return;
     bool installed = false;
     if (InterlockedIncrement(&g_krkrBridgeAttempts) <= 32) {
@@ -302,7 +378,7 @@ template<size_t Slot> static HRESULT __stdcall KrkrV2Link(void* exporter) {
 
 static FARPROC KrkrMaybeWrapGetProcAddress(HMODULE module, LPCSTR name, FARPROC original) {
     if (!module || !original || reinterpret_cast<ULONG_PTR>(name) <= 0xffff ||
-        strcmp(name, "V2Link") != 0 || !Config::EnableKrkrHook ||
+        strcmp(name, "V2Link") != 0 || !KrkrNativeFontDispatchEnabled() ||
         InterlockedCompareExchange(&g_krkrBridgeState, 2, 2) == 2 ||
         !KrkrLooksLikeEngineRoot()) return original;
     static const KrkrV2LinkProc wrappers[] = {

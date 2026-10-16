@@ -161,6 +161,68 @@ DWORD WINAPI newGetGlyphIndicesW(HDC hdc, LPCWSTR lpstr, int c, LPWORD pgi, DWOR
 }
 
 // Font info supplement hooks.
+static bool TryGetLogicalOutlineFontName(HDC hdc, LOGFONTW* sourceLogfont) {
+    if (!hdc || !sourceLogfont ||
+        !Config::EnableFontHook || !Config::EnableFaceNameReplace ||
+        !BgiCompat::ShouldPreserveLogicalOutlineFontNames()) {
+        return false;
+    }
+
+    HFONT currentFont = (HFONT)orgGetCurrentObject(hdc, OBJ_FONT);
+    ReplacementFontInfo replacementInfo = {};
+    if (!currentFont || !TryGetReplacementInfo(currentFont, &replacementInfo) ||
+        !replacementInfo.sourceLogfont.lfFaceName[0]) {
+        return false;
+    }
+
+    *sourceLogfont = replacementInfo.sourceLogfont;
+    return true;
+}
+
+static bool CopyLogicalOutlineFontNameW(UINT cbData,
+    LPOUTLINETEXTMETRICW lpOTM, const wchar_t* sourceName) {
+    if (!lpOTM || !sourceName || !sourceName[0] ||
+        cbData < sizeof(OUTLINETEXTMETRICW)) {
+        return false;
+    }
+
+    const uintptr_t offset = reinterpret_cast<uintptr_t>(lpOTM->otmpFaceName);
+    if (offset < sizeof(OUTLINETEXTMETRICW) || offset >= cbData) return false;
+
+    const size_t length = wcsnlen_s(sourceName, LF_FACESIZE);
+    if (length >= LF_FACESIZE) return false;
+    const size_t bytes = (length + 1) * sizeof(wchar_t);
+    if (bytes > cbData - offset) return false;
+
+    memcpy(reinterpret_cast<BYTE*>(lpOTM) + offset, sourceName, bytes);
+    return true;
+}
+
+static bool CopyLogicalOutlineFontNameA(UINT cbData,
+    LPOUTLINETEXTMETRICA lpOTM, const wchar_t* sourceName) {
+    if (!lpOTM || !sourceName || !sourceName[0] ||
+        cbData < sizeof(OUTLINETEXTMETRICA)) {
+        return false;
+    }
+
+    char name[LF_FACESIZE] = {};
+    if (WideCharToMultiByte(CP_ACP, 0, sourceName, -1,
+        name, _countof(name), NULL, NULL) <= 0) {
+        return false;
+    }
+
+    const uintptr_t offset = reinterpret_cast<uintptr_t>(lpOTM->otmpFaceName);
+    if (offset < sizeof(OUTLINETEXTMETRICA) || offset >= cbData) return false;
+
+    const size_t length = strnlen_s(name, _countof(name));
+    if (length >= _countof(name)) return false;
+    const size_t bytes = length + 1;
+    if (bytes > cbData - offset) return false;
+
+    memcpy(reinterpret_cast<BYTE*>(lpOTM) + offset, name, bytes);
+    return true;
+}
+
 UINT WINAPI newGetOutlineTextMetricsA(HDC hdc, UINT cbData, LPOUTLINETEXTMETRICA lpOTM) {
     DEBUG_API_CONTEXT("GetOutlineTextMetricsA");
     if (IsPickerThread()) return orgGetOutlineTextMetricsA(hdc, cbData, lpOTM);
@@ -169,7 +231,13 @@ UINT WINAPI newGetOutlineTextMetricsA(HDC hdc, UINT cbData, LPOUTLINETEXTMETRICA
     DEBUG_GDI_ENTER("GetOutlineTextMetricsA", hdc, hNew);
     UINT ret = orgGetOutlineTextMetricsA(hdc, cbData, lpOTM);
     DEBUG_GDI_EXIT("GetOutlineTextMetricsA", hdc, ret, hNew);
-    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICA)) PatchOutlineTextMetric(hdc, lpOTM);
+    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICA)) {
+        PatchOutlineTextMetric(hdc, lpOTM);
+        LOGFONTW sourceLogfont = {};
+        if (TryGetLogicalOutlineFontName(hdc, &sourceLogfont)) {
+            CopyLogicalOutlineFontNameA(cbData, lpOTM, sourceLogfont.lfFaceName);
+        }
+    }
     RestoreHdcFont(hdc, hOld, hNew);
     return ret;
 }
@@ -182,7 +250,13 @@ UINT WINAPI newGetOutlineTextMetricsW(HDC hdc, UINT cbData, LPOUTLINETEXTMETRICW
     DEBUG_GDI_ENTER("GetOutlineTextMetricsW", hdc, hNew);
     UINT ret = orgGetOutlineTextMetricsW(hdc, cbData, lpOTM);
     DEBUG_GDI_EXIT("GetOutlineTextMetricsW", hdc, ret, hNew);
-    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICW)) PatchOutlineTextMetric(hdc, lpOTM);
+    if (ret && lpOTM && cbData >= sizeof(OUTLINETEXTMETRICW)) {
+        PatchOutlineTextMetric(hdc, lpOTM);
+        LOGFONTW sourceLogfont = {};
+        if (TryGetLogicalOutlineFontName(hdc, &sourceLogfont)) {
+            CopyLogicalOutlineFontNameW(cbData, lpOTM, sourceLogfont.lfFaceName);
+        }
+    }
     RestoreHdcFont(hdc, hOld, hNew);
     return ret;
 }

@@ -45,7 +45,8 @@ namespace Config {
     bool ArtemisRedirectFontFiles = true;
     bool ArtemisClearFontCacheOnSwitch = true;
     bool EnableKrkrHook = true;
-    bool KrkrDisablePrerenderedFonts = true;
+    bool KrkrDisablePrerenderedFonts = false;
+    int KrkrNativeDispatchMode = KrkrNativeDispatchAuto;
     bool EnableEntisHook = true;
     bool EntisDisableBitmapFonts = true;
     bool EntisRefreshFontOnSwitch = true;
@@ -878,6 +879,7 @@ namespace Utils {
         AppendIniInt(out, "ArtemisRubySize", Config::ArtemisRubySize);
         AppendIniBool(out, "EnableKrkrHook", Config::EnableKrkrHook);
         AppendIniBool(out, "KrkrDisablePrerenderedFonts", Config::KrkrDisablePrerenderedFonts);
+        AppendIniInt(out, "KrkrNativeDispatchMode", Config::KrkrNativeDispatchMode);
         AppendIniBool(out, "EnableEntisHook", Config::EnableEntisHook);
         AppendIniBool(out, "EntisDisableBitmapFonts", Config::EntisDisableBitmapFonts);
         AppendIniBool(out, "EntisRefreshFontOnSwitch", Config::EntisRefreshFontOnSwitch);
@@ -962,25 +964,26 @@ namespace Utils {
 
         IniEntries kv = ParseIni(content);
         const std::string* fontNameWValue = FindIniValue(kv, "FontNameW");
-        if (!fontNameWValue) return false;
+        if (fontNameWValue) {
+            // Restore font names. Engine-only compatibility files may omit
+            // FontNameW and leave the compiled defaults unchanged.
+            std::wstring fontW = Utf8ToWide(*fontNameWValue);
+            if (LooksLikeInternalMetricCloneName(fontW)) {
+                Trace("[Config] Ignored saved internal metric clone font name.");
+                fontW.clear();
+            }
+            wcsncpy_s(Config::ForcedFontNameW, fontW.c_str(), LF_FACESIZE - 1);
+            wcsncpy_s(Config::SourceFontNameW, fontW.c_str(), LF_FACESIZE - 1);
 
-        // Restore font names
-        std::wstring fontW = Utf8ToWide(*fontNameWValue);
-        if (LooksLikeInternalMetricCloneName(fontW)) {
-            Trace("[Config] Ignored saved internal metric clone font name.");
-            fontW.clear();
+            if (const std::string* fontNameAValue = FindIniValue(kv, "FontNameA")) {
+                std::wstring fontAW = Utf8ToWide(*fontNameAValue);
+                if (LooksLikeInternalMetricCloneName(fontAW)) fontAW.clear();
+                WideCharToMultiByte(CP_ACP, 0, fontAW.c_str(), -1, Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+            } else {
+                WideCharToMultiByte(CP_ACP, 0, Config::ForcedFontNameW, -1, Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
+            }
+            Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
         }
-        wcsncpy_s(Config::ForcedFontNameW, fontW.c_str(), LF_FACESIZE - 1);
-        wcsncpy_s(Config::SourceFontNameW, fontW.c_str(), LF_FACESIZE - 1);
-
-        if (const std::string* fontNameAValue = FindIniValue(kv, "FontNameA")) {
-            std::wstring fontAW = Utf8ToWide(*fontNameAValue);
-            if (LooksLikeInternalMetricCloneName(fontAW)) fontAW.clear();
-            WideCharToMultiByte(CP_ACP, 0, fontAW.c_str(), -1, Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
-        } else {
-            WideCharToMultiByte(CP_ACP, 0, Config::ForcedFontNameW, -1, Config::ForcedFontNameA, LF_FACESIZE - 1, NULL, NULL);
-        }
-        Config::ForcedFontNameA[LF_FACESIZE - 1] = '\0';
 
         Config::EnableFontHook = ReadIniInt(kv, "EnableFontHook", 0) != 0;
         Config::EnableFaceNameReplace = ReadIniInt(kv, "EnableFaceNameReplace", 0) != 0;
@@ -1045,7 +1048,13 @@ namespace Utils {
         Config::ArtemisRedirectFontFiles = ReadIniInt(kv, "ArtemisRedirectFontFiles", 1) != 0;
         Config::ArtemisClearFontCacheOnSwitch = ReadIniInt(kv, "ArtemisClearFontCacheOnSwitch", 1) != 0;
         Config::EnableKrkrHook = ReadIniInt(kv, "EnableKrkrHook", 1) != 0;
-        Config::KrkrDisablePrerenderedFonts = ReadIniInt(kv, "KrkrDisablePrerenderedFonts", 1) != 0;
+        Config::KrkrDisablePrerenderedFonts = ReadIniInt(kv, "KrkrDisablePrerenderedFonts", 0) != 0;
+        Config::KrkrNativeDispatchMode = ReadIniInt(kv, "KrkrNativeDispatchMode",
+            Config::KrkrNativeDispatchAuto);
+        if (Config::KrkrNativeDispatchMode < Config::KrkrNativeDispatchAuto ||
+            Config::KrkrNativeDispatchMode > Config::KrkrNativeDispatchDisabled) {
+            Config::KrkrNativeDispatchMode = Config::KrkrNativeDispatchAuto;
+        }
         Config::EnableEntisHook = ReadIniInt(kv, "EnableEntisHook", 1) != 0;
         Config::EntisDisableBitmapFonts = ReadIniInt(kv, "EntisDisableBitmapFonts", 1) != 0;
         Config::EntisRefreshFontOnSwitch = ReadIniInt(kv, "EntisRefreshFontOnSwitch", 1) != 0;

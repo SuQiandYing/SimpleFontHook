@@ -120,5 +120,7 @@ static volatile LONG g_active = 0;
 static volatile LONG g_cacheObserveTraceCount = 0;
 static volatile LONG g_cacheClearTraceCount = 0;
 static volatile LONG g_metricNormalizationTraceCount = 0;
+static volatile LONG g_metricNormalizationSkipTraceCount = 0;
 static LONG g_installConfigVersion = 0;
+static CodeRange g_user32CodeRange = {};
 static __declspec(thread) unsigned int g_textOutputDepth = 0;

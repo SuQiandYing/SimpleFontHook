@@ -35,6 +35,66 @@ Application Error 记录 `WINMM.dll+0x5f305`。调试器捕获的第二次机会
 原始 DLL、调用约定反汇编、调试转储及执行记录位于 `artifacts/krkr-compat/runtime/`；
 同一事务的四个交付角色及离线回归记录仍位于 `artifacts/krkr-compat/`。
 
+## KRKR：预渲染字体桥接兼容回退
+
+`native-font-dispatch install=1` 只证明 `V2Link` 已提供可绑定接口且 `FuncCall` Detour
+安装成功，不证明该游戏后续的 `mapPrerenderedFont` 调用已经通过，也不能单独证明崩溃
+发生在 Detour 内。没有异常码或故障地址时，先用单变量配置确认问题是否由运行时桥接触发。
+
+在目标目录的 `FontHook.ini` 中设置，并在下一次启动前生效：
+
+```ini
+[FontHook]
+KrkrDisablePrerenderedFonts=0
+```
+
+此模式不包装插件 `V2Link`，也不安装共享 `FuncCall` Detour；原生 TFT 映射与文件访问保持
+不变，通用字体 API 钩子和其他 2.6 适配器仍可使用。代价是 TFT 预渲染文字不会由 Krkr
+适配器切换到实时字体路径。移除此键或设为 `1` 可恢复默认 2.6 桥接行为。
+
+对照测试时记录是否在进入首个场景前退出、是否在首次 `mappfont` 后退出，并保存单次
+`FontHook.trace.log`、Windows Application Error 的异常码/故障模块/故障偏移及 DLL 哈希。
+如果关闭桥接后仍出现同一故障，应转查代理导出或其他通用钩子，不应把问题归因于
+`FuncCall` Detour。
+
+### 版本能力门控
+
+`KrkrDisablePrerenderedFonts=1` 不再直接代表“对所有 TVP 强制安装 2.6 ABI
+桥接”。自动模式先读取主模块固定文件版本，再决定是否允许进入 `V2Link`、
+`TVPGetScriptDispatch` 和 `FuncCall` 路径。当前已验证的能力范围是 TVP `1.4.x`；
+低于 `1.4.0.0`、没有版本资源或其他未知版本保持原生 map/unmap 和 TFT 路径。
+
+目标 `恋愛、借りちゃいました.exe` 的固定文件版本为 `1.3.3.7`，因此即使目录中
+保留旧的 `KrkrDisablePrerenderedFonts=1`，自动模式也不会触碰不兼容的 TVP 虚接口。
+支持 2.6 桥接的 `hfeti_risa_crack.exe` 固定文件版本为 `1.4.0.8`，自动模式允许
+继续执行原有的 2.6 绑定；若目标没有版本资源但已经确认 ABI，可显式设置：
+
+```ini
+[FontHook]
+KrkrDisablePrerenderedFonts=1
+KrkrNativeDispatchMode=1
+```
+
+`KrkrNativeDispatchMode=2` 或 `KrkrDisablePrerenderedFonts=0` 始终关闭桥接。
+自动模式的判定依据是主模块版本和 TVP 能力证据，不使用单个游戏文件名。
+
+## BGI：系统对话框字体触发度量探测
+
+当 BGI 栅格兼容已启用时，`CreateFont*` 钩子会在游戏字体创建路径同步测量源字体与替换
+字体的字形度量。若转储栈显示该路径由 `user32.dll` 的系统对话框代码发起，继续执行
+多轮 BGI 度量探测可能耗尽较深 UI 调用栈。当前处理仅让这类系统 UI 请求跳过 BGI 专用
+尺寸归一化；通用字体名称替换、游戏模块发起的 BGI 度量归一化及其他引擎功能保持启用。
+日志以 `[DEBUG][BGI] metric normalization skipped reason=user32-font-request` 标记该回退。
+
+## BGI：OTM 逻辑字体名递归
+
+部分 BGI 字体初始化函数会将 `GetOutlineTextMetricsW` 的 `otmpFaceName` 与原始请求名比较。
+字体替换后如果直接返回替换字体名，函数会递归重建字体，最终表现为 `0xC00000FD`
+栈溢出。当前 BGI 身份确认后，OTM 查询只在输出缓冲区边界通过、且当前 HFONT 具备源
+`LOGFONT` 元数据时恢复源逻辑 face name；实际替换字体、度量值和其他引擎路径不变。
+该回退不依赖 `BgiPatchGdiImports` 或字形缓存刷新开关。验证时应记录进程退出码不是
+`0xC00000FD`，以及目标程序仍能进入初始场景。
+
 ## 日志文件
 
 运行日志写入目标程序目录中的 `FontHook.trace.log`。每个进程会话第一次写入时重建

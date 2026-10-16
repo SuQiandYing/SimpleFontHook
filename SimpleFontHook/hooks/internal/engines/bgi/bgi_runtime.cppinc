@@ -57,6 +57,14 @@ static void InstallInOpenDetourTransaction() {
         matched ? 1 : 0);
     if (!matched) return;
 
+    HMODULE user32Module = GetModuleHandleW(L"user32.dll");
+    MODULEINFO user32Info = {};
+    if (user32Module && GetModuleInformation(
+        GetCurrentProcess(), user32Module, &user32Info, sizeof(user32Info))) {
+        g_user32CodeRange.begin = static_cast<BYTE*>(user32Info.lpBaseOfDll);
+        g_user32CodeRange.end = g_user32CodeRange.begin + user32Info.SizeOfImage;
+    }
+
     g_installConfigVersion = Config::ConfigVersion;
     size_t attachedLayouts = 0;
     if (Config::BgiClearGlyphCacheOnSwitch) {
@@ -75,12 +83,24 @@ static void InstallInOpenDetourTransaction() {
         g_cacheLayouts.size(), attachedLayouts, patchedImports);
 }
 
-static bool NormalizeReplacementFontMetrics(const LOGFONTW& sourceLogfont, LOGFONTW& replacementLogfont) {
+static bool NormalizeReplacementFontMetrics(const LOGFONTW& sourceLogfont,
+    LOGFONTW& replacementLogfont, const void* callerAddress) {
     if (InterlockedCompareExchange(&g_active, 0, 0) == 0 || IsPickerThread() ||
         !Config::EnableFontHook || !Config::EnableFaceNameReplace ||
         sourceLogfont.lfHeight == 0 || replacementLogfont.lfHeight == 0 ||
         sourceLogfont.lfEscapement != 0 || replacementLogfont.lfEscapement != 0 ||
         sourceLogfont.lfOrientation != 0 || replacementLogfont.lfOrientation != 0) {
+        return false;
+    }
+
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(callerAddress);
+    const uintptr_t user32Begin = reinterpret_cast<uintptr_t>(g_user32CodeRange.begin);
+    const uintptr_t user32End = reinterpret_cast<uintptr_t>(g_user32CodeRange.end);
+    if (callerAddress && user32Begin != 0 && caller >= user32Begin && caller < user32End) {
+        if (InterlockedIncrement(&g_metricNormalizationSkipTraceCount) <= 8) {
+            Utils::Trace("[DEBUG][BGI] metric normalization skipped reason=user32-font-request caller=%p",
+                callerAddress);
+        }
         return false;
     }
 
@@ -322,7 +342,7 @@ static void InstallInOpenDetourTransaction() {
     InstallBgiLineFontInOpenDetourTransaction();
 }
 
-static bool NormalizeReplacementFontMetrics(const LOGFONTW&, LOGFONTW&) {
+static bool NormalizeReplacementFontMetrics(const LOGFONTW&, LOGFONTW&, const void*) {
     return false;
 }
 
