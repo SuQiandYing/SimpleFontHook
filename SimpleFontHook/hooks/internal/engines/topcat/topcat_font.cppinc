@@ -1,0 +1,532 @@
+namespace TopCatCompat {
+
+static volatile LONG g_engineProbe = -1;
+static volatile LONG g_patchAttempted = 0;
+static volatile LONG g_wrapperTraceCount = 0;
+static volatile LONG g_actualFaceTraceCount = 0;
+static volatile LONG g_metricPatchTraceCount = 0;
+static BYTE* g_metricReturnSites[16] = {};
+static size_t g_metricReturnSiteCount = 0;
+
+static const LONG kTopCatGlyphDimensionLimit = 560;
+
+static const char* const kTopCatMarkers[] = {
+    "TOPCAT",
+    "(C) 2009 TOPCAT",
+};
+
+static const char* const kTopCatContainerMagics[] = {
+    "TCD3",
+};
+
+static bool IsReadableRange(const BYTE* address, size_t length) {
+    if (!address || length == 0) return false;
+
+    MEMORY_BASIC_INFORMATION memory = {};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t regionBegin = reinterpret_cast<uintptr_t>(memory.BaseAddress);
+    const uintptr_t regionEnd = regionBegin + memory.RegionSize;
+    return begin >= regionBegin && begin <= regionEnd &&
+        length <= regionEnd - begin;
+}
+
+static bool IsImageRange(const BYTE* imageBase, size_t imageSize,
+    const void* address, size_t length) {
+    if (!imageBase || !address || length == 0) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(imageBase);
+    const uintptr_t value = reinterpret_cast<uintptr_t>(address);
+    return value >= base && length <= imageSize && value - base <= imageSize - length;
+}
+
+static BYTE* ImageRva(BYTE* imageBase, size_t imageSize, DWORD rva,
+    size_t length) {
+    if (!imageBase || rva > imageSize || length > imageSize - rva) return nullptr;
+    return imageBase + rva;
+}
+
+static bool QueryMainImage(BYTE** imageBase, size_t* imageSize,
+    IMAGE_NT_HEADERS32** ntHeaders) {
+    if (!imageBase || !imageSize || !ntHeaders) return false;
+    *imageBase = nullptr;
+    *imageSize = 0;
+    *ntHeaders = nullptr;
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    MODULEINFO moduleInfo = {};
+    if (!module || !GetModuleInformation(GetCurrentProcess(), module,
+        &moduleInfo, sizeof(moduleInfo)) ||
+        !moduleInfo.lpBaseOfDll ||
+        moduleInfo.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+
+    BYTE* base = static_cast<BYTE*>(moduleInfo.lpBaseOfDll);
+    const size_t mappedSize = moduleInfo.SizeOfImage;
+    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!IsImageRange(base, mappedSize, dos, sizeof(*dos)) ||
+        dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        static_cast<size_t>(dos->e_lfanew) >
+            mappedSize - sizeof(IMAGE_NT_HEADERS32)) {
+        return false;
+    }
+
+    IMAGE_NT_HEADERS32* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(
+        base + dos->e_lfanew);
+    if (!IsImageRange(base, mappedSize, nt, sizeof(*nt)) ||
+        nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER32) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt->OptionalHeader.SizeOfImage == 0 ||
+        nt->OptionalHeader.SizeOfImage > mappedSize) {
+        return false;
+    }
+
+    const BYTE* sectionTable = reinterpret_cast<const BYTE*>(
+        &nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(
+        nt->FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (!IsImageRange(base, mappedSize, sectionTable, sectionBytes)) return false;
+
+    *imageBase = base;
+    *imageSize = mappedSize;
+    *ntHeaders = nt;
+    return true;
+}
+
+static bool IsTerminatedImageString(const BYTE* imageBase, size_t imageSize,
+    const char* text) {
+    if (!IsImageRange(imageBase, imageSize, text, 1)) return false;
+    const char* end = reinterpret_cast<const char*>(imageBase + imageSize);
+    while (text < end) {
+        if (*text == '\0') return true;
+        ++text;
+    }
+    return false;
+}
+
+static bool IsSameModuleName(const char* left, const char* right) {
+    if (!left || !right) return false;
+    while (*left && *right) {
+        char a = *left++;
+        char b = *right++;
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return *left == '\0' && *right == '\0';
+}
+
+static bool FindImportIat(BYTE* imageBase, size_t imageSize,
+    IMAGE_NT_HEADERS32* nt, const char* wantedModule, const char* wantedApi,
+    BYTE** iatSlot) {
+    if (!imageBase || !nt || !wantedModule || !wantedApi || !iatSlot)
+        return false;
+    *iatSlot = nullptr;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <=
+        IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        return false;
+    }
+
+    const IMAGE_DATA_DIRECTORY& directory =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!directory.VirtualAddress ||
+        directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        return false;
+    }
+
+    BYTE* importDirectory = ImageRva(imageBase, imageSize,
+        directory.VirtualAddress, directory.Size);
+    if (!importDirectory) return false;
+
+    IMAGE_IMPORT_DESCRIPTOR* descriptors =
+        reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(importDirectory);
+    const size_t maxDescriptors = directory.Size /
+        sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    HMODULE importedModule = GetModuleHandleA(wantedModule);
+    FARPROC expected = importedModule ?
+        GetProcAddress(importedModule, wantedApi) : nullptr;
+
+    for (size_t descriptorIndex = 0; descriptorIndex < maxDescriptors;
+        ++descriptorIndex) {
+        IMAGE_IMPORT_DESCRIPTOR* descriptor = descriptors + descriptorIndex;
+        if (descriptor->Name == 0 && descriptor->FirstThunk == 0) break;
+        if (!descriptor->Name || !descriptor->FirstThunk) continue;
+
+        const char* moduleName = reinterpret_cast<const char*>(
+            ImageRva(imageBase, imageSize, descriptor->Name, 1));
+        if (!moduleName ||
+            !IsTerminatedImageString(imageBase, imageSize, moduleName) ||
+            !IsSameModuleName(moduleName, wantedModule)) {
+            continue;
+        }
+
+        for (size_t thunkIndex = 0; thunkIndex < imageSize /
+            sizeof(IMAGE_THUNK_DATA32); ++thunkIndex) {
+            const size_t thunkOffset = thunkIndex * sizeof(IMAGE_THUNK_DATA32);
+            if (thunkOffset > imageSize ||
+                descriptor->FirstThunk > imageSize - thunkOffset) {
+                break;
+            }
+
+            IMAGE_THUNK_DATA32* slotThunk =
+                reinterpret_cast<IMAGE_THUNK_DATA32*>(ImageRva(
+                    imageBase, imageSize,
+                    descriptor->FirstThunk + static_cast<DWORD>(thunkOffset),
+                    sizeof(IMAGE_THUNK_DATA32)));
+            if (!slotThunk || slotThunk->u1.Function == 0) break;
+
+            bool matchesName = false;
+            if (descriptor->OriginalFirstThunk) {
+                if (thunkOffset > imageSize ||
+                    descriptor->OriginalFirstThunk > imageSize - thunkOffset) {
+                    break;
+                }
+
+                IMAGE_THUNK_DATA32* nameThunk =
+                    reinterpret_cast<IMAGE_THUNK_DATA32*>(ImageRva(
+                        imageBase, imageSize,
+                        descriptor->OriginalFirstThunk +
+                            static_cast<DWORD>(thunkOffset),
+                        sizeof(IMAGE_THUNK_DATA32)));
+                if (nameThunk && !IMAGE_SNAP_BY_ORDINAL32(
+                    nameThunk->u1.Ordinal)) {
+                    IMAGE_IMPORT_BY_NAME* importName =
+                        reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(ImageRva(
+                            imageBase, imageSize,
+                            nameThunk->u1.AddressOfData, sizeof(WORD) + 1));
+                    if (importName &&
+                        IsTerminatedImageString(imageBase, imageSize,
+                            reinterpret_cast<const char*>(importName->Name))) {
+                        matchesName = strcmp(
+                            reinterpret_cast<const char*>(importName->Name),
+                            wantedApi) == 0;
+                    }
+                }
+            }
+
+            const bool matchesAddress = expected &&
+                reinterpret_cast<FARPROC>(
+                    static_cast<uintptr_t>(slotThunk->u1.Function)) == expected;
+            if (matchesName || matchesAddress) {
+                *iatSlot = reinterpret_cast<BYTE*>(&slotThunk->u1.Function);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool GetSectionRange(const BYTE* imageBase, size_t imageSize,
+    IMAGE_NT_HEADERS32* nt, WORD index, BYTE** begin, BYTE** end) {
+    if (!imageBase || !nt || !begin || !end ||
+        index >= nt->FileHeader.NumberOfSections) {
+        return false;
+    }
+
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    const IMAGE_SECTION_HEADER& section = sections[index];
+    size_t virtualSize = section.Misc.VirtualSize;
+    if (virtualSize == 0) virtualSize = section.SizeOfRawData;
+    if (section.VirtualAddress >= imageSize || virtualSize == 0) return false;
+    if (virtualSize > imageSize - section.VirtualAddress)
+        virtualSize = imageSize - section.VirtualAddress;
+
+    *begin = const_cast<BYTE*>(imageBase) + section.VirtualAddress;
+    *end = *begin + virtualSize;
+    return *end > *begin;
+}
+
+static size_t FindIatCallSites(const BYTE* imageBase, size_t imageSize,
+    IMAGE_NT_HEADERS32* nt, const BYTE* iatSlot, BYTE** matches,
+    size_t matchCapacity) {
+    if (!imageBase || !nt || !iatSlot || !matches || matchCapacity == 0)
+        return 0;
+
+    const uintptr_t iatValue = reinterpret_cast<uintptr_t>(iatSlot);
+    if (iatValue > UINT32_MAX) return 0;
+
+    BYTE pattern[6] = { 0xFF, 0x15, 0, 0, 0, 0 };
+    const DWORD iatAddress = static_cast<DWORD>(iatValue);
+    memcpy(pattern + 2, &iatAddress, sizeof(iatAddress));
+
+    size_t found = 0;
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD sectionIndex = 0;
+        sectionIndex < nt->FileHeader.NumberOfSections; ++sectionIndex) {
+        if ((sections[sectionIndex].Characteristics &
+            IMAGE_SCN_MEM_EXECUTE) == 0) {
+            continue;
+        }
+
+        BYTE* begin = nullptr;
+        BYTE* end = nullptr;
+        if (!GetSectionRange(imageBase, imageSize, nt, sectionIndex,
+            &begin, &end)) {
+            continue;
+        }
+
+        for (BYTE* cursor = begin;
+            cursor <= end && static_cast<size_t>(end - cursor) >= sizeof(pattern);
+            ++cursor) {
+            if (!IsReadableRange(cursor, sizeof(pattern)) ||
+                memcmp(cursor, pattern, sizeof(pattern)) != 0) {
+                continue;
+            }
+            if (found < matchCapacity) matches[found] = cursor;
+            ++found;
+        }
+    }
+    return found;
+}
+
+static bool WriteIatPointer(BYTE* slot, const void* target) {
+    if (!slot || !target || !IsReadableRange(slot, sizeof(DWORD)))
+        return false;
+
+    const uintptr_t targetAddress = reinterpret_cast<uintptr_t>(target);
+    if (targetAddress > UINT32_MAX) return false;
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(DWORD), PAGE_READWRITE,
+        &oldProtection)) {
+        return false;
+    }
+
+    const DWORD value = static_cast<DWORD>(targetAddress);
+    memcpy(slot, &value, sizeof(value));
+    FlushInstructionCache(GetCurrentProcess(), slot, sizeof(value));
+
+    DWORD ignoredProtection = 0;
+    VirtualProtect(slot, sizeof(DWORD), oldProtection, &ignoredProtection);
+    return true;
+}
+
+static void TraceWrapperHit(const LOGFONTA* logfont) {
+    if (!Config::EnableDebugLog) return;
+    const LONG count = InterlockedIncrement(&g_wrapperTraceCount);
+    if (count > 32) return;
+
+    char face[LF_FACESIZE] = {};
+    if (logfont) {
+        memcpy(face, logfont->lfFaceName, sizeof(face) - 1);
+        face[sizeof(face) - 1] = '\0';
+    }
+    Utils::Trace("[DEBUG][TopCat] phase=font-call decision=wrapper-hit count=%ld face='%s' h=%ld w=%ld charset=%u",
+        count, face, logfont ? logfont->lfHeight : 0,
+        logfont ? logfont->lfWidth : 0,
+        logfont ? static_cast<unsigned>(logfont->lfCharSet) : 0);
+}
+
+static HFONT WINAPI TopCatCreateFontIndirectA(const LOGFONTA* logfont) {
+    if (!logfont) return newCreateFontIndirectA(logfont);
+
+    LOGFONTA safeLogfont = *logfont;
+    safeLogfont.lfFaceName[LF_FACESIZE - 1] = '\0';
+    TraceWrapperHit(&safeLogfont);
+    HFONT result = newCreateFontIndirectA(&safeLogfont);
+
+    if (Config::EnableDebugLog && result &&
+        InterlockedCompareExchange(&g_actualFaceTraceCount, 0, 0) < 16) {
+        LOGFONTW actual = {};
+        const int actualBytes = orgGetObjectW(
+            result, sizeof(actual), &actual);
+        if (actualBytes == sizeof(actual)) {
+            const LONG traceCount = InterlockedIncrement(
+                &g_actualFaceTraceCount);
+            if (traceCount <= 16) {
+                actual.lfFaceName[LF_FACESIZE - 1] = L'\0';
+                const std::string configuredFace =
+                    EngineCommon::WideToUtf8(Config::ForcedFontNameW);
+                const std::string actualFace =
+                    EngineCommon::WideToUtf8(actual.lfFaceName);
+                Utils::Trace("[DEBUG][TopCat] phase=font-call decision=font-created count=%ld requestedA='%s' forcedW='%s' actualW='%s' hfont=%p",
+                    traceCount, safeLogfont.lfFaceName,
+                    configuredFace.c_str(), actualFace.c_str(), result);
+            }
+        }
+    }
+    return result;
+}
+
+static bool IsTopCatMetricReturnSite(const BYTE* returnAddress) {
+    if (!returnAddress) return false;
+    for (size_t i = 0; i < g_metricReturnSiteCount; ++i) {
+        if (g_metricReturnSites[i] == returnAddress) return true;
+    }
+    return false;
+}
+
+static void ClampTopCatTextMetrics(TEXTMETRICA* metrics,
+    const BYTE* returnAddress) {
+    if (!metrics || !IsTopCatMetricReturnSite(returnAddress)) return;
+
+    const LONG originalMaxCharWidth = metrics->tmMaxCharWidth;
+    const LONG originalAverageCharWidth = metrics->tmAveCharWidth;
+    const LONG originalHeight = metrics->tmHeight;
+    LONG safeMaxCharWidth = originalMaxCharWidth;
+    bool normalizedOutlier = false;
+
+    if (originalMaxCharWidth > 0 && originalAverageCharWidth > 0 &&
+        originalHeight > 0 &&
+        static_cast<int64_t>(originalMaxCharWidth) >
+            static_cast<int64_t>(originalHeight) * 2 &&
+        static_cast<int64_t>(originalMaxCharWidth) >
+            static_cast<int64_t>(originalAverageCharWidth) * 3) {
+        safeMaxCharWidth = static_cast<LONG>(std::min<int64_t>(
+            kTopCatGlyphDimensionLimit,
+            static_cast<int64_t>(originalAverageCharWidth) * 2));
+        normalizedOutlier = true;
+    }
+
+    metrics->tmMaxCharWidth = std::max<LONG>(1, std::min<LONG>(
+        kTopCatGlyphDimensionLimit, safeMaxCharWidth));
+    metrics->tmHeight = std::max<LONG>(1, std::min<LONG>(
+        kTopCatGlyphDimensionLimit, metrics->tmHeight));
+
+    if (!Config::EnableDebugLog ||
+        (originalMaxCharWidth == metrics->tmMaxCharWidth &&
+            originalHeight == metrics->tmHeight)) {
+        return;
+    }
+
+    const LONG traceCount = InterlockedIncrement(&g_metricPatchTraceCount);
+    if (traceCount <= 32) {
+        Utils::Trace("[DEBUG][TopCat] phase=metrics decision=%s count=%ld maxWidth=%ld->%ld ave=%ld height=%ld->%ld limit=%ld return=%p",
+            normalizedOutlier ? "outlier-normalized" : "clamped",
+            traceCount, originalMaxCharWidth, metrics->tmMaxCharWidth,
+            originalAverageCharWidth, originalHeight, metrics->tmHeight,
+            kTopCatGlyphDimensionLimit, returnAddress);
+    }
+}
+
+static BOOL WINAPI TopCatGetTextMetricsA(HDC hdc, LPTEXTMETRICA metrics) {
+    const BOOL result = orgGetTextMetricsA(hdc, metrics);
+    if (result) {
+        ClampTopCatTextMetrics(metrics,
+            reinterpret_cast<const BYTE*>(_ReturnAddress()));
+    }
+    return result;
+}
+
+static bool LooksLikeEngineRoot() {
+    const LONG cached = InterlockedCompareExchange(&g_engineProbe, -1, -1);
+    if (cached != -1) return cached != 0;
+
+    HMODULE mainModule = GetModuleHandleW(nullptr);
+    const bool hasTopCatMarker = EngineCommon::MainModuleContainsAnyAscii(
+        kTopCatMarkers, _countof(kTopCatMarkers));
+    const bool hasSetFontContract = EngineCommon::ModuleContainsAscii(
+        mainModule, "SET_FONT");
+    const bool hasTcd3Resource = EngineCommon::AnyRootFileStartsWithAnyAscii(
+        L"*.TCD", kTopCatContainerMagics, _countof(kTopCatContainerMagics));
+    const bool identityContract = EngineIdentityPolicy::ConfirmCapability(
+        hasTopCatMarker, hasSetFontContract);
+    const bool detected = EngineIdentityPolicy::Confirm({
+        identityContract, false, hasTcd3Resource, hasSetFontContract });
+
+    InterlockedExchange(&g_engineProbe, detected ? 1 : 0);
+    Utils::Trace("[DEBUG][TopCat] phase=identity decision=%s marker=%d set-font=%d tcd3=%d",
+        detected ? "confirmed" : "skip",
+        hasTopCatMarker ? 1 : 0, hasSetFontContract ? 1 : 0,
+        hasTcd3Resource ? 1 : 0);
+    return detected;
+}
+
+void Install() {
+    if (InterlockedExchange(&g_patchAttempted, 1) != 0) return;
+    if (!Config::EnableTopCatHook) {
+        Utils::Trace("[DEBUG][TopCat] phase=install decision=skip fallback=original reason=config-disabled");
+        return;
+    }
+    if (!LooksLikeEngineRoot()) {
+        Utils::Trace("[DEBUG][TopCat] phase=install decision=skip fallback=original reason=identity-mismatch");
+        return;
+    }
+
+    BYTE* imageBase = nullptr;
+    size_t imageSize = 0;
+    IMAGE_NT_HEADERS32* nt = nullptr;
+    if (!QueryMainImage(&imageBase, &imageSize, &nt)) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=x86-pe-unavailable");
+        return;
+    }
+
+    BYTE* createFontIat = nullptr;
+    if (!FindImportIat(imageBase, imageSize, nt, "gdi32.dll",
+        "CreateFontIndirectA", &createFontIat)) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=createfontindirecta-import-missing");
+        return;
+    }
+
+    BYTE* createSites[16] = {};
+    const size_t createSiteCount = FindIatCallSites(imageBase, imageSize,
+        nt, createFontIat, createSites, _countof(createSites));
+    if (createSiteCount == 0 ||
+        createSiteCount > _countof(createSites)) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=createfontindirecta-callsite-count count=%zu",
+            createSiteCount);
+        return;
+    }
+
+    BYTE* metricsIat = nullptr;
+    if (!FindImportIat(imageBase, imageSize, nt, "gdi32.dll",
+        "GetTextMetricsA", &metricsIat)) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=gettextmetricsa-import-missing");
+        return;
+    }
+
+    BYTE* metricSites[16] = {};
+    const size_t metricSiteCount = FindIatCallSites(imageBase, imageSize,
+        nt, metricsIat, metricSites, _countof(metricSites));
+    if (metricSiteCount == 0 ||
+        metricSiteCount > _countof(metricSites)) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=gettextmetricsa-callsite-count count=%zu",
+            metricSiteCount);
+        return;
+    }
+
+    const uintptr_t createWrapper =
+        reinterpret_cast<uintptr_t>(&TopCatCreateFontIndirectA);
+    const uintptr_t metricsWrapper =
+        reinterpret_cast<uintptr_t>(&TopCatGetTextMetricsA);
+    if (createWrapper > UINT32_MAX || metricsWrapper > UINT32_MAX) {
+        Utils::Trace("[DEBUG][TopCat] phase=capability decision=skip fallback=original reason=wrapper-not-x86");
+        return;
+    }
+
+    DWORD originalCreateFont = 0;
+    memcpy(&originalCreateFont, createFontIat, sizeof(originalCreateFont));
+    if (!WriteIatPointer(createFontIat, &TopCatCreateFontIndirectA)) {
+        Utils::Trace("[DEBUG][TopCat] phase=patch decision=skip fallback=original reason=createfontindirecta-iat-write-failed error=%lu",
+            GetLastError());
+        return;
+    }
+    if (!WriteIatPointer(metricsIat, &TopCatGetTextMetricsA)) {
+        WriteIatPointer(createFontIat,
+            reinterpret_cast<const void*>(
+                static_cast<uintptr_t>(originalCreateFont)));
+        Utils::Trace("[DEBUG][TopCat] phase=patch decision=skip fallback=original reason=gettextmetricsa-iat-write-failed error=%lu",
+            GetLastError());
+        return;
+    }
+
+    for (size_t i = 0; i < metricSiteCount; ++i)
+        g_metricReturnSites[i] = metricSites[i] + 6;
+    g_metricReturnSiteCount = metricSiteCount;
+
+    Utils::Trace("[DEBUG][TopCat] phase=patch decision=iat-patched create-slot=%p metrics-slot=%p create-wrapper=%p metrics-wrapper=%p",
+        createFontIat, metricsIat,
+        reinterpret_cast<void*>(createWrapper),
+        reinterpret_cast<void*>(metricsWrapper));
+    Utils::Trace("[DEBUG][TopCat] phase=capability decision=direct-call-sites create=%p metrics=%p create-count=%zu metrics-count=%zu",
+        createSites[0], metricSites[0], createSiteCount, metricSiteCount);
+    Utils::Trace("[DEBUG][TopCat] phase=install decision=active mode=x86-gdi-iat");
+}
+
+} // namespace TopCatCompat

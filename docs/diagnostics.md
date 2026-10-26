@@ -148,6 +148,7 @@ DebugPickerThreadLogLimit=0
 | `[TRACE]` | 安装、配置版本和 API 采样 |
 | `[DEBUG][TextSub]` | 文字映射输入和输出 |
 | `[DEBUG][BGI]` | BGI 身份、DSC/LINE 字体脚本、GDI 缓存和度量适配 |
+| `[DEBUG][TopCat]` | TopCat 身份、x86 主模块 GDI IAT 安装、字体 wrapper 和调用点度量保护 |
 | `[DEBUG][CatSystem2]` | classic CatSystem2 字体源、文件重定向和缺失目录枚举回退 |
 | `[DEBUG][UnityMono]` | Unity Mono 运行时绑定和对象应用 |
 | `[DEBUG][CatSystemUnity]` | Unity IL2CPP/TMP 运行时适配 |
@@ -183,8 +184,21 @@ DebugPickerThreadLogLimit=0
 
 ### 字体切换后没有变化
 
-检查 `ConfigVersion` 是否更新、目标引擎是否使用内部缓存，以及对应适配器是否记录了
-缓存清理或资源重建。不要直接把问题归因于字体名称替换失败。
+先确认当前适配器实际覆盖的字体创建路径。配置更新只影响后续新建的字体对象；已有 UI
+对象、字形贴图或游戏私有缓存不会因此自动重建。适配器没有明确记录缓存刷新能力时，
+不要假设它会清缓存或重绘，也不要仅凭最终画面判断字体创建 Hook 未命中。
+
+### TopCat 菜单或对话仍显示原字体
+
+TopCat 适配器只接管已识别 x86 主模块中的 `CreateFontIndirectA` 和 `GetTextMetricsA`
+导入调用。依次查看 `[DEBUG][TopCat]` 的身份、能力和 `phase=install decision=active`；
+`phase=font-call decision=wrapper-hit` 证明有字体创建请求经过该入口，
+`font-created` 记录通用 Hook 创建后的实际字体名。
+
+这些日志不代表菜单、按钮和对话 UI 全部使用 GDI，也不会触发游戏 EXE 重建已缓存的字体
+或贴图。若日志确认 wrapper 命中但特定 UI 仍使用原字体，应按游戏自己的渲染/缓存路径
+处理；不要通过猜测内部地址或跨线程刷新来强制改写其状态。详细覆盖范围见
+[TopCat 适配说明](../SimpleFontHook/hooks/internal/engines/topcat/README.md)。
 
 ### 繁简映射开启后回想文本断行异常
 

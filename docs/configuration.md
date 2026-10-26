@@ -113,6 +113,7 @@
 | [TyranoScript](../SimpleFontHook/hooks/internal/engines/tyrano/README.md) | `EnableTyranoHook=1`、`TyranoRedirectWebFonts=1` |
 | [Ren'Py](../SimpleFontHook/hooks/internal/engines/renpy/README.md) | `EnableRenPyHook=1`、`RenPyRedirectFonts=1`、`RenPyRefreshFontOnSwitch=1` |
 | [YU-RIS](../SimpleFontHook/hooks/internal/engines/yuris/README.md) | `YurisAtlasCodepage=0`（INI 诊断覆盖项）；使用 `EnableFontHook`、`FontNameW` 和通用度量配置 |
+| [TopCat](../SimpleFontHook/hooks/internal/engines/topcat/README.md) | `EnableTopCatHook=1` |
 
 BGI 的 `EnableBgiHook` 同时控制 x86/x64 DSC 解码后的 LINE 字体脚本层和 Win32 GDI
 栅格层；`BgiPatchGdiImports`、`BgiClearGlyphCacheOnSwitch` 只作用于 Win32 GDI 路径。

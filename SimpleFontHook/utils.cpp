@@ -72,6 +72,7 @@ namespace Config {
     bool EnableRenPyHook = true;
     bool RenPyRedirectFonts = true;
     bool RenPyRefreshFontOnSwitch = true;
+    bool EnableTopCatHook = true;
     wchar_t DxLibCachedFontNameW[LF_FACESIZE] = L"";
     wchar_t ForcedFontNameW[LF_FACESIZE] = L"galgame";
     wchar_t SourceFontNameW[LF_FACESIZE] = L"galgame";
@@ -907,6 +908,7 @@ namespace Utils {
         AppendIniBool(out, "EnableRenPyHook", Config::EnableRenPyHook);
         AppendIniBool(out, "RenPyRedirectFonts", Config::RenPyRedirectFonts);
         AppendIniBool(out, "RenPyRefreshFontOnSwitch", Config::RenPyRefreshFontOnSwitch);
+        AppendIniBool(out, "EnableTopCatHook", Config::EnableTopCatHook);
 
         AppendIniBool(out, "EnableFontHeightScale", Config::EnableFontHeightScale);
         AppendIniBool(out, "EnableFontWidthScale", Config::EnableFontWidthScale);
@@ -1086,6 +1088,7 @@ namespace Utils {
         Config::EnableRenPyHook = ReadIniInt(kv, "EnableRenPyHook", 1) != 0;
         Config::RenPyRedirectFonts = ReadIniInt(kv, "RenPyRedirectFonts", 1) != 0;
         Config::RenPyRefreshFontOnSwitch = ReadIniInt(kv, "RenPyRefreshFontOnSwitch", 1) != 0;
+        Config::EnableTopCatHook = ReadIniInt(kv, "EnableTopCatHook", 1) != 0;
         if (const std::string* cachedDxLibValue = FindIniValue(kv, "DxLibCachedFontNameW")) {
             std::wstring cachedDxLibFont = Utf8ToWide(*cachedDxLibValue);
             wcsncpy_s(Config::DxLibCachedFontNameW, cachedDxLibFont.c_str(), LF_FACESIZE - 1);

@@ -14,8 +14,8 @@ SimpleFontHook 是面向 Windows 游戏的字体兼容与替换 DLL。产物以 
 - 在字体选择器内提供普通用户指南，说明字体选择、应用、显示修正和排版调整流程。
 - 为已确认的 YU-RIS CP932、GBK、Big5 与 Relirium YDG 位图字体资源实时生成系统字体图集。
 - 为 Unity Mono/IL2CPP、classic CatSystem2、BGI、Artemis 与 Artemis Legacy、KiriKiri、
-  Entis、Softpal、Escude、Mirai、Majiro、DxLib、TinkerBell、TyranoScript、Ren'Py 和
-  YU-RIS 提供兼容路径。
+  Entis、Softpal、Escude、Mirai、Majiro、DxLib、TinkerBell、TopCat、TyranoScript、
+  Ren'Py 和 YU-RIS 提供兼容路径。
 
 ## 工作原理
 

@@ -201,6 +201,7 @@ void Install(HMODULE hModule) {
     Unity::InstallInOpenDetourTransaction();
     UnityMono::InstallInOpenDetourTransaction();
     DetourTransactionCommit();
+    TopCatCompat::Install();
     Yuris::Start();
     Unity::StartApplyThread();
     UnityMono::StartApplyThread();

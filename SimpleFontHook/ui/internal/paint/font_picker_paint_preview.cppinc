@@ -33,7 +33,6 @@ static void PaintPreviewPanel(HDC mem, const RECT& rc)
     DrawPetal(mem, rc.right - 42, prevTop + 20, 3, 4, MixColor(COL_ACCENT, COL_PREVIEW_TOP, 0.6f));
     DrawPetal(mem, 24, rc.bottom - 20, 4, 5, COL_ACCENT3);
 
-    BYTE gameCs = GetGameCharset();
     int itemCount = (int)g_filteredIndices.size();
     if (g_selectedIndex >= 0 && g_selectedIndex < itemCount) {
         const std::wstring& fontName = g_allFonts[g_filteredIndices[g_selectedIndex]].name;
@@ -46,7 +45,10 @@ static void PaintPreviewPanel(HDC mem, const RECT& rc)
         if (Config::EnableFontWidthScale)
             previewWidth = max(1, (int)((previewHeight / 2.0f) * Config::FontWidthScale + 0.5f));
         int previewWeight = Config::EnableFontWeight ? Config::FontWeight : FW_NORMAL;
-        HFONT prevFont = GetCachedPickerFont(fontName, previewHeight, previewWidth, previewWeight, gameCs);
+        // This panel previews Unicode text, so the target game's charset must
+        // not steer GDI toward a different fallback family.
+        HFONT prevFont = GetCachedPickerFont(fontName, previewHeight,
+            previewWidth, previewWeight, DEFAULT_CHARSET);
         HGDIOBJ oldPreviewFont = SelectObject(mem, prevFont);
         int oldCharExtra = 0x80000000;
         if (Config::EnableFontCharSpacing && Config::FontCharSpacing != 0)

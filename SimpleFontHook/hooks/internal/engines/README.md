@@ -98,6 +98,7 @@
 | TyranoScript | ASAR 覆盖、Web 字体和 Electron 桥接 | [tyrano/README.md](tyrano/README.md) |
 | Unity | Mono/IL2CPP、TMP 字体资源和线程调度 | [unity/README.md](unity/README.md) |
 | YU-RIS | YPF 位图字体识别、CP932/GBK/Big5/YDG 资源配置和解码后图集替换 | [yuris/README.md](yuris/README.md) |
+| TopCat | x86 主模块 GDI 导入转发与调用点度量保护；不刷新游戏私有 UI 缓存 | [topcat/README.md](topcat/README.md) |
 
 ## 证据索引
 

@@ -106,6 +106,7 @@ static bool SoftpalShouldUseNaturalReplacementWidth();
 #include "internal/font_hooks_text_render.cppinc"
 #include "internal/font_hooks_font_queries.cppinc"
 #include "internal/font_hooks_font_creation.cppinc"
+#include "internal/engines/topcat/topcat_font.cppinc"
 #include "internal/engines/bgi/bgi_compat.cppinc"
 #include "internal/font_hooks_platform.cppinc"
 #include "internal/font_hooks_install.cppinc"

@@ -8,8 +8,6 @@ static void PaintFontList(HDC mem, const RECT& rc)
 
     HFONT uiBadge = GetCachedPickerFont(L"Segoe UI", SF(10), 0, FW_BOLD, DEFAULT_CHARSET);
 
-    BYTE gameCs = GetGameCharset();
-
     for (int i = 0; i < maxVisible; i++) {
         int idx = g_scrollOffset + i;
         int itemTop = yStart + i * ITEM_HEIGHT;
@@ -60,7 +58,8 @@ static void PaintFontList(HDC mem, const RECT& rc)
         }
 
         // Font name in its own typeface (primary line)
-        HFONT itemFont = GetCachedPickerFont(fontName, SF(17), 0, FW_NORMAL, gameCs);
+        HFONT itemFont = GetCachedPickerFont(fontName, SF(17), 0,
+            FW_NORMAL, DEFAULT_CHARSET);
         SelectObject(mem, itemFont);
         SetTextColor(mem, selected ? COL_ACCENT : COL_TEXT);
         RECT nameRc = { textLeft, itemRc.top, badgeRight - 4, itemRc.bottom };

@@ -490,6 +490,8 @@ static void TraceLogCurrentConfig(const char* prefix, LONG version) {
         version, Config::EnableRenPyHook ? 1 : 0,
         Config::RenPyRedirectFonts ? 1 : 0,
         Config::RenPyRefreshFontOnSwitch ? 1 : 0);
+    Utils::Trace("[TRACE][v%ld] topcat enabled=%d adapter=x86-main-module-gdi-iat",
+        version, Config::EnableTopCatHook ? 1 : 0);
 }
 
 static void TraceFlushEpochLocked(LONG nextVersion) {

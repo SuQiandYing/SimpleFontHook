@@ -75,6 +75,7 @@ namespace Config {
     extern bool EnableRenPyHook;
     extern bool RenPyRedirectFonts;
     extern bool RenPyRefreshFontOnSwitch;
+    extern bool EnableTopCatHook;
     extern wchar_t DxLibCachedFontNameW[LF_FACESIZE];
 
     extern wchar_t ForcedFontNameW[LF_FACESIZE];

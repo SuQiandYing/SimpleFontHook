@@ -233,6 +233,7 @@
     <None Include="hooks\internal\engines\softpal\README.md" />
     <None Include="hooks\internal\engines\tinkerbell\README.md" />
     <None Include="hooks\internal\engines\tyrano\README.md" />
+    <None Include="hooks\internal\engines\topcat\README.md" />
     <None Include="hooks\internal\engines\unity\README.md" />
     <None Include="hooks\internal\engines\yuris\README.md" />
     <None Include="hooks\internal\engines\common\engine_font_export.cppinc" />
@@ -270,6 +271,7 @@
     <None Include="hooks\internal\engines\bgi\bgi_cache_hooks.cppinc" />
     <None Include="hooks\internal\engines\bgi\bgi_runtime.cppinc" />
     <None Include="hooks\internal\engines\catsystem2\catsystem2_font.cppinc" />
+    <None Include="hooks\internal\engines\topcat\topcat_font.cppinc" />
     <None Include="hooks\internal\font_hooks_platform.cppinc" />
     <None Include="hooks\internal\font_hooks_install.cppinc" />
     <None Include="hooks\internal\engines\engine_file_dispatch.cppinc" />
