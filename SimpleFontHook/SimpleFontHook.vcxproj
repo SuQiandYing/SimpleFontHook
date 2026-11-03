@@ -209,6 +209,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="winmm_proxy.cpp" />
     <ClCompile Include="hooks\font_hooks.cpp" />
     <ClCompile Include="ui\font_picker.cpp" />
     <ClCompile Include="utils.cpp" />
@@ -217,6 +218,7 @@
     <ClCompile Include="hooks\internal\engines\common\engine_common.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="winmm_exports_x86.inc" />
     <None Include="hooks\internal\engines\README.md" />
     <None Include="hooks\internal\engines\common\README.md" />
     <None Include="hooks\internal\engines\artemis\README.md" />

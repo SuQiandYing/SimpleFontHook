@@ -1,6 +1,8 @@
 #include "../framework.h"
 #include "font_hooks.h"
+#ifdef _WIN64
 #include "../winmm_proxy.h"
+#endif
 #include "../font/font_patcher.h"
 #include "../ui/font_picker.h"
 #include "hook_policy.h"
